@@ -18,6 +18,8 @@ import sys
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
+from listn.llm import DEFAULT_LLM
+
 MODELS = ["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"]
 BACKENDS = ["auto", "faster-whisper", "mlx", "openai-whisper"]
 
@@ -80,6 +82,8 @@ class Settings:
     save_audio: bool = True
     diarize_after: bool = False
     hf_token: str | None = None
+    llm_model: str = DEFAULT_LLM
+    summarize_after: bool = True
 
     @classmethod
     def path(cls) -> Path:
@@ -107,6 +111,8 @@ class Settings:
         self.language = (self.language or "").strip().lower() or None
         self.device = self.device or None
         self.hf_token = (self.hf_token or "").strip() or None
+        self.llm_model = (self.llm_model or DEFAULT_LLM).strip()[:200] or DEFAULT_LLM
+        self.summarize_after = bool(self.summarize_after)
         return self
 
     def save(self) -> None:

@@ -87,6 +87,16 @@ The Live page's device picker is the **legacy** path: a microphone, or BlackHole
 
 The first use of a model downloads it from Hugging Face. That request is unauthenticated unless you set `HF_TOKEN`, so the log may say `Warning: You are sending unauthenticated requests to the HF Hub` once. After the files are in `~/.cache/huggingface`, later loads set `HF_HUB_OFFLINE` and do not use the network.
 
+## Notes
+
+When a recording or file transcription finishes, listn writes a summary, the decisions, and action items into `sessions/<id>/summary.json`. Each action item is attributed to **Me**, **Others**, or a renamed speaker. Turn this off with *Summarize when a recording ends*, or run it again from the library. The notes are editable.
+
+The model is `mlx-community/Qwen2.5-7B-Instruct-4bit` (about 4.3 GB), via `mlx-lm` (`uv sync --extra mlx --extra llm`). It is a 7B instruct model in 4-bit: accurate enough to keep commitments attached to the right person, and small enough to sit next to Whisper large-v3-turbo on a 48 GB Mac. Change the repo id in Settings if you want a different MLX model. The weights download on first use and then load offline. Without MLX, listn still fills the same file from the transcript itself (decisions and commitments matched from the wording) and labels that pass `extractive`.
+
+```bash
+uv run listn summarize <session-id>
+```
+
 A settings file left over from an older run keeps whatever model you saved. In the web UI, set the model to `large-v3-turbo` and the backend to Auto (or MLX).
 
 Backends:

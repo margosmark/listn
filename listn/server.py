@@ -49,6 +49,8 @@ class SettingsIn(BaseModel):
     save_audio: bool | None = None
     diarize_after: bool | None = None
     hf_token: str | None = None
+    llm_model: str | None = None
+    summarize_after: bool | None = None
 
 
 class DeviceTestIn(BaseModel):
@@ -67,6 +69,12 @@ class SessionPatch(BaseModel):
 
 class RetranscribeIn(BaseModel):
     diarize: bool = False
+
+
+class NotesIn(BaseModel):
+    summary: str = ""
+    decisions: list[str] = []
+    actions: list[dict] = []
 
 
 def _host_ok(host_header: str) -> bool:
@@ -257,7 +265,7 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
         meta = _meta(session_id)
         lib = eng().library
         return {"meta": meta.to_dict(), "segments": [s.to_dict() for s in lib.segments(session_id)],
-                "has_audio": lib.audio_path(meta) is not None}
+                "has_audio": lib.audio_path(meta) is not None, "notes": lib.notes(session_id)}
 
     @app.patch("/api/sessions/{session_id}")
     def patch_session(session_id: str, body: SessionPatch):
@@ -277,6 +285,22 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
         _meta(session_id)
         e.library.delete(session_id)
         return {"ok": True}
+
+    @app.post("/api/sessions/{session_id}/summary")
+    def summarize(session_id: str):
+        _meta(session_id)
+        from listn.summary import write_notes
+
+        return write_notes(eng().library, session_id, app.state.settings)
+
+    @app.put("/api/sessions/{session_id}/summary")
+    def edit_summary(session_id: str, body: NotesIn):
+        _meta(session_id)
+        from listn.summary import edited_notes
+
+        notes = edited_notes(body.summary, body.decisions, body.actions, eng().library.notes(session_id))
+        eng().library.save_notes(session_id, notes)
+        return notes
 
     @app.post("/api/sessions/{session_id}/retranscribe")
     def retranscribe(session_id: str, body: RetranscribeIn):

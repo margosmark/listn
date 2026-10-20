@@ -118,6 +118,8 @@ function renderSettings() {
   $("#backend-hint").textContent = `${BACKEND_NOTES[s.backend] || ""} Currently using: ${st.resolved_backend}.`;
   $("#save-audio").checked = !!s.save_audio;
   $("#diarize-after").checked = !!s.diarize_after;
+  $("#summarize-after").checked = s.summarize_after !== false;
+  if (document.activeElement !== $("#llm-model")) $("#llm-model").value = s.llm_model || "";
   $("#chunk").value = s.chunk_seconds;
   $("#chunk-label").textContent = `${s.chunk_seconds}s`;
   $("#hf-token-state").textContent = s.hf_token ? "A token is saved (or HF_TOKEN is set)." : "Not set. Only needed the first time you label speakers.";
@@ -416,7 +418,9 @@ async function openSession(id) {
     } catch (err) { toast(err.message, "error"); }
   } });
 
-  const head = el("div", { class: "detail-head" }, title, metaLine,
+  const notes = data.notes;
+  const notesBox = renderNotes(id, notes, busy);
+  const head = el("div", { class: "detail-head" }, title, metaLine, notesBox,
     meta.error ? el("div", { class: "error-box", text: meta.error }) : null,
     audio,
     el("div", { class: "detail-actions" }, exportMenu, copyBtn, retrans, speakersBtn, el("span", { class: "sep" }), reveal, del));
@@ -460,6 +464,43 @@ async function openSession(id) {
   if (firstHit) firstHit.scrollIntoView({ block: "center" });
 }
 
+function renderNotes(id, notes, busy) {
+  const box = el("div", { class: "notes" });
+  const summary = el("textarea", { class: "notes-summary", rows: "4", placeholder: "Summary" });
+  summary.value = notes?.summary || "";
+  const decisions = el("textarea", { class: "notes-list", rows: "3", placeholder: "One decision per line" });
+  decisions.value = (notes?.decisions || []).join("\n");
+  const actions = el("textarea", { class: "notes-list", rows: "3", placeholder: "Owner: action" });
+  actions.value = (notes?.actions || []).map(a => `${a.owner}: ${a.text}`).join("\n");
+  const how = notes ? (notes.edited ? "edited" : (notes.backend || "")) : "";
+  box.append(
+    el("div", { class: "notes-head" }, el("h3", { text: "Notes" }), how ? el("span", { class: "muted small-text", text: how }) : null),
+    el("label", {}, "Summary", summary),
+    el("label", {}, "Decisions", decisions),
+    el("label", {}, "Action items", actions),
+    el("div", { class: "detail-actions" },
+      el("button", { class: "btn ghost small", text: "Save notes", onclick: async () => {
+        const parsed = actions.value.split("\n").map(line => line.trim()).filter(Boolean).map(line => {
+          const cut = line.indexOf(":");
+          return cut > 0 ? { owner: line.slice(0, cut).trim(), text: line.slice(cut + 1).trim() } : { owner: "Others", text: line };
+        });
+        try {
+          await api("PUT", `/api/sessions/${id}/summary`, {
+            summary: summary.value,
+            decisions: decisions.value.split("\n").map(s => s.trim()).filter(Boolean),
+            actions: parsed,
+          });
+          toast("Notes saved");
+        } catch (err) { toast(err.message, "error"); }
+      } }),
+      el("button", { class: "btn ghost small", text: notes ? "Regenerate" : "Summarize", disabled: busy, onclick: async () => {
+        try { await api("POST", `/api/sessions/${id}/summary`); openSession(id); }
+        catch (err) { toast(err.message, "error"); }
+      } })),
+  );
+  return box;
+}
+
 async function retranscribe(id, diarize) {
   try {
     const job = await api("POST", `/api/sessions/${id}/retranscribe`, { diarize });
@@ -492,6 +533,10 @@ function connectEvents() {
         setLiveStatus(`Saved · ${clock(ev.meta.duration)} · ${state.liveSegments.length} segments.`);
         renderLive();
         if (state.selected === ev.session || $("#view-library").classList.contains("active")) loadSessions();
+        if (state.selected === ev.session) openSession(ev.session);
+        break;
+      case "summary.ready":
+        if (state.selected === ev.session) openSession(ev.session);
         break;
       case "job.update": state.jobs.set(ev.job.id, { ...state.jobs.get(ev.job.id), ...ev.job }); renderJobs(); break;
       case "job.done":
