@@ -26,6 +26,7 @@ let package = Package(
                 .linkedFramework("EventKit"),
                 .linkedFramework("UserNotifications"),
                 .linkedFramework("ServiceManagement"),
+                .linkedFramework("IOKit"),
             ]
         ),
     ]

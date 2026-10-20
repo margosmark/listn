@@ -153,6 +153,22 @@ The menu bar can show a floating captions window (**Live captions**). It stays a
 2. Accept the terms for [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) and [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0), and create a read token at <https://huggingface.co/settings/tokens>.
 3. Paste the token in Settings, or `export HF_TOKEN=...`. It is only needed for the first download.
 
+## Privacy, pause, and a self-contained app
+
+**Retention.** Settings can delete audio after N days (`0` keeps it). The transcript, notes, and bookmarks stay. A session that is still recording is left alone. The library says when the audio is gone.
+
+**Pause.** Pause stops transcribing and writes silence, then Resume leaves a *Paused* line in the transcript so the gap is visible and the later lines still line up with the audio. The menu bar has the same control. Sleep pauses a recording; wake reconnects and resumes it.
+
+**Battery.** Under 40% on battery, a new recording uses the `small` Whisper model and skips the notes model. Plugging in, or turning the saver off, keeps the model you chose. The saved settings are not rewritten.
+
+**Disk.** Recording will not start when the data volume has less than 2 GB free (change `min_free_gb` in settings). If space runs out during a long meeting, listn stops and keeps what it already wrote.
+
+**Icon and packaging.** `macos/scripts/build-app.sh` builds `Listn.app` with the Command Line Tools, ad-hoc signs it (`codesign --sign -`), and by default copies a private Python environment into the bundle. The app then runs `python -m listn` from that copy. It does not need this checkout or uv. `LISTN_STANDALONE=0` points at `.venv/bin/listn` instead. The script prints `du -sh` and writes `Contents/Resources/SIZE.txt`.
+
+What that size is: the Swift app plus the interpreter and the installed wheels. Without the MLX extra that is often a few hundred MB. With `uv sync --extra mlx --extra llm` it is commonly 1–3 GB, because the MLX wheels are large. Whisper `large-v3-turbo` (about 1.6 GB) and Qwen2.5-7B-Instruct 4-bit (about 4.3 GB) stay in `~/.cache/huggingface` and are not inside the app. This Linux checkout cannot produce the signed Mac bundle, so confirm the number on the Mac with the script.
+
+A dropped input device is reopened. The menu bar also restarts the process tap when the audio device list changes, and reconnects the capture socket if the engine process disappears.
+
 ## Where your data lives
 
 `~/Library/Application Support/listn/` (override with `LISTN_DATA_DIR`):
@@ -196,6 +212,11 @@ listn/
   transcriber.py  faster-whisper / MLX / openai-whisper
   diarize.py      optional pyannote, whole recording
   library.py      sessions, search, export
+  speakers.py     local voice profiles
+  retention.py    delete old audio, keep text
+  power.py        battery model choice and free-space check
+  bundle.py       copy Python into the .app
+  iconart.py      app icon PNGs
 macos/
   Package.swift
   Info.plist
@@ -205,7 +226,7 @@ macos/
 
 ### Capture socket
 
-Frames are little-endian: `uint32 length | uint8 type | payload`. Types are HELLO, WELCOME, AUDIO, START, STOP, EVENT, PING, PONG, ERROR, BOOKMARK. AUDIO is `track | sample rate | channels | float32 PCM`, track 0 system and track 1 microphone. START's `source` is `system`, `app`, or `device` (the legacy input). Details are in `listn/ipc.py`. The Python tests drive this with a fake client, including a client that reconnects mid-recording.
+Frames are little-endian: `uint32 length | uint8 type | payload`. Types are HELLO, WELCOME, AUDIO, START, STOP, EVENT, PING, PONG, ERROR, BOOKMARK, PAUSE, RESUME. AUDIO is `track | sample rate | channels | float32 PCM`, track 0 system and track 1 microphone. START's `source` is `system`, `app`, or `device` (the legacy input). Details are in `listn/ipc.py`. The Python tests drive this with a fake client, including a client that reconnects mid-recording.
 
 ## On a Mac, before you trust it
 
@@ -223,6 +244,11 @@ This repo's tests do not open a process tap. On the Mac, check:
 10. Quit and reopen. If you denied a permission, System Settings shows **listn** (not "python" or a blank name) under System Audio Recording and Microphone.
 11. Legacy: install BlackHole only if you want it, pick it in the web UI, choose **Legacy input device** in the menu, and confirm the old path still records.
 12. With `uv sync --extra mlx` and model `large-v3-turbo`, two live tracks stay caught up (the UI should not sit on "N chunks waiting" during normal speech).
+13. Pause during a recording. The transcript shows a Paused gap, the audio is silent there, and Resume continues the same session. Sleep the Mac: it pauses, and after wake the tap is back and the session is still going.
+14. Set audio retention to 1 day, or use a session older than the limit. The wav files go away and the transcript and notes stay. The library says the audio was removed.
+15. `macos/scripts/build-app.sh` prints the app size. `codesign --verify macos/Listn.app` is clean. Move `Listn.app` somewhere with no checkout and no uv and open it: the menu bar and the library still come up. Confirm the icon is the indigo waveform.
+16. On battery under 40%, start a recording. The session model is `small` and it does not run the notes model. Plug in and the next recording uses the model in Settings.
+17. Start a recording, then switch the output device (or unplug headphones). The tap restarts and this session keeps going. Pulling the engine down and letting it come back reconnects the menu without a second START.
 
 ## Troubleshooting
 

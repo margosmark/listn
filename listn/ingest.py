@@ -33,6 +33,8 @@ from listn.ipc import (
     AUDIO,
     BOOKMARK,
     ERROR,
+    PAUSE,
+    RESUME,
     EVENT,
     HELLO,
     MAX_FRAME,
@@ -329,6 +331,12 @@ class IngestServer:
                             self._on_stop(state)
                         elif kind == BOOKMARK:
                             self._on_bookmark(decode_json(payload))
+                        elif kind == PAUSE:
+                            if not self.engine.pause_live():
+                                raise ProtocolError("Nothing is recording.")
+                        elif kind == RESUME:
+                            if not self.engine.resume_live():
+                                raise ProtocolError("Nothing is paused.")
                         elif kind == AUDIO:
                             self._on_audio(conn, payload)
                         elif kind == PING:
@@ -410,15 +418,21 @@ class IngestServer:
         title = body.get("title") or None
         if isinstance(title, str):
             title = title.strip()[:200] or None
+        on_battery = bool(body.get("on_battery"))
+        percent = body.get("battery_percent")
+        try:
+            percent = None if percent is None else float(percent)
+        except (TypeError, ValueError):
+            percent = None
         try:
             if source == "device":
-                self.engine.start_live(settings, title, _attendees(body))
+                self.engine.start_live(settings, title, _attendees(body), on_battery=on_battery, battery_percent=percent)
             else:
                 self.engine.start_ingest(settings, {
                     "source": source,
                     "app_name": body.get("app_name") or None,
                     "mic": bool(body.get("mic", True)),
-                }, title, _attendees(body))
+                }, title, _attendees(body), on_battery=on_battery, battery_percent=percent)
         except RuntimeError as exc:
             self._error(conn, str(exc))
             return

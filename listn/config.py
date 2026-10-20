@@ -91,6 +91,9 @@ class Settings:
     vad_chunks: bool = True
     match_speakers: bool = True
     speaker_threshold: float = 0.72
+    audio_retention_days: int = 0
+    min_free_gb: float = 2.0
+    battery_saver: bool = True
 
     @classmethod
     def path(cls) -> Path:
@@ -132,6 +135,15 @@ class Settings:
             self.speaker_threshold = min(0.95, max(0.4, float(self.speaker_threshold)))
         except (TypeError, ValueError):
             self.speaker_threshold = 0.72
+        try:
+            self.audio_retention_days = min(3650, max(0, int(self.audio_retention_days)))
+        except (TypeError, ValueError):
+            self.audio_retention_days = 0
+        try:
+            self.min_free_gb = min(100.0, max(0.0, float(self.min_free_gb)))
+        except (TypeError, ValueError):
+            self.min_free_gb = 2.0
+        self.battery_saver = bool(self.battery_saver)
         return self
 
     def save(self) -> None:

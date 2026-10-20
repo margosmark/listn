@@ -124,6 +124,10 @@ function renderSettings() {
   $("#launch-at-login").checked = !!s.launch_at_login;
   $("#vad-chunks").checked = s.vad_chunks !== false;
   $("#match-speakers").checked = s.match_speakers !== false;
+  $("#battery-saver").checked = s.battery_saver !== false;
+  if (document.activeElement !== $("#retention-days")) {
+    $("#retention-days").value = s.audio_retention_days ?? 0;
+  }
   const threshold = Number(s.speaker_threshold ?? 0.72);
   $("#speaker-threshold").value = threshold;
   $("#speaker-threshold-label").textContent = threshold.toFixed(2);
@@ -156,7 +160,7 @@ $$("[data-setting]").forEach(input => {
   input.addEventListener("change", () => {
     const key = input.dataset.setting;
     let value = input.type === "checkbox" ? input.checked : input.value;
-    if (key === "chunk_seconds" || key === "speaker_threshold") value = Number(value);
+    if (["chunk_seconds", "speaker_threshold", "audio_retention_days", "min_free_gb"].includes(key)) value = Number(value);
     if (key === "language" && value === "") value = null;
     saveSetting(key, value);
   });
@@ -238,10 +242,14 @@ function renderLive() {
   const live = state.live;
   const active = live && !["done", "error"].includes(live.state);
   const btn = $("#record-btn");
+  const paused = live && live.state === "paused";
   btn.classList.toggle("recording", !!active);
   btn.querySelector(".record-label").textContent = active ? (live.state === "finishing" || live.state === "diarizing" ? "Finishing…" : "Stop") : "Start";
   btn.disabled = !!active && ["finishing", "diarizing"].includes(live.state);
   btn.setAttribute("aria-label", active ? "Stop recording" : "Start recording");
+  const pauseBtn = $("#pause-btn");
+  pauseBtn.hidden = !active || ["finishing", "diarizing"].includes(live && live.state);
+  pauseBtn.textContent = paused ? "Resume" : "Pause";
   $$(".controls select, .controls input, #test-device, #refresh-devices").forEach(c => {
     if (c.id === "diarize-after" && !state.status?.diarization_available) return;
     c.disabled = !!active;
@@ -272,10 +280,17 @@ function appendLiveSegments(segs) {
     const who = s.speaker
       ? el("span", { class: s.speaker === "Me" ? "speaker me" : "speaker", text: `${s.speaker}:` })
       : null;
-    box.append(el("div", { class: "seg" }, el("span", { class: "ts", text: clock(s.start) }), el("span", {}, who, document.createTextNode(s.text))));
+    const gap = s.text === "[paused]";
+    box.append(el("div", { class: gap ? "seg gap" : "seg" }, el("span", { class: "ts", text: clock(s.start) }), el("span", {}, who, document.createTextNode(gap ? "Paused" : s.text))));
   }
   if ($("#autoscroll").checked) box.scrollTop = box.scrollHeight;
 }
+
+$("#pause-btn").addEventListener("click", async () => {
+  const paused = state.live && state.live.state === "paused";
+  try { await api("POST", paused ? "/api/live/resume" : "/api/live/pause"); }
+  catch (err) { toast(err.message, "error"); }
+});
 
 $("#record-btn").addEventListener("click", async () => {
   const live = state.live;
@@ -454,6 +469,7 @@ async function openSession(id, seekAt) {
   const notesBox = renderNotes(id, notes, busy);
   const head = el("div", { class: "detail-head" }, title, metaLine, notesBox,
     meta.error ? el("div", { class: "error-box", text: meta.error }) : null,
+    meta.audio_removed ? el("div", { class: "note", text: "The audio was deleted by the retention rule. The transcript and notes are still here." }) : null,
     audio,
     el("div", { class: "detail-actions" }, exportMenu, copyBtn, retrans, speakersBtn, el("span", { class: "sep" }), reveal, del));
 
@@ -610,6 +626,16 @@ function connectEvents() {
         setLiveStatus(ev.message === "Listening" ? "Listening… transcript appears every few seconds." : ev.message);
         renderLive(); break;
       case "live.segments": state.liveSegments.push(...ev.segments); appendLiveSegments(ev.segments); break;
+      case "live.paused":
+        if (state.live) state.live.state = "paused";
+        setLiveStatus("Paused. The gap stays in the transcript.");
+        renderLive();
+        break;
+      case "live.resumed":
+        if (state.live) state.live.state = ev.state || "listening";
+        setLiveStatus("Listening…");
+        renderLive();
+        break;
       case "live.error": toast(ev.message, "error"); setLiveStatus(ev.message); break;
       case "live.stopped":
         if (state.live) state.live.state = "done";

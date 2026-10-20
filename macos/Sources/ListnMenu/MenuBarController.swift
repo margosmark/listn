@@ -38,6 +38,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let calendar = CalendarTitle()
 
     private let startItem = NSMenuItem(title: "Start recording", action: #selector(toggleRecording), keyEquivalent: "")
+    private let pauseItem = NSMenuItem(title: "Pause", action: #selector(togglePause), keyEquivalent: "")
     private let sourceItem = NSMenuItem(title: "Source: All system audio", action: nil, keyEquivalent: "")
     private let micItem = NSMenuItem(title: "Microphone", action: #selector(toggleMic), keyEquivalent: "")
     private let levelItem = NSMenuItem(title: "Level  ▯▯▯▯▯▯▯▯", action: nil, keyEquivalent: "")
@@ -65,6 +66,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private var calendarApplied = false
     private var liveSessionID: String?
     private var shuttingDown = false
+    private var paused = false
+    private var pausedForSleep = false
+    private var socketPath: String?
     private var engineWarmup = false
     private var warmupGeneration = 0
     private var captureGeneration = 0
@@ -81,7 +85,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         statusItem.button?.image = image
         statusItem.button?.toolTip = "listn"
 
-        for item in [startItem, micItem, libraryItem, meetingItem, bookmarkItem, captionsItem, loginItem, quitItem] {
+        for item in [startItem, pauseItem, micItem, libraryItem, meetingItem, bookmarkItem, captionsItem, loginItem, quitItem] {
             item.target = self
         }
         meetingItem.isHidden = true
@@ -102,6 +106,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
         menu.delegate = self
         menu.addItem(startItem)
+        menu.addItem(pauseItem)
         menu.addItem(sourceItem)
         menu.addItem(micItem)
         menu.addItem(levelItem)
@@ -124,7 +129,25 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         Hotkeys.shared.onBookmark = { [weak self] in self?.bookmarkMoment(nil) }
         Hotkeys.shared.install()
         meetings.start()
+        capture.watchDevices()
+        watchPowerEvents()
         warmEngine()
+    }
+
+    private func watchPowerEvents() {
+        let center = NSWorkspace.shared.notificationCenter
+        center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self, self.phase == .recording else { return }
+            self.pausedForSleep = true
+            self.ipc.sendPause()
+            _ = self.bumpCapture()
+            self.captureQueue.async { self.capture.stop() }
+        }
+        center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self, self.pausedForSleep else { return }
+            self.pausedForSleep = false
+            self.reconnectAndResume()
+        }
     }
 
     func shutdown() {
@@ -173,6 +196,18 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 self.beginCapture(info, source: chosen, mic: mic, calendar: calendarMatch ?? self.pendingCalendar)
             }
         }
+    }
+
+    @objc private func togglePause(_ sender: Any?) {
+        guard phase == .recording else { return }
+        if paused {
+            ipc.sendResume()
+            paused = false
+        } else {
+            ipc.sendPause()
+            paused = true
+        }
+        refresh()
     }
 
     @objc private func toggleMic(_ sender: Any?) {
@@ -385,6 +420,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 self?.refresh()
             }
         }
+        capture.onDeviceChange = { [weak self] in
+            self?.restartTap(reason: "The audio device changed. Restarting the tap.")
+        }
         ipc.onEvent = { [weak self] event in
             self?.handle(event)
         }
@@ -393,12 +431,91 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
         ipc.onDisconnect = { [weak self] in
             guard let self, !self.shuttingDown, self.phase != .idle else { return }
-            _ = self.bumpCapture()
-            self.captureQueue.async { self.capture.stop() }
-            self.phase = .idle
-            self.localLevels = false
-            self.errorText = "Lost the transcription engine."
-            self.refresh()
+            if self.pausedForSleep { return }
+            self.reconnectAfterDrop()
+        }
+    }
+
+    private func reconnectAfterDrop() {
+        supervisor.ensureRunning { [weak self] result in
+            guard let self, !self.shuttingDown else { return }
+            switch result {
+            case .failure(let error):
+                self.fail(error.localizedDescription)
+            case .success(let info):
+                guard let path = info.sock else {
+                    self.fail(EngineError.noSocket.localizedDescription)
+                    return
+                }
+                do {
+                    try self.ipc.connect(path)
+                    self.socketPath = path
+                    self.ipc.sendHello()
+                    if self.phase == .recording {
+                        self.restartTap(reason: "Reconnected to the transcription engine.")
+                    }
+                } catch {
+                    self.fail(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func reconnectAndResume() {
+        supervisor.ensureRunning { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let error):
+                self.fail(error.localizedDescription)
+            case .success(let info):
+                guard let path = info.sock else {
+                    self.fail(EngineError.noSocket.localizedDescription)
+                    return
+                }
+                do {
+                    try self.ipc.connect(path)
+                    self.socketPath = path
+                } catch {
+                    self.fail(error.localizedDescription)
+                    return
+                }
+                self.ipc.sendHello()
+                self.phase = .recording
+                self.restartTap(reason: "Woke from sleep. Recording resumed.")
+                self.ipc.sendResume()
+                self.paused = false
+                self.refresh()
+            }
+        }
+    }
+
+    private func restartTap(reason: String) {
+        guard phase == .recording, !isLegacy else { return }
+        errorText = reason
+        let chosen = source
+        let mic = micOn
+        let token = bumpCapture()
+        captureQueue.async { [weak self] in
+            guard let self else { return }
+            self.capture.stop()
+            guard self.captureGenerationLocked() == token else { return }
+            do {
+                switch chosen {
+                case .system:
+                    try self.capture.start(appPID: nil, appName: nil, mic: mic)
+                case .app(let pid, let name):
+                    try self.capture.start(appPID: pid, appName: name, mic: mic)
+                case .legacy:
+                    break
+                }
+                DispatchQueue.main.async {
+                    guard self.captureGenerationLocked() == token else { return }
+                    self.localLevels = true
+                    self.refresh()
+                }
+            } catch {
+                DispatchQueue.main.async { self.fail(error.localizedDescription) }
+            }
         }
     }
 
@@ -409,6 +526,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
         do {
             try ipc.connect(path)
+            socketPath = path
         } catch {
             fail(error.localizedDescription)
             return
@@ -499,10 +617,17 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 if lines.count > 6 { lines.removeFirst(lines.count - 6) }
                 refreshLines()
             }
+        case "live.paused":
+            paused = true
+            refresh()
+        case "live.resumed":
+            paused = false
+            refresh()
         case "live.stopped":
             _ = bumpCapture()
             captureQueue.async { [weak self] in self?.capture.stop() }
             localLevels = false
+            paused = false
             phase = .idle
             levelItem.title = "Level  " + meter(-120)
             refresh()
@@ -638,7 +763,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             meetingItem.isHidden = true
             meetingItem.action = #selector(recordOfferedMeeting)
         }
-        bookmarkItem.isEnabled = phase == .recording
+        pauseItem.title = paused ? "Resume" : "Pause"
+        pauseItem.isEnabled = phase == .recording
+        bookmarkItem.isEnabled = phase == .recording && !paused
         captionsItem.state = captions.isVisible ? .on : .off
         let symbol = phase == .recording || phase == .finishing ? "record.circle" : "waveform"
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "listn")

@@ -59,6 +59,7 @@ class SessionMeta:
     speakers: dict = field(default_factory=dict)
     owner_pid: int | None = None
     attendees: list = field(default_factory=list)
+    audio_removed: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)

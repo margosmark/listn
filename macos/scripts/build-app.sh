@@ -30,16 +30,41 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$MACOS/.build/release/ListnMenu" "$APP/Contents/MacOS/Listn"
 cp "$MACOS/Info.plist" "$APP/Contents/Info.plist"
 
-ENGINE="$ROOT/.venv/bin/listn"
-if [[ -x "$ENGINE" ]]; then
-  printf '%s\n' "$ENGINE" > "$APP/Contents/Resources/engine.path"
-  echo "Engine: $ENGINE"
+ICONSET="$MACOS/Resources/AppIcon.iconset"
+if [[ -d "$ICONSET" ]] && command -v iconutil >/dev/null 2>&1; then
+  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+  echo "Icon: $APP/Contents/Resources/AppIcon.icns"
 else
-  echo "No $ENGINE yet. The app will look for LISTN_BIN, a .venv next to the repo, or Homebrew's listn." >&2
-  echo "Create the environment with: uv sync --extra mlx" >&2
+  echo "No iconutil, or no iconset. The app builds without AppIcon.icns on this machine." >&2
 fi
 
-codesign --force --sign - --identifier local.listn.menu "$APP"
+# The default app carries its own interpreter and site-packages, so opening
+# it does not need this checkout or uv. Model files stay in ~/.cache/huggingface.
+# LISTN_STANDALONE=0 keeps the older pointer at .venv/bin/listn.
+if [[ "${LISTN_STANDALONE:-1}" == "1" ]]; then
+  PY="$ROOT/.venv/bin/python"
+  if [[ ! -x "$PY" ]]; then
+    echo "No $PY. Run: uv sync --extra mlx" >&2
+    echo "Or build against an existing binary with LISTN_STANDALONE=0." >&2
+    exit 1
+  fi
+  echo "Bundling Python into the app (this can take a minute; models are not copied)"
+  "$PY" -m listn.bundle --venv "$ROOT/.venv" --project "$ROOT" --dest "$APP/Contents/Resources/python"
+  printf '%s\n' "python/bin/listn" > "$APP/Contents/Resources/engine.path"
+else
+  ENGINE="$ROOT/.venv/bin/listn"
+  if [[ -x "$ENGINE" ]]; then
+    printf '%s\n' "$ENGINE" > "$APP/Contents/Resources/engine.path"
+    echo "Engine: $ENGINE"
+  else
+    echo "No $ENGINE yet. The app will look for LISTN_BIN, a .venv next to the repo, or Homebrew's listn." >&2
+  fi
+fi
+
+codesign --force --deep --sign - --identifier local.listn.menu "$APP"
+codesign --verify --verbose=2 "$APP"
+echo "App size (environment only; Whisper and the notes model are separate):"
+du -sh "$APP" | tee "$APP/Contents/Resources/SIZE.txt"
 codesign --verify --verbose=2 "$APP"
 echo
 echo "Built $APP"

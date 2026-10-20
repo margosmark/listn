@@ -58,6 +58,9 @@ class SettingsIn(BaseModel):
     vad_chunks: bool | None = None
     match_speakers: bool | None = None
     speaker_threshold: float | None = None
+    audio_retention_days: int | None = None
+    min_free_gb: float | None = None
+    battery_saver: bool | None = None
 
 
 class DeviceTestIn(BaseModel):
@@ -231,6 +234,18 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
         except RuntimeError as exc:
             raise HTTPException(409 if "already" in str(exc) else 400, str(exc))
         return session.status()
+
+    @app.post("/api/live/pause")
+    def live_pause():
+        if not eng().pause_live():
+            raise HTTPException(409, "Nothing is recording.")
+        return eng().live.status()
+
+    @app.post("/api/live/resume")
+    def live_resume():
+        if not eng().resume_live():
+            raise HTTPException(409, "Nothing is paused.")
+        return eng().live.status()
 
     @app.post("/api/live/stop")
     def live_stop():
