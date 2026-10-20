@@ -32,6 +32,9 @@ Types
 9 ERROR    server → client. JSON ``{"message": "..."}``.
 10 BOOKMARK client → server. JSON ``{"note": "optional"}``. Marks the
    current moment in the transcript.
+11 PAUSE    client → server. Empty. Drops speech until RESUME and leaves a
+   ``[paused]`` gap in the transcript. The timeline keeps moving.
+12 RESUME   client → server. Empty. Recording continues after the gap.
 
 A new connection replaces the previous client. Replacing a client does not
 stop a recording that client started; the new client can send STOP.
@@ -58,6 +61,8 @@ PING = 7
 PONG = 8
 ERROR = 9
 BOOKMARK = 10
+PAUSE = 11
+RESUME = 12
 
 TRACK_SYSTEM = 0
 TRACK_MIC = 1

@@ -110,6 +110,10 @@ class LiveSession:
         self._threads: list[threading.Thread] = []
         self._started = time.monotonic()
         self._samples = 0
+        self.paused = False
+        self._pause_started: float | None = None
+        self._segment_lock = threading.Lock()
+        self._last_disk = 0.0
 
     def _emit(self, kind: str, **data) -> None:
         self.bus.publish({"type": kind, "session": self.meta.id, **data})
@@ -129,6 +133,7 @@ class LiveSession:
             "segments": len(self.segments),
             "model": self.meta.model,
             "backend": self.meta.backend,
+            "paused": self.paused,
         }
 
     def _elapsed_seconds(self) -> float:
@@ -242,20 +247,40 @@ class LiveSession:
         resampler = StreamResampler(self._rate)
         chunker = self._chunker()
         last_level = 0.0
+        gap = 0.0
+        was_paused = False
         while not (self._stop.is_set() and self._blocks.empty()):
+                self._guard_disk()
+                if self.mode == "device":
+                    try:
+                        self._reopen_input()
+                    except Exception as exc:
+                        self._emit("live.error", message=f"The input device dropped: {exc}")
                 try:
                     block = self._blocks.get(timeout=0.2)
                 except queue.Empty:
                     continue
                 mono = resampler.process(to_mono(block))
                 self._samples += mono.size
+                if self.paused:
+                    if not was_paused:
+                        for start, chunk in chunker.flush():
+                            self.pending_chunks += 1
+                            self._chunks.put((None, start + gap, chunk))
+                        was_paused = True
+                    if self._writer:
+                        self._writer.write(np.zeros(mono.size, dtype=np.float32))
+                    gap += mono.size / TARGET_RATE
+                    self.level_db = -120.0
+                    continue
+                was_paused = False
                 if self._writer:
                     self._writer.write(mono)
                 level = rms(mono)
                 self.level_db = 20 * np.log10(level) if level > 1e-6 else -120.0
                 for start, chunk in chunker.feed(mono):
                     self.pending_chunks += 1
-                    self._chunks.put((None, start, chunk))
+                    self._chunks.put((None, start + gap, chunk))
                 now = time.monotonic()
                 if now - last_level > 0.25:
                     last_level = now
@@ -264,14 +289,17 @@ class LiveSession:
                                pending=self.pending_chunks, dropped=self.dropped_blocks)
         for start, chunk in chunker.flush():
             self.pending_chunks += 1
-            self._chunks.put((None, start, chunk))
+            self._chunks.put((None, start + gap, chunk))
 
     def _pipeline_ingest(self) -> None:
         resamplers: dict[int, StreamResampler] = {}
         chunkers: dict[int, Chunker] = {}
         offsets: dict[int, float] = {}
+        gaps: dict[int, float] = {}
         last_level = 0.0
+        was_paused = False
         while not (self._stop.is_set() and self._blocks.empty()):
+            self._guard_disk()
             try:
                 track, rate, block = self._blocks.get(timeout=0.2)
             except queue.Empty:
@@ -294,6 +322,20 @@ class LiveSession:
                 if self.settings.save_audio:
                     self._open_track_writer(track, offsets[track])
             writer = self._writers.get(track)
+            if self.paused:
+                if not was_paused:
+                    for held, held_chunker in chunkers.items():
+                        for start, chunk in held_chunker.flush():
+                            self.pending_chunks += 1
+                            self._chunks.put((held, offsets.get(held, 0.0) + gaps.get(held, 0.0) + start, chunk))
+                    was_paused = True
+                if writer is not None:
+                    writer.write(np.zeros(audio.size, dtype=np.float32))
+                gaps[track] = gaps.get(track, 0.0) + audio.size / TARGET_RATE
+                self._track_levels[track] = -120.0
+                self.level_db = -120.0
+                continue
+            was_paused = False
             if writer is not None:
                 writer.write(audio)
             level = rms(audio)
@@ -302,7 +344,7 @@ class LiveSession:
             chunker = chunkers.setdefault(track, self._chunker())
             for start, chunk in chunker.feed(audio):
                 self.pending_chunks += 1
-                self._chunks.put((track, offsets[track] + start, chunk))
+                self._chunks.put((track, offsets[track] + gaps.get(track, 0.0) + start, chunk))
             now = time.monotonic()
             if now - last_level > 0.25:
                 last_level = now
@@ -314,7 +356,7 @@ class LiveSession:
         for track, chunker in chunkers.items():
             for start, chunk in chunker.flush():
                 self.pending_chunks += 1
-                self._chunks.put((track, offsets.get(track, 0.0) + start, chunk))
+                self._chunks.put((track, offsets.get(track, 0.0) + gaps.get(track, 0.0) + start, chunk))
 
     def _open_track_writer(self, track: int, offset: float) -> None:
         name = "audio-system.wav" if track == TRACK_SYSTEM else "audio-mic.wav"
@@ -373,10 +415,74 @@ class LiveSession:
                 bucket = recent.setdefault(track, [])
                 bucket.extend(new)
                 prompts[track] = " ".join(s.text for s in bucket[-3:])[-200:]
-                self.segments.extend(new)
+                with self._segment_lock:
+                    self.segments.extend(new)
+                    self.segments.sort(key=lambda s: (s.start, s.speaker or ""))
+                    self.library.save_segments(self.meta.id, self.segments)
+                self._emit("live.segments", segments=[s.to_dict() for s in new])
+
+    def pause(self) -> bool:
+        if self._stop.is_set() or self.paused or self.state in ("done", "error", "finishing"):
+            return False
+        self.paused = True
+        self._pause_started = self._elapsed_seconds()
+        self.state = "paused"
+        self._emit("live.paused", t=round(self._pause_started, 2), state=self.state)
+        self._emit("live.status", message="Paused. Speech during the gap is not transcribed.", state=self.state)
+        return True
+
+    def resume(self) -> bool:
+        if not self.paused or self._stop.is_set():
+            return False
+        end = self._elapsed_seconds()
+        start = self._pause_started if self._pause_started is not None else end
+        self.paused = False
+        self._pause_started = None
+        self.state = "listening"
+        if end - start >= 0.05:
+            gap = Segment(round(start, 2), round(max(end, start + 0.05), 2), "[paused]", None)
+            with self._segment_lock:
+                self.segments.append(gap)
                 self.segments.sort(key=lambda s: (s.start, s.speaker or ""))
                 self.library.save_segments(self.meta.id, self.segments)
-                self._emit("live.segments", segments=[s.to_dict() for s in new])
+            self._emit("live.segments", segments=[gap.to_dict()])
+        self._emit("live.resumed", state=self.state)
+        self._emit("live.status", message="Listening", state=self.state)
+        return True
+
+    def _guard_disk(self) -> None:
+        now = time.monotonic()
+        if now - self._last_disk < 30:
+            return
+        self._last_disk = now
+        from listn.power import DiskSpaceError, require_free_space
+
+        try:
+            require_free_space(self.library.root, self.settings.min_free_gb)
+        except DiskSpaceError as exc:
+            self.meta.error = str(exc)
+            self._emit("live.error", message=str(exc))
+            self._stop.set()
+
+    def _reopen_input(self) -> None:
+        stream = self._stream
+        if stream is None or getattr(stream, "active", True):
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_reopen_at", 0.0) < 2:
+            return
+        self._reopen_at = now
+        try:
+            if stream is not None:
+                stop = getattr(stream, "stop", None)
+                if stop:
+                    stop()
+                stream.close()
+        except Exception:
+            pass
+        opened = open_input(self.settings.device, self._callback, sd=self.sd)
+        self._stream = opened.stream
+        self._emit("live.status", message="The input device changed. Recording continued.")
 
     def stop(self, wait: bool = True) -> None:
         if self._stop.is_set():
@@ -463,8 +569,13 @@ class LiveSession:
         self.library.save_meta(self.meta)
         self.state = "done"
         self._emit("live.stopped", session=self.meta.id, meta=self.meta.to_dict())
+        from listn.retention import apply_retention
         from listn.summary import schedule_notes
 
+        try:
+            apply_retention(self.library, self.settings.audio_retention_days)
+        except OSError:
+            log.exception("Retention pass failed")
         schedule_notes(self.library, self.meta.id, self.settings, self.bus)
 
     def _fail(self, message: str) -> None:
@@ -506,31 +617,62 @@ class Engine:
         self._job_queue: queue.Queue = queue.Queue()
         self._lock = threading.Lock()
         self.library.recover_interrupted()
+        try:
+            from listn.retention import apply_retention
+
+            apply_retention(self.library, Settings.load().audio_retention_days)
+        except OSError:
+            log.exception("Retention pass failed")
         threading.Thread(target=self._job_worker, name="listn-jobs", daemon=True).start()
 
     def live_active(self) -> bool:
         return self.live is not None and self.live.state not in ("done", "error")
 
-    def start_live(self, settings: Settings, title: str | None = None, attendees: list | None = None) -> LiveSession:
+    def _tuned(self, settings: Settings, on_battery: bool, battery_percent: float | None) -> Settings:
+        from dataclasses import replace
+
+        from listn.power import model_for_power, require_free_space
+
+        require_free_space(self.library.root, settings.min_free_gb)
+        model, allow_notes = model_for_power(settings, on_battery, battery_percent)
+        return replace(settings, model=model, summarize_after=bool(settings.summarize_after) and allow_notes)
+
+    def start_live(self, settings: Settings, title: str | None = None, attendees: list | None = None,
+                   on_battery: bool = False, battery_percent: float | None = None) -> LiveSession:
         with self._lock:
             if self.live_active():
                 raise RuntimeError("A recording is already running.")
-            session = LiveSession(self.library, self.bus, settings, title, sd=self.sd,
+            tuned = self._tuned(settings, on_battery, battery_percent)
+            session = LiveSession(self.library, self.bus, tuned, title, sd=self.sd,
                                   transcriber_factory=self._factory)
             session.start(attendees)
             self.live = session
             return session
 
     def start_ingest(self, settings: Settings, source: dict, title: str | None = None,
-                     attendees: list | None = None) -> LiveSession:
+                     attendees: list | None = None, on_battery: bool = False,
+                     battery_percent: float | None = None) -> LiveSession:
         with self._lock:
             if self.live_active():
                 raise RuntimeError("A recording is already running.")
-            session = LiveSession(self.library, self.bus, settings, title, sd=self.sd,
+            tuned = self._tuned(settings, on_battery, battery_percent)
+            session = LiveSession(self.library, self.bus, tuned, title, sd=self.sd,
                                   transcriber_factory=self._factory)
             session.start_ingest(source, attendees)
             self.live = session
             return session
+
+    def pause_live(self) -> bool:
+        session = self.live
+        if session is None or not self.live_active():
+            return False
+        return session.pause()
+
+    def resume_live(self) -> bool:
+        session = self.live
+        if session is None or not self.live_active():
+            return False
+        return session.resume()
 
     def add_bookmark(self, note: str = "") -> dict | None:
         session = self.live

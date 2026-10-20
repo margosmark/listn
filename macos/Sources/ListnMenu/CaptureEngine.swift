@@ -95,6 +95,7 @@ final class CaptureEngine {
     var onPCM: ((UInt8, Double, Int, [Float]) -> Void)?
     var onLevels: ((Float, Float) -> Void)?
     var onWarning: ((String) -> Void)?
+    var onDeviceChange: (() -> Void)?
 
     private var tapID = noObject
     private var aggregateID = noObject
@@ -102,6 +103,7 @@ final class CaptureEngine {
     private var format = AudioStreamBasicDescription()
     private var micEngine: AVAudioEngine?
     private var running = false
+    private var watchingDevices = false
     private var systemDB: Float = -120
     private var micDB: Float = -120
     private var lastLevel = Date.distantPast
@@ -178,6 +180,21 @@ final class CaptureEngine {
         }
         systemDB = -120
         micDB = -120
+    }
+
+    /// Restart the tap if the default device list changes while a recording is up.
+    /// Core Audio delivers this on the main queue. The menu bar owns the restart.
+    func watchDevices() {
+        guard !watchingDevices else { return }
+        watchingDevices = true
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        AudioObjectAddPropertyListenerBlock(systemObject, &address, DispatchQueue.main) { [weak self] _, _ in
+            guard let self, self.running else { return }
+            self.onDeviceChange?()
+        }
     }
 
     deinit { stop() }

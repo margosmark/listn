@@ -94,6 +94,7 @@
             <span class="record-icon"></span>
             <span class="record-label">Start</span>
           </button>
+          <button class="btn ghost" id="pause-btn" hidden>Pause</button>
           <div class="stage-meta">
             <div class="timer" id="timer">00:00</div>
             <div class="status-line" id="live-status">Ready when you are.</div>
@@ -215,6 +216,14 @@
       <span>Notes model <em class="muted">(MLX, downloaded once)</em></span>
       <input type="text" id="llm-model" data-setting="llm_model" spellcheck="false">
       <small class="muted">Default is Qwen2.5-7B-Instruct 4-bit, about 4.3 GB. It runs after Whisper, so both fit in 48 GB. Without MLX, notes are extracted from the transcript instead.</small>
+    </label>
+    <label class="field">
+      <span>Delete audio after <input type="number" id="retention-days" min="0" max="3650" step="1" data-setting="audio_retention_days"> days</span>
+      <small class="muted">0 keeps the recordings. Transcripts and notes stay either way. A session that is still recording is left alone.</small>
+    </label>
+    <label class="toggle">
+      <input type="checkbox" id="battery-saver" data-setting="battery_saver">
+      <span>Use the small model when the battery is under 40%</span>
     </label>
     <label class="field">
       <span>Hugging Face token <em class="muted">(only for the first speaker-model download)</em></span>

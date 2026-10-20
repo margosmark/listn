@@ -13,6 +13,8 @@ private let frameStop: UInt8 = 5
 private let frameEvent: UInt8 = 6
 private let frameError: UInt8 = 9
 private let frameBookmark: UInt8 = 10
+private let framePause: UInt8 = 11
+private let frameResume: UInt8 = 12
 private let maxFrame = 8 * 1024 * 1024
 
 enum IPCError: LocalizedError {
@@ -96,10 +98,32 @@ final class IPCClient {
         if let appPID { body["app_pid"] = appPID }
         if let title, !title.isEmpty { body["title"] = title }
         if !attendees.isEmpty { body["attendees"] = attendees }
+        let power = currentPower()
+        body["on_battery"] = power.onBattery
+        if let percent = power.percent { body["battery_percent"] = percent }
         writeQueue.async { [weak self] in
             guard let self else { return }
             self.writeAll(self.jsonFrame(frameHello, ["client": "listn-menu", "version": 1]))
             self.writeAll(self.jsonFrame(frameStart, body))
+        }
+    }
+
+    func sendHello() {
+        writeQueue.async { [weak self] in
+            guard let self else { return }
+            self.writeAll(self.jsonFrame(frameHello, ["client": "listn-menu", "version": 1]))
+        }
+    }
+
+    func sendPause() {
+        writeQueue.async { [weak self] in
+            self?.writeAll(self?.frame(framePause, Data()) ?? Data())
+        }
+    }
+
+    func sendResume() {
+        writeQueue.async { [weak self] in
+            self?.writeAll(self?.frame(frameResume, Data()) ?? Data())
         }
     }
 

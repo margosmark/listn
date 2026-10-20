@@ -127,7 +127,11 @@ final class PythonSupervisor {
         if let bundled = Bundle.main.url(forResource: "engine", withExtension: "path"),
            let text = try? String(contentsOf: bundled, encoding: .utf8) {
             let path = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !path.isEmpty { candidates.append(path) }
+            if path.hasPrefix("/"), !path.isEmpty {
+                candidates.append(path)
+            } else if !path.isEmpty, let resources = Bundle.main.resourceURL {
+                candidates.append(resources.appendingPathComponent(path).path)
+            }
         }
         if let executable = Bundle.main.executableURL {
             var directory = executable.deletingLastPathComponent()

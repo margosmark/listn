@@ -28,6 +28,7 @@ class FakeStream:
         self.block = 1024
         self._stop = threading.Event()
         self._thread = None
+        self.active = True
         sd.opened.append(self)
 
     def start(self):
