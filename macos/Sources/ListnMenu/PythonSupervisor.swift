@@ -157,15 +157,15 @@ final class PythonSupervisor {
         var request = URLRequest(url: url, timeoutInterval: 0.6)
         request.httpMethod = "GET"
         let semaphore = DispatchSemaphore(value: 0)
-        var ok = false
+        let ok = Locked(false)
         URLSession.shared.dataTask(with: request) { data, response, _ in
             let status = (response as? HTTPURLResponse)?.statusCode == 200
             let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
-            ok = status && body.contains("\"capture_sock\"")
+            ok.value = status && body.contains("\"capture_sock\"")
             semaphore.signal()
         }.resume()
         _ = semaphore.wait(timeout: .now() + 0.8)
-        return ok
+        return ok.value
     }
 
     private func openLog() throws -> FileHandle {
@@ -177,7 +177,7 @@ final class PythonSupervisor {
             FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600])
         }
         let handle = try FileHandle(forWritingTo: url)
-        try handle.seekToEnd()
+        _ = try handle.seekToEnd()
         return handle
     }
 

@@ -19,11 +19,10 @@ fi
 
 MACOS="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$(cd "$MACOS/.." && pwd)"
-ARCH="$(uname -m)"
 cd "$MACOS"
 
-echo "Building ListnMenu for ${ARCH}-apple-macos14.2"
-swift build -c release -Xswiftc -target -Xswiftc "${ARCH}-apple-macos14.2"
+echo "Building ListnMenu (deployment target macOS 14.2, from Package.swift)"
+swift build -c release
 
 APP="$MACOS/Listn.app"
 rm -rf "$APP"

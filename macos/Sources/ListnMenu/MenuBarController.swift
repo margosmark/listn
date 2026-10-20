@@ -432,7 +432,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             if index < lines.count {
                 let line = lines[index]
                 let who = line.speaker.map { "\($0): " } ?? ""
-                let text = "\(clock(line.start))  \(who)\(line.text)"
+                let text = "\(clockText(line.start))  \(who)\(line.text)"
                 item.title = String(text.prefix(110))
                 item.isHidden = false
             } else if index == 0 && lines.isEmpty {
@@ -445,7 +445,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
 }
 
-private func clock(_ seconds: Double) -> String {
+private func clockText(_ seconds: Double) -> String {
     let whole = max(0, Int(seconds))
     return String(format: "%d:%02d", whole / 60, whole % 60)
 }
