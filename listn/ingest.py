@@ -2,8 +2,11 @@
 
 The socket lives at ``<data dir>/capture.sock`` with mode 0600. The data
 directory itself is 0700, so other users on the machine cannot connect.
-``server.json`` next to it tells the menu bar app which port the web UI is
-on and where the socket is. Nothing listens on a network interface.
+If that path is longer than a Unix socket address allows (104 bytes on
+macOS, including the NUL), the socket moves to a short per-user directory
+such as ``/tmp/listn-<uid>/`` (mode 0700). ``server.json`` stays in the data
+directory and records the path that is actually listening. Nothing listens
+on a network interface.
 
 One client at a time. A new connection replaces the old one without stopping
 the recording, so the menu bar can reconnect after a hiccup and still send
@@ -19,6 +22,7 @@ import os
 import queue
 import socket
 import struct
+import sys
 import threading
 from pathlib import Path
 
@@ -47,6 +51,67 @@ from listn.ipc import (
 )
 
 log = logging.getLogger("listn")
+
+# CPython rejects an AF_UNIX path whose length is >= sizeof(sun_path).
+# macOS sun_path is 104 bytes; Linux is 108. The bound we use is one
+# shorter than that so the terminating NUL fits on both.
+_UNIX_SOCKET_MAX = 103 if sys.platform == "darwin" else 107
+
+
+def unix_socket_max_bytes() -> int:
+    return _UNIX_SOCKET_MAX
+
+
+def path_fits_unix_socket(path: Path) -> bool:
+    try:
+        encoded = os.fsencode(path)
+    except (OSError, ValueError):
+        return False
+    return 0 < len(encoded) <= _UNIX_SOCKET_MAX
+
+
+def short_socket_dir() -> Path:
+    """A 0700 directory whose ``capture.sock`` fits in a Unix address.
+
+    ``$TMPDIR`` is preferred when that path is short enough. macOS points
+    ``TMPDIR`` at ``/var/folders/...``, which is often already too long, so
+    ``/tmp/listn-<uid>`` is the fallback that always fits.
+    """
+    uid = os.getuid() if hasattr(os, "getuid") else "user"
+    name = f"listn-{uid}"
+    candidates: list[Path] = []
+    tmpdir = os.environ.get("TMPDIR")
+    if tmpdir:
+        candidates.append(Path(tmpdir) / name)
+    fallback = Path("/tmp") / name
+    if fallback not in candidates:
+        candidates.append(fallback)
+    chosen = next((directory for directory in candidates if path_fits_unix_socket(directory / "capture.sock")), fallback)
+    chosen.mkdir(parents=True, exist_ok=True)
+    try:
+        chosen.chmod(0o700)
+    except OSError:
+        pass
+    return chosen
+
+
+def resolve_capture_socket(preferred: Path | None = None) -> Path:
+    """Return ``preferred`` when it can be bound, otherwise a short per-user path."""
+    path = Path(preferred) if preferred is not None else data_dir() / "capture.sock"
+    if path_fits_unix_socket(path):
+        return path
+    fallback = short_socket_dir() / "capture.sock"
+    try:
+        length = len(os.fsencode(path))
+    except (OSError, ValueError):
+        length = -1
+    log.warning(
+        "Capture socket path is too long for a Unix socket (%s, %s bytes). Using %s",
+        path,
+        length,
+        fallback,
+    )
+    return fallback
 
 
 def server_info_path() -> Path:
@@ -106,7 +171,12 @@ class IngestServer:
     def start(self) -> None:
         if self.path is None:
             self.path = data_dir() / "capture.sock"
+        self.path = resolve_capture_socket(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.path.parent.chmod(0o700)
+        except OSError:
+            pass
         self._reclaim_stale_socket()
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:

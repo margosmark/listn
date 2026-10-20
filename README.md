@@ -51,9 +51,9 @@ What the menu does:
 - **Open library**, which is the web UI
 - **Quit**, which also stops the engine if the app started it
 
-The app starts `listn ui --no-browser` itself, using the `listn` written into the bundle at build time (your `.venv`). If you move the `.app` but not the checkout, set `LISTN_BIN` to the `listn` script. Logs: `~/Library/Application Support/listn/engine.log`.
+The app starts `listn ui --no-browser` in the background as soon as it launches, using the `listn` written into the bundle at build time (your `.venv`). If you move the `.app` but not the checkout, set `LISTN_BIN` to the `listn` script. Logs: `~/Library/Application Support/listn/engine.log`.
 
-You do not need to start the web server yourself. Open Library does that once the engine is up (`http://127.0.0.1:8765`).
+You do not need to start the web server yourself. **Open library** waits until the engine is actually listening, then opens `http://127.0.0.1:8765`. The menu item says **Starting…** while that happens. If the engine cannot start, the error is shown in the menu instead of a browser error page.
 
 ## Web UI and CLI
 
@@ -84,6 +84,8 @@ The Live page's device picker is the **legacy** path: a microphone, or BlackHole
 | `large-v3` | 3 GB | Most accurate, slowest |
 
 **Why `large-v3-turbo` on this Mac.** It is a distilled large-v3: similar accuracy, about 1.6 GB, and much faster. With MLX on an M5 Pro (48 GB), one 6-second chunk finishes well inside that 6 seconds, and doing it twice — system audio, then the microphone — still keeps up. `auto` selects the MLX backend when `mlx-whisper` imports on Apple Silicon. If MLX is not installed, the default model stays `small`, because turbo on CPU int8 can fall behind two live tracks.
+
+The first use of a model downloads it from Hugging Face. That request is unauthenticated unless you set `HF_TOKEN`, so the log may say `Warning: You are sending unauthenticated requests to the HF Hub` once. After the files are in `~/.cache/huggingface`, later loads set `HF_HUB_OFFLINE` and do not use the network.
 
 A settings file left over from an older run keeps whatever model you saved. In the web UI, set the model to `large-v3-turbo` and the backend to Auto (or MLX).
 
@@ -129,7 +131,7 @@ sessions/<id>/audio-mic.wav         # Me
 
 Legacy and file recordings are a single `audio.wav` (or the imported file). Recordings are 16 kHz 16-bit WAV. Turn off *Keep the audio recording* in the web UI if you only want text. Models are cached in `~/.cache/huggingface`.
 
-The socket path has to fit in a Unix socket address (about 100 bytes). The default path does.
+The socket path has to fit in a Unix socket address (104 bytes on macOS, including the terminating NUL). The default path does. If `LISTN_DATA_DIR` is so deep that `capture.sock` would not fit, the engine listens on `$TMPDIR/listn-<uid>/capture.sock` when that is short enough, otherwise `/tmp/listn-<uid>/capture.sock`. That directory is mode 0700 and the socket is mode 0600. `server.json` stays in the data folder and records the real socket path.
 
 ## Development
 

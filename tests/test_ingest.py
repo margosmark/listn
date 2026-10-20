@@ -5,16 +5,18 @@ import os
 import queue
 import socket
 import struct
+import sys
 import threading
 import time
 import wave
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from listn.config import default_model
 from listn.engine import Engine
-from listn.ingest import IngestServer
+from listn.ingest import IngestServer, path_fits_unix_socket, resolve_capture_socket, unix_socket_max_bytes
 from listn.ipc import (
     ERROR,
     EVENT,
@@ -115,9 +117,83 @@ def ingest(data_dir, fake_factory):
         server.stop()
 
 
-def test_default_model_is_small_without_mlx():
-    # This environment is not an Apple Silicon Mac with mlx-whisper.
-    assert default_model() == "small"
+def test_default_model_is_small_without_mlx(monkeypatch):
+    """Apple Silicon with MLX installed must still be able to prove the fallback."""
+    import builtins
+
+    import listn.config as config
+
+    monkeypatch.setattr(config, "apple_silicon", lambda: True)
+    real_import = builtins.__import__
+
+    def guarded(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "mlx_whisper" or name.startswith("mlx_whisper."):
+            raise ImportError("mlx unavailable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    assert config.default_model() == "small"
+
+
+def test_default_model_is_turbo_when_mlx_imports(monkeypatch):
+    import sys
+    import types
+
+    import listn.config as config
+
+    monkeypatch.setattr(config, "apple_silicon", lambda: True)
+    monkeypatch.setitem(sys.modules, "mlx_whisper", types.ModuleType("mlx_whisper"))
+    assert config.default_model() == "large-v3-turbo"
+
+
+def test_default_model_is_small_off_apple_silicon(monkeypatch):
+    import listn.config as config
+
+    monkeypatch.setattr(config, "apple_silicon", lambda: False)
+    assert config.default_model() == "small"
+
+
+def test_unix_socket_limit_matches_the_platform():
+    if sys.platform == "darwin":
+        assert unix_socket_max_bytes() <= 103
+    else:
+        assert unix_socket_max_bytes() == 107
+    macos_sized = Path("/tmp") / ("p" * 100)  # "/tmp/" + 100 == 105 bytes
+    assert len(os.fsencode(macos_sized)) == 105
+    if sys.platform == "darwin":
+        assert not path_fits_unix_socket(macos_sized)
+    else:
+        assert path_fits_unix_socket(macos_sized)
+    assert not path_fits_unix_socket(Path("/tmp") / ("p" * 120))
+
+
+def test_long_data_dir_falls_back_to_a_short_socket(monkeypatch, fake_factory):
+    import shutil
+
+    long_root = Path("/tmp") / ("n" * 90)
+    data = long_root / "data"
+    monkeypatch.setenv("LISTN_DATA_DIR", str(data))
+    monkeypatch.setenv("TMPDIR", "/tmp/" + ("t" * 90))
+    preferred = data / "capture.sock"
+    assert not path_fits_unix_socket(preferred)
+    engine = Engine(sd=FakeSD(MAC_DEVICES, speed=40.0), transcriber_factory=fake_factory)
+    server = IngestServer(engine, port=8765)
+    try:
+        server.start()
+        assert server.path == Path(f"/tmp/listn-{os.getuid()}") / "capture.sock"
+        assert path_fits_unix_socket(server.path)
+        assert server.path.is_socket()
+        assert os.stat(server.path).st_mode & 0o777 == 0o600
+        assert server.path.parent.stat().st_mode & 0o777 == 0o700
+        info = json.loads((data / "server.json").read_text())
+        assert info["sock"] == str(server.path)
+        assert info["pid"] == os.getpid()
+        client = FakeClient(server.path)
+        client.hello()
+        client.close()
+    finally:
+        server.stop()
+        shutil.rmtree(long_root, ignore_errors=True)
 
 
 def test_socket_is_private_and_handshake_works(ingest, data_dir):

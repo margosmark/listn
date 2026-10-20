@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from listn.config import Settings
+from listn.config import Settings, default_model
 from listn.library import Library, Segment, export, fmt_clock
 
 
@@ -104,7 +104,7 @@ def test_fmt_clock():
 
 def test_settings_roundtrip_and_sanitize(data_dir):
     s = Settings.load()
-    assert s.model == "small"
+    assert s.model == default_model()
     s.model, s.language, s.hf_token = "base", " EN ", "hf_secret"
     s.validated().save()
     loaded = Settings.load()
@@ -115,4 +115,17 @@ def test_settings_roundtrip_and_sanitize(data_dir):
     bad = Settings.load()
     assert bad.model == "small" and bad.chunk_seconds == 30.0
     (data_dir / "settings.json").write_text("{not json")
+    assert Settings.load().model == default_model()
+
+
+def test_invalid_model_falls_back_to_small_even_when_mlx_is_default(data_dir, monkeypatch):
+    import sys
+    import types
+
+    import listn.config as config
+
+    monkeypatch.setattr(config, "apple_silicon", lambda: True)
+    monkeypatch.setitem(sys.modules, "mlx_whisper", types.ModuleType("mlx_whisper"))
+    assert Settings.load().model == "large-v3-turbo"
+    (data_dir / "settings.json").write_text('{"model": "huge"}')
     assert Settings.load().model == "small"

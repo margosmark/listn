@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import shutil
+import tempfile
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -112,9 +115,13 @@ class FakeTranscriber(Transcriber):
 
 
 @pytest.fixture
-def data_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("LISTN_DATA_DIR", str(tmp_path / "data"))
-    return tmp_path / "data"
+def data_dir(monkeypatch):
+    """Short directory. macOS pytest temps under /var/folders exceed sun_path."""
+    root = Path(tempfile.mkdtemp(prefix="lt", dir="/tmp"))
+    path = root / "d"
+    monkeypatch.setenv("LISTN_DATA_DIR", str(path))
+    yield path
+    shutil.rmtree(root, ignore_errors=True)
 
 
 @pytest.fixture
