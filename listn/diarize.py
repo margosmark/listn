@@ -17,6 +17,7 @@ from collections.abc import Callable
 import numpy as np
 
 from listn.audio import TARGET_RATE
+from listn.hub import load_local_or_download
 from listn.library import Segment
 
 PIPELINE_ID = "pyannote/speaker-diarization-3.1"
@@ -45,16 +46,23 @@ def load_pipeline(token: str | None):
             from pyannote.audio import Pipeline
         except ImportError as exc:
             raise RuntimeError("Speaker labels need the diarization extra: pip install 'listn[diarize]'") from exc
-        try:
-            pipeline = Pipeline.from_pretrained(PIPELINE_ID, use_auth_token=token)
-        except TypeError:
-            pipeline = Pipeline.from_pretrained(PIPELINE_ID, token=token)
-        if pipeline is None:
-            raise RuntimeError(
-                "Could not load the pyannote model. On first use, accept the terms at "
-                "https://huggingface.co/pyannote/speaker-diarization-3.1 and "
-                "https://huggingface.co/pyannote/segmentation-3.0, then add a Hugging Face token in Settings."
-            )
+
+        def build():
+            try:
+                pipeline = Pipeline.from_pretrained(PIPELINE_ID, use_auth_token=token)
+            except TypeError:
+                pipeline = Pipeline.from_pretrained(PIPELINE_ID, token=token)
+            if pipeline is None:
+                raise RuntimeError(
+                    "Could not load the pyannote model. On first use, accept the terms at "
+                    "https://huggingface.co/pyannote/speaker-diarization-3.1 and "
+                    "https://huggingface.co/pyannote/segmentation-3.0, then add a Hugging Face token in Settings."
+                )
+            return pipeline
+
+        # Cached weights load with HF_HUB_OFFLINE. A missing cache is the one
+        # download that still uses the network, then the Hub is turned back off.
+        pipeline = load_local_or_download(build, build)
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             try:
                 pipeline.to(torch.device("mps"))

@@ -7,8 +7,10 @@
 * ``openai-whisper``: the original reference implementation. Optional extra.
 
 Models are downloaded once from Hugging Face (or OpenAI's CDN for
-openai-whisper) and loaded from the local cache afterwards; listn tries the
-cache first so it works fully offline once a model is present.
+openai-whisper) and loaded from the local cache afterwards. A cached load
+sets ``HF_HUB_OFFLINE`` first, so it does not contact the Hub. The
+unauthenticated-request warning only happens on that first download, and
+only when ``HF_TOKEN`` is unset.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from listn.audio import TARGET_RATE, rms
+from listn.hub import load_local_or_download
 
 MLX_REPOS = {
     "tiny": "mlx-community/whisper-tiny-mlx",
@@ -140,12 +143,18 @@ class FasterWhisper(Transcriber):
         from faster_whisper import WhisperModel
 
         kwargs = dict(device="auto", compute_type="int8")
-        try:
-            self._model = WhisperModel(model, local_files_only=True, **kwargs)
-        except Exception:
-            if download:
-                download(f"Downloading Whisper '{model}' (one time)...")
-            self._model = WhisperModel(model, **kwargs)
+
+        def cached():
+            return WhisperModel(model, local_files_only=True, **kwargs)
+
+        def fetched():
+            return WhisperModel(model, **kwargs)
+
+        self._model = load_local_or_download(
+            cached,
+            fetched,
+            on_download=(lambda: download(f"Downloading Whisper '{model}' (one time)...")) if download else None,
+        )
 
     def segments(self, audio, language=None, prompt=None, vad=True):
         segs, _info = self._model.transcribe(
@@ -187,12 +196,18 @@ class MlxWhisper(_WindowedBackend):
         from huggingface_hub import snapshot_download
 
         repo = MLX_REPOS[model]
-        try:
-            self._path = snapshot_download(repo, local_files_only=True)
-        except Exception:
-            if download:
-                download(f"Downloading Whisper '{model}' for MLX (one time)...")
-            self._path = snapshot_download(repo)
+
+        def cached():
+            return snapshot_download(repo, local_files_only=True)
+
+        def fetched():
+            return snapshot_download(repo)
+
+        self._path = load_local_or_download(
+            cached,
+            fetched,
+            on_download=(lambda: download(f"Downloading Whisper '{model}' for MLX (one time)...")) if download else None,
+        )
         self._mlx = mlx_whisper
 
     def _run(self, audio, language, prompt):

@@ -52,6 +52,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private var libraryPort = 8765
     private var localLevels = false
     private var shuttingDown = false
+    private var engineWarmup = false
+    private var warmupGeneration = 0
     private var captureGeneration = 0
     private let captureQueue = DispatchQueue(label: "local.listn.capture.control")
     private let gate = NSLock()
@@ -97,6 +99,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         statusItem.menu = menu
         rebuildSourceMenu()
         wireCapture()
+        warmEngine()
     }
 
     func shutdown() {
@@ -166,8 +169,55 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func openLibrary(_ sender: Any?) {
-        guard let url = URL(string: "http://127.0.0.1:\(libraryPort)/") else { return }
-        NSWorkspace.shared.open(url)
+        if phase == .idle { errorText = nil }
+        let token = beginWarmup()
+        supervisor.ensureRunning { [weak self] result in
+            guard let self, !self.shuttingDown else { return }
+            switch result {
+            case .failure(let error):
+                self.endWarmup(token)
+                self.fail(error.localizedDescription)
+            case .success(let info):
+                self.libraryPort = info.port ?? self.supervisor.port
+                self.endWarmup(token)
+                guard let url = URL(string: "http://127.0.0.1:\(self.libraryPort)/") else { return }
+                NSWorkspace.shared.open(url)
+            }
+        }
+    }
+
+    /// Bring the engine up as soon as the menu bar app is open, so the first
+    /// recording and Open Library do not wait on process startup.
+    private func warmEngine() {
+        let token = beginWarmup()
+        supervisor.ensureRunning { [weak self] result in
+            guard let self, !self.shuttingDown else { return }
+            self.endWarmup(token)
+            switch result {
+            case .failure(let error):
+                if self.phase == .idle {
+                    self.errorText = error.localizedDescription
+                    self.refresh()
+                }
+            case .success(let info):
+                self.libraryPort = info.port ?? self.supervisor.port
+                self.refresh()
+            }
+        }
+    }
+
+    @discardableResult
+    private func beginWarmup() -> Int {
+        warmupGeneration += 1
+        engineWarmup = true
+        refresh()
+        return warmupGeneration
+    }
+
+    private func endWarmup(_ token: Int) {
+        guard token == warmupGeneration else { return }
+        engineWarmup = false
+        refresh()
     }
 
     @objc private func quit(_ sender: Any?) {
@@ -418,11 +468,19 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         } else {
             errorItem.isHidden = true
         }
+        libraryItem.title = engineWarmup ? "Starting…" : "Open library"
+        libraryItem.isEnabled = !engineWarmup
         let symbol = phase == .recording || phase == .finishing ? "record.circle" : "waveform"
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "listn")
         image?.isTemplate = true
         statusItem.button?.image = image
-        statusItem.button?.toolTip = phase == .recording ? "listn — recording" : "listn"
+        if phase == .recording {
+            statusItem.button?.toolTip = "listn — recording"
+        } else if engineWarmup {
+            statusItem.button?.toolTip = "listn — starting"
+        } else {
+            statusItem.button?.toolTip = "listn"
+        }
         refreshLines()
         rebuildSourceMenu()
     }

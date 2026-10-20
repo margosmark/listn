@@ -42,11 +42,29 @@ final class PythonSupervisor {
     private(set) var spawned = false
     private var process: Process?
     let port = 8765
+    private let startLock = NSLock()
+    private var startWaiters: [(Result<ServerInfo, Error>) -> Void] = []
+    private var startInFlight = false
 
+    /// One engine start at a time. Launch, Open Library, and Start recording
+    /// can all ask together; they share the result instead of spawning twice.
     func ensureRunning(_ completion: @escaping (Result<ServerInfo, Error>) -> Void) {
+        startLock.lock()
+        startWaiters.append(completion)
+        let shouldStart = !startInFlight
+        startInFlight = true
+        startLock.unlock()
+        guard shouldStart else { return }
         DispatchQueue.global(qos: .userInitiated).async {
             let result = Result { try self.ensureRunningSync() }
-            DispatchQueue.main.async { completion(result) }
+            self.startLock.lock()
+            let waiters = self.startWaiters
+            self.startWaiters.removeAll()
+            self.startInFlight = false
+            self.startLock.unlock()
+            DispatchQueue.main.async {
+                waiters.forEach { $0(result) }
+            }
         }
     }
 
