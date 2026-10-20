@@ -37,9 +37,22 @@ macos/scripts/build-app.sh
 open macos/Listn.app
 ```
 
-The script runs `swift build -c release` for macOS 14.2, assembles `macos/Listn.app`, copies `Info.plist` (system-audio and microphone usage strings, menu-bar agent, minimum 14.2), and ad-hoc signs the bundle with `codesign --sign -`. Ad-hoc signing is what makes the permission prompts stick to this app. Rebuilding changes the signature, so macOS may ask again.
+The script runs `swift build -c release` for macOS 14.2, assembles `macos/Listn.app`, copies `Info.plist` (system-audio and microphone usage strings, menu-bar agent, minimum 14.2), and signs it. It builds into a temporary folder and only replaces `macos/Listn.app` once `codesign --verify --deep --strict` passes, so a failed step leaves the previous app untouched.
 
-The first time you record, macOS asks for **System Audio Recording** and **Microphone**. Allow both. If you dismissed them: System Settings → Privacy & Security → System Audio Recording, and Microphone. The app does not appear in the Dock (`LSUIElement`).
+The first time you record, the menu asks for **Microphone** and **System Audio Recording** before any audio flows. Allow both. The app does not appear in the Dock (`LSUIElement`).
+
+**Rebuilds and permissions.** By default the app is ad-hoc signed (`codesign --sign -`). macOS keys an ad-hoc grant to that exact build, so after a rebuild the old grant no longer matches. The capture keeps running but macOS hands it zeros: a silent recording with no error. listn now catches this, but the fix is to reset the stale grant and allow again:
+
+```bash
+tccutil reset Microphone local.listn.menu
+tccutil reset AudioCapture local.listn.menu
+```
+
+To make grants survive rebuilds, create a self-signed code-signing certificate once (Keychain Access → Certificate Assistant → Create a Certificate, type *Code Signing*, name it `listn local`) and build with `LISTN_SIGN_IDENTITY="listn local" macos/scripts/build-app.sh`.
+
+**Silent input.** If a track delivers only exact zeros for about two seconds, the menu and the web UI say *listn isn't receiving audio* and show **Open Privacy Settings**, which opens the right pane (Microphone, or Screen & System Audio Recording). System audio is only flagged while something is actually playing, because a quiet Mac is zeros too. A finished recording that never heard any signal is saved as an error ("no audio reached listn"), not as a done session with an empty transcript. Audio that arrives but holds no speech is saved as done, with a warning.
+
+**Engine version.** The app compares the running engine's version (from `server.json`) with its own. An engine left over from an older build is restarted when it is idle; one in the middle of a recording or a file job is left alone until next time.
 
 What the menu does:
 
@@ -163,7 +176,7 @@ The menu bar can show a floating captions window (**Live captions**). It stays a
 
 **Disk.** Recording will not start when the data volume has less than 2 GB free (change `min_free_gb` in settings). If space runs out during a long meeting, listn stops and keeps what it already wrote.
 
-**Icon and packaging.** `macos/scripts/build-app.sh` builds `Listn.app` with the Command Line Tools, ad-hoc signs it (`codesign --sign -`), and by default copies a private Python environment into the bundle. The app then runs `python -m listn` from that copy. It does not need this checkout or uv. `LISTN_STANDALONE=0` points at `.venv/bin/listn` instead. The script prints `du -sh` and writes `Contents/Resources/SIZE.txt`.
+**Icon and packaging.** `macos/scripts/build-app.sh` builds `Listn.app` with the Command Line Tools and by default copies a private Python environment into `Contents/Resources/python`. The base interpreter is found by resolving `.venv/bin/python` through its symlinks (uv's `cpython-3.13-…` folder is a symlink to the patch release). Its `bin` and `lib` go to `python/prefix`, the venv's packages go into `prefix/lib/python3.X/site-packages`, and `listn` is copied in so nothing points back at the checkout. Bytecode is compiled at build time, and the launcher sets `PYTHONDONTWRITEBYTECODE` so nothing is written into the signed bundle at run time. Every Mach-O file is signed, then the app, then the whole bundle is verified. `LISTN_STANDALONE=0` points at `.venv/bin/listn` instead. The script prints `du -sh` and writes `Contents/Resources/SIZE.txt` before signing.
 
 What that size is: the Swift app plus the interpreter and the installed wheels. Without the MLX extra that is often a few hundred MB. With `uv sync --extra mlx --extra llm` it is commonly 1–3 GB, because the MLX wheels are large. Whisper `large-v3-turbo` (about 1.6 GB) and Qwen2.5-7B-Instruct 4-bit (about 4.3 GB) stay in `~/.cache/huggingface` and are not inside the app. This Linux checkout cannot produce the signed Mac bundle, so confirm the number on the Mac with the script.
 
@@ -232,28 +245,30 @@ Frames are little-endian: `uint32 length | uint8 type | payload`. Types are HELL
 
 This repo's tests do not open a process tap. On the Mac, check:
 
-1. `macos/scripts/build-app.sh` finishes and `codesign --verify macos/Listn.app` is clean.
-2. `open macos/Listn.app`. The menu bar icon appears and no Dock icon does.
-3. Start recording. macOS asks for system-audio recording and the microphone. After allowing both, the menu's level meter moves when system audio plays and when you speak.
-4. Playback of other apps does **not** go silent while the tap is running.
-5. A Zoom, Teams, or browser tab can be chosen as the only source, and other apps' audio stays out of Others.
-6. A short call: your voice is **Me**, the other side is **Others**, in the menu and in the library.
-7. Open Library. The web UI loads on `127.0.0.1` only. The live page shows the same lines. Export still works.
-8. Start a Zoom or Meet call. The menu offers to record, and with automatic recording on it starts by itself and offers to stop when the call ends. An overlapping calendar event titles the session. Control-Option-B leaves a bookmark you can seek to. Launch at login survives a reboot.
-9. Name an Others line in the library (**This is…**). Record again with that person on the far side: the new lines should use that name when the match is confident. **Live captions** stays above a full-screen meeting and updates as lines arrive.
-10. Quit and reopen. If you denied a permission, System Settings shows **listn** (not "python" or a blank name) under System Audio Recording and Microphone.
-11. Legacy: install BlackHole only if you want it, pick it in the web UI, choose **Legacy input device** in the menu, and confirm the old path still records.
-12. With `uv sync --extra mlx` and model `large-v3-turbo`, two live tracks stay caught up (the UI should not sit on "N chunks waiting" during normal speech).
-13. Pause during a recording. The transcript shows a Paused gap, the audio is silent there, and Resume continues the same session. Sleep the Mac: it pauses, and after wake the tap is back and the session is still going.
-14. Set audio retention to 1 day, or use a session older than the limit. The wav files go away and the transcript and notes stay. The library says the audio was removed.
-15. `macos/scripts/build-app.sh` prints the app size. `codesign --verify macos/Listn.app` is clean. Move `Listn.app` somewhere with no checkout and no uv and open it: the menu bar and the library still come up. Confirm the icon is the indigo waveform.
-16. On battery under 40%, start a recording. The session model is `small` and it does not run the notes model. Plug in and the next recording uses the model in Settings.
-17. Start a recording, then switch the output device (or unplug headphones). The tap restarts and this session keeps going. Pulling the engine down and letting it come back reconnects the menu without a second START.
+1. `macos/scripts/build-app.sh` finishes and `codesign --verify --deep --strict macos/Listn.app` is clean. `macos/Listn.app/Contents/Resources/python/bin/listn --version` prints the app version.
+2. After a rebuild, run the two `tccutil reset` lines from *Menu bar app*, record, and allow both prompts. The level meter moves. Deny the microphone in System Settings and record again: within a few seconds the menu shows the privacy message and **Open Privacy Settings** opens the Microphone pane.
+3. `open macos/Listn.app`. The menu bar icon appears and no Dock icon does. If an older engine was running, `engine.log` shows a fresh start with the new version.
+4. Start recording. macOS asks for system-audio recording and the microphone. After allowing both, the menu's level meter moves when system audio plays and when you speak.
+5. Playback of other apps does **not** go silent while the tap is running.
+6. A Zoom, Teams, or browser tab can be chosen as the only source, and other apps' audio stays out of Others.
+7. A short call: your voice is **Me**, the other side is **Others**, in the menu and in the library.
+8. Open Library. The web UI loads on `127.0.0.1` only. The live page shows the same lines. Export still works.
+9. Start a Zoom or Meet call. The menu offers to record, and with automatic recording on it starts by itself and offers to stop when the call ends. An overlapping calendar event titles the session. Control-Option-B leaves a bookmark you can seek to. Launch at login survives a reboot.
+10. Name an Others line in the library (**This is…**). Record again with that person on the far side: the new lines should use that name when the match is confident. **Live captions** stays above a full-screen meeting and updates as lines arrive.
+11. Quit and reopen. If you denied a permission, System Settings shows **listn** (not "python" or a blank name) under System Audio Recording and Microphone.
+12. Legacy: install BlackHole only if you want it, pick it in the web UI, choose **Legacy input device** in the menu, and confirm the old path still records.
+13. With `uv sync --extra mlx` and model `large-v3-turbo`, two live tracks stay caught up (the UI should not sit on "N chunks waiting" during normal speech).
+14. Pause during a recording. The transcript shows a Paused gap, the audio is silent there, and Resume continues the same session. Sleep the Mac: it pauses, and after wake the tap is back and the session is still going.
+15. Set audio retention to 1 day, or use a session older than the limit. The wav files go away and the transcript and notes stay. The library says the audio was removed.
+16. `macos/scripts/build-app.sh` prints the app size. `codesign --verify macos/Listn.app` is clean. Move `Listn.app` somewhere with no checkout and no uv and open it: the menu bar and the library still come up. Confirm the icon is the indigo waveform.
+17. On battery under 40%, start a recording. The session model is `small` and it does not run the notes model. Plug in and the next recording uses the model in Settings.
+18. Start a recording, then switch the output device (or unplug headphones). The tap restarts and this session keeps going. Pulling the engine down and letting it come back reconnects the menu without a second START.
 
 ## Troubleshooting
 
 - **Menu says it cannot find the engine.** Run `uv sync --extra mlx` in the repo and rebuild, or `export LISTN_BIN=/absolute/path/to/.venv/bin/listn`.
-- **System audio permission denied.** System Settings → Privacy & Security → System Audio Recording → listn. Rebuilds can change the ad-hoc signature and clear the grant.
+- **Every recording is silent (peak 0, empty transcript).** A permission is missing or belongs to an older build. Run the two `tccutil reset … local.listn.menu` lines from *Menu bar app*, quit any old `listn ui` process, reopen the app, and allow both prompts. Sign with `LISTN_SIGN_IDENTITY` so this stops happening on every rebuild.
+- **System audio permission denied.** System Settings → Privacy & Security → Screen & System Audio Recording → listn.
 - **An app is missing from Source.** It has to have opened an audio device. Start the meeting audio, then open the menu again.
 - **The meter stays silent.** Confirm the meeting is actually playing, and that you did not pick a single app that is quiet. Tap auto-start is off so recording begins immediately; silence until someone speaks is normal.
 - **Legacy transcript is empty.** That path still needs BlackHole (or an aggregate) routed in Audio MIDI Setup. The menu-bar tap does not.

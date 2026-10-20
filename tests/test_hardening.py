@@ -75,10 +75,13 @@ def test_pause_and_resume_frames(data_dir, fake_factory):
         client.send(encode_json(START, {"source": "device", "on_battery": True, "battery_percent": 10}))
         wait_for(lambda: engine.live_active())
         assert engine.live.settings.model == "small"
+        live = engine.live
+        wait_for(lambda: live._samples > 0)
         client.send(encode_frame(PAUSE))
-        wait_for(lambda: engine.live.paused)
+        wait_for(lambda: live.paused)
         client.send(encode_frame(RESUME))
-        wait_for(lambda: any(segment.text == "[paused]" for segment in engine.live.segments))
+        wait_for(lambda: not live.paused)
+        wait_for(lambda: any(segment.text == "[paused]" for segment in live.segments))
     finally:
         client.close()
         engine.stop_live(wait=True)
@@ -118,17 +121,52 @@ def test_retention_deletes_old_audio_and_keeps_the_transcript(data_dir):
     assert apply_retention(library, 0) == []
 
 
-def test_bundle_is_relocatable_and_copies_listn(tmp_path):
-    prefix = tmp_path / "prefix"
+def _uv_layout(tmp_path):
+    """Mirror uv: a versioned prefix, a minor-version symlink to it, and a venv
+    whose pyvenv.cfg ``home`` is the symlinked ``bin`` directory."""
+    prefix = tmp_path / "cpython-3.12.9-macos-aarch64-none"
     (prefix / "bin").mkdir(parents=True)
-    (prefix / "bin" / "python3").write_text("#!/bin/sh\n")
-    (prefix / "lib" / "python3.12").mkdir(parents=True)
+    (prefix / "bin" / "python3.12").write_bytes(b"\xcf\xfa\xed\xfe" + b"\0" * 60)
+    (prefix / "bin" / "python3").symlink_to("python3.12")
+    (prefix / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
     (prefix / "lib" / "python3.12" / "os.py").write_text("stdlib = True\n")
     (prefix / "lib" / "python3.12" / "test").mkdir()
     (prefix / "lib" / "python3.12" / "test" / "skip.py").write_text("nope\n")
+    (prefix / "lib" / "libpython3.12.dylib").write_bytes(b"\xcf\xfa\xed\xfe" + b"\0" * 60)
+    alias = tmp_path / "cpython-3.12-macos-aarch64-none"
+    alias.symlink_to(prefix.name)
     venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(alias / "bin" / "python3.12")
     (venv / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
-    (venv / "pyvenv.cfg").write_text(f"home = {prefix}\n")
+    (venv / "pyvenv.cfg").write_text(f"home = {alias / 'bin'}\n")
+    return prefix, venv
+
+
+def test_bundle_finds_the_interpreter_when_home_is_the_bin_directory(tmp_path):
+    from listn.bundle import base_interpreter, base_prefix
+
+    prefix, venv = _uv_layout(tmp_path)
+    assert base_interpreter(venv) == (prefix / "bin" / "python3.12").resolve()
+    assert base_prefix(venv) == prefix.resolve()
+    (venv / "bin" / "python").unlink()
+    assert base_prefix(venv) == prefix.resolve()
+
+
+def test_bundle_reports_a_missing_interpreter_cleanly(tmp_path, capsys):
+    from listn.bundle import main
+
+    venv = tmp_path / "venv"
+    venv.mkdir()
+    project = tmp_path / "project"
+    (project / "listn").mkdir(parents=True)
+    (project / "listn" / "__init__.py").write_text('__version__ = "test"\n')
+    assert main(["--venv", str(venv), "--project", str(project), "--dest", str(tmp_path / "out")]) == 1
+    assert "Could not bundle Python" in capsys.readouterr().err
+
+
+def test_bundle_is_relocatable_and_copies_listn(tmp_path):
+    prefix, venv = _uv_layout(tmp_path)
     site = venv / "lib" / "python3.12" / "site-packages"
     (site / "demo.py").write_text("x = 1\n")
     (site / "listn.pth").write_text(str(tmp_path / "checkout") + "\n")
@@ -144,15 +182,19 @@ def test_bundle_is_relocatable_and_copies_listn(tmp_path):
     assert launcher == launcher_text()
     assert str(project) not in launcher
     assert "PYTHONHOME" in launcher
-    assert (dest / "site-packages" / "listn" / "__init__.py").read_text().startswith("__version__")
-    assert (dest / "site-packages" / "listn" / "web" / "index.html").exists()
-    assert (dest / "site-packages" / "demo.py").exists()
-    assert not (dest / "site-packages" / "listn.pth").exists()
+    site_dest = dest / "prefix" / "lib" / "python3.12" / "site-packages"
+    assert (site_dest / "listn" / "__init__.py").read_text().startswith("__version__")
+    assert (site_dest / "listn" / "web" / "index.html").exists()
+    assert (site_dest / "demo.py").exists()
+    assert not (site_dest / "listn.pth").exists()
     assert (dest / "prefix" / "lib" / "python3.12" / "os.py").exists()
     assert not (dest / "prefix" / "lib" / "python3.12" / "test").exists()
     assert (dest / "prefix" / "bin" / "python3").stat().st_size > 0
     assert not (dest / "prefix" / "bin" / "python3").is_symlink()
-    assert "models not included" in (dest / "SIZE.txt").read_text() or "not included" in (dest / "SIZE.txt").read_text()
+    machos = (dest / "macho.txt").read_text().split()
+    assert "prefix/bin/python3" in machos
+    assert "prefix/lib/libpython3.12.dylib" in machos
+    assert "not included" in (dest / "SIZE.txt").read_text()
 
 
 def test_icon_is_a_png():

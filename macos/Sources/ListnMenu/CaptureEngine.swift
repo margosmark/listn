@@ -96,6 +96,14 @@ final class CaptureEngine {
     var onLevels: ((Float, Float) -> Void)?
     var onWarning: ((String) -> Void)?
     var onDeviceChange: (() -> Void)?
+    /// Called once per recording when a track has delivered only exact zeros
+    /// for `silenceWindow` seconds. System audio is reported only if some
+    /// output device is actually playing, because a quiet Mac is also zeros.
+    var onSilent: ((PrivacyPane) -> Void)?
+    private let silenceWindow: Double = 2.5
+    private var heard: [Int: Double] = [:]
+    private var peaks: [Int: Float] = [:]
+    private var reported: Set<Int> = []
 
     private var tapID = noObject
     private var aggregateID = noObject
@@ -160,6 +168,11 @@ final class CaptureEngine {
 
     func stop() {
         running = false
+        levelLock.lock()
+        heard = [:]
+        peaks = [:]
+        reported = []
+        levelLock.unlock()
         if let micEngine {
             micEngine.inputNode.removeTap(onBus: 0)
             micEngine.stop()
@@ -300,7 +313,29 @@ final class CaptureEngine {
             samples = Array(UnsafeBufferPointer(start: data.assumingMemoryBound(to: Float.self), count: count))
         }
         noteLevel(track: 0, samples)
+        watchSilence(track: 0, samples, seconds: Double(samples.count / channels) / format.mSampleRate)
         onPCM?(0, format.mSampleRate, channels, samples)
+    }
+
+    private func watchSilence(track: Int, _ samples: [Float], seconds: Double) {
+        var peak: Float = 0
+        for sample in samples {
+            let value = abs(sample)
+            if value > peak { peak = value }
+        }
+        levelLock.lock()
+        if reported.contains(track) {
+            levelLock.unlock()
+            return
+        }
+        heard[track, default: 0] += seconds
+        peaks[track] = max(peaks[track] ?? 0, peak)
+        let due = heard[track, default: 0] >= silenceWindow && (peaks[track] ?? 0) <= 1e-5
+        if due { reported.insert(track) }
+        levelLock.unlock()
+        guard due else { return }
+        if track == 0 && !outputIsPlaying() { return }
+        onSilent?(track == 0 ? .audioCapture : .microphone)
     }
 
     private func consumeMicrophone(_ buffer: AVAudioPCMBuffer) {
@@ -316,6 +351,7 @@ final class CaptureEngine {
             }
         }
         noteLevel(track: 1, interleaved)
+        watchSilence(track: 1, interleaved, seconds: Double(frameCount) / buffer.format.sampleRate)
         onPCM?(1, buffer.format.sampleRate, channelCount, interleaved)
     }
 
@@ -379,6 +415,21 @@ private func audioObjectIDs(_ object: AudioObjectID, _ selector: AudioObjectProp
     var ids = [AudioObjectID](repeating: 0, count: count)
     guard AudioObjectGetPropertyData(object, &address, 0, nil, &size, &ids) == noErr else { return [] }
     return ids
+}
+
+/// True when the default output device is running for some process, i.e.
+/// something is playing. Then a tap that hears only zeros is being withheld.
+func outputIsPlaying() -> Bool {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var device = noObject
+    var size = UInt32(MemoryLayout<AudioObjectID>.size)
+    guard AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, &device) == noErr, device != noObject else {
+        return false
+    }
+    return (readUInt32(device, kAudioDevicePropertyDeviceIsRunningSomewhere) ?? 0) != 0
 }
 
 private func readUInt32(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> UInt32? {

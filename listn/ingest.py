@@ -177,6 +177,7 @@ class IngestServer:
         self._conn: socket.socket | None = None
         self._client: _Client | None = None
         self._handlers: list[threading.Thread] = []
+        self.late_frames = 0
 
     def start(self) -> None:
         if self.path is None:
@@ -349,6 +350,10 @@ class IngestServer:
                         self._error(conn, str(exc))
                     except OSError:
                         return
+                    except Exception as exc:
+                        # One bad frame must not end the client thread.
+                        log.exception("Capture frame %s failed", kind)
+                        self._error(conn, f"listn could not handle that frame: {exc}")
         finally:
             state.done.set()
             if forwarder is not None:
@@ -452,15 +457,19 @@ class IngestServer:
         state.owns_session = False
 
     def _on_audio(self, conn: socket.socket, payload: bytes) -> None:
+        # The menu bar keeps sending for a moment after STOP, and between
+        # sessions. Those frames are dropped quietly; the connection stays up.
         session = self.engine.live
         if session is None or not self.engine.live_active():
-            self._error(conn, "Not recording.")
+            self.late_frames += 1
             return
         if session.mode != "ingest":
-            self._error(conn, "This recording is using an input device, not the capture socket.")
+            if not session._stop.is_set():
+                self._error(conn, "This session records from an input device; it does not take captured audio.")
             return
         track, rate, _channels, samples = decode_audio(payload)
         if track not in TRACK_SPEAKER:
             self._error(conn, "Track must be 0 (system) or 1 (microphone).")
             return
-        session.push_audio(track, rate, samples)
+        if not session.push_audio(track, rate, samples):
+            self.late_frames += 1

@@ -1,71 +1,95 @@
 #!/bin/bash
 # Build listn.app with Swift Package Manager and Command Line Tools.
-# No Xcode project. The app is ad-hoc signed so macOS will attach the
-# audio-capture and microphone permission prompts to this bundle.
+# No Xcode project.
+#
+# Signing: ad-hoc by default (codesign --sign -). macOS keys privacy grants
+# for an ad-hoc app to that exact build, so after a rebuild the old
+# Microphone / System Audio Recording grant no longer matches and capture
+# can come back as silence. Either reset the grants after each rebuild
+# (printed at the end), or sign with a stable identity:
+#   LISTN_SIGN_IDENTITY="listn local" macos/scripts/build-app.sh
+# (create a self-signed "Code Signing" certificate once in Keychain Access →
+# Certificate Assistant → Create a Certificate).
+#
+# The app is assembled in a staging folder and only replaces Listn.app once
+# every step, including signature verification, has passed.
 set -euo pipefail
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "The menu bar app builds only on macOS (it links Core Audio and AppKit)." >&2
   exit 1
 fi
-if ! command -v swift >/dev/null 2>&1; then
-  echo "swift was not found. Install the Command Line Tools: xcode-select --install" >&2
-  exit 1
-fi
-if ! command -v codesign >/dev/null 2>&1; then
-  echo "codesign was not found. It ships with the Command Line Tools." >&2
-  exit 1
-fi
+for tool in swift codesign; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "$tool was not found. Install the Command Line Tools: xcode-select --install" >&2
+    exit 1
+  fi
+done
 
 MACOS="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$(cd "$MACOS/.." && pwd)"
-cd "$MACOS"
-
-echo "Building ListnMenu (deployment target macOS 14.2, from Package.swift)"
-swift build -c release
-
+IDENTITY="${LISTN_SIGN_IDENTITY:--}"
 APP="$MACOS/Listn.app"
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$MACOS/.build/release/ListnMenu" "$APP/Contents/MacOS/Listn"
-cp "$MACOS/Info.plist" "$APP/Contents/Info.plist"
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/listn-build.XXXXXX")"
+NEW="$STAGE/Listn.app"
+cleanup() { rm -rf "$STAGE"; }
+fail() { echo "build-app: $*" >&2; echo "Listn.app was not changed." >&2; exit 1; }
+trap cleanup EXIT
+
+cd "$MACOS"
+echo "Building ListnMenu (deployment target macOS 14.2, from Package.swift)"
+swift build -c release || fail "swift build failed."
+
+mkdir -p "$NEW/Contents/MacOS" "$NEW/Contents/Resources"
+cp "$MACOS/.build/release/ListnMenu" "$NEW/Contents/MacOS/Listn"
+cp "$MACOS/Info.plist" "$NEW/Contents/Info.plist"
 
 ICONSET="$MACOS/Resources/AppIcon.iconset"
 if [[ -d "$ICONSET" ]] && command -v iconutil >/dev/null 2>&1; then
-  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
-  echo "Icon: $APP/Contents/Resources/AppIcon.icns"
+  iconutil -c icns "$ICONSET" -o "$NEW/Contents/Resources/AppIcon.icns" || fail "iconutil failed."
 else
-  echo "No iconutil, or no iconset. The app builds without AppIcon.icns on this machine." >&2
+  echo "No iconutil or no iconset; building without AppIcon.icns." >&2
 fi
 
 # The default app carries its own interpreter and site-packages, so opening
-# it does not need this checkout or uv. Model files stay in ~/.cache/huggingface.
-# LISTN_STANDALONE=0 keeps the older pointer at .venv/bin/listn.
+# it needs neither this checkout nor uv. Model files stay in ~/.cache/huggingface.
+# LISTN_STANDALONE=0 points at .venv/bin/listn instead.
 if [[ "${LISTN_STANDALONE:-1}" == "1" ]]; then
   PY="$ROOT/.venv/bin/python"
-  if [[ ! -x "$PY" ]]; then
-    echo "No $PY. Run: uv sync --extra mlx" >&2
-    echo "Or build against an existing binary with LISTN_STANDALONE=0." >&2
-    exit 1
-  fi
-  echo "Bundling Python into the app (this can take a minute; models are not copied)"
-  "$PY" -m listn.bundle --venv "$ROOT/.venv" --project "$ROOT" --dest "$APP/Contents/Resources/python"
-  printf '%s\n' "python/bin/listn" > "$APP/Contents/Resources/engine.path"
+  [[ -x "$PY" ]] || fail "No $PY. Run: uv sync --extra mlx --extra llm (or set LISTN_STANDALONE=0)."
+  echo "Bundling Python into the app (models are not copied)"
+  PYDEST="$NEW/Contents/Resources/python"
+  "$PY" -m listn.bundle --venv "$ROOT/.venv" --project "$ROOT" --dest "$PYDEST" || fail "Bundling Python failed."
+  "$PYDEST/bin/listn" --version >/dev/null || fail "The bundled engine does not start."
+  printf '%s\n' "python/bin/listn" > "$NEW/Contents/Resources/engine.path"
+  echo "Signing $(wc -l < "$PYDEST/macho.txt" | tr -d ' ') Mach-O files inside the bundled Python"
+  ( cd "$PYDEST" && tr '\n' '\0' < macho.txt | xargs -0 -n 64 codesign --force --sign "$IDENTITY" --timestamp=none ) \
+    || fail "Signing the bundled Python failed."
 else
   ENGINE="$ROOT/.venv/bin/listn"
   if [[ -x "$ENGINE" ]]; then
-    printf '%s\n' "$ENGINE" > "$APP/Contents/Resources/engine.path"
+    printf '%s\n' "$ENGINE" > "$NEW/Contents/Resources/engine.path"
     echo "Engine: $ENGINE"
   else
     echo "No $ENGINE yet. The app will look for LISTN_BIN, a .venv next to the repo, or Homebrew's listn." >&2
   fi
 fi
 
-codesign --force --deep --sign - --identifier local.listn.menu "$APP"
-codesign --verify --verbose=2 "$APP"
-echo "App size (environment only; Whisper and the notes model are separate):"
-du -sh "$APP" | tee "$APP/Contents/Resources/SIZE.txt"
-codesign --verify --verbose=2 "$APP"
+# Everything inside the bundle must be in place before the outer signature
+# seals it; writing a file afterwards breaks the seal.
+du -sh "$NEW" | awk '{print $1 " (app + Python environment; models are separate)"}' > "$NEW/Contents/Resources/SIZE.txt"
+
+codesign --force --sign "$IDENTITY" --identifier local.listn.menu --timestamp=none "$NEW" || fail "codesign failed."
+codesign --verify --deep --strict --verbose=2 "$NEW" || fail "The signature did not verify."
+
+rm -rf "$APP"
+mv "$NEW" "$APP"
 echo
-echo "Built $APP"
+echo "Built $APP ($(cat "$APP/Contents/Resources/SIZE.txt"))"
 echo "Run it with:  open \"$APP\""
+if [[ "$IDENTITY" == "-" ]]; then
+  echo
+  echo "Ad-hoc signed. If recordings come back silent after this rebuild, reset the old grants and allow again:"
+  echo "  tccutil reset Microphone local.listn.menu"
+  echo "  tccutil reset AudioCapture local.listn.menu"
+fi

@@ -60,6 +60,8 @@ class SessionMeta:
     owner_pid: int | None = None
     attendees: list = field(default_factory=list)
     audio_removed: bool = False
+    silent: bool = False
+    warning: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -45,6 +45,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let transcriptHeader = NSMenuItem(title: "Latest transcript", action: nil, keyEquivalent: "")
     private var lineItems: [NSMenuItem] = []
     private let errorItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let privacyItem = NSMenuItem(title: "Open Privacy Settings…", action: #selector(openPrivacy), keyEquivalent: "")
+    private var privacyPane: PrivacyPane?
     private let libraryItem = NSMenuItem(title: "Open library", action: #selector(openLibrary), keyEquivalent: "")
     private let meetingItem = NSMenuItem(title: "Record this meeting", action: #selector(recordOfferedMeeting), keyEquivalent: "")
     private let bookmarkItem = NSMenuItem(title: "Bookmark this moment", action: #selector(bookmarkMoment), keyEquivalent: "")
@@ -85,7 +87,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         statusItem.button?.image = image
         statusItem.button?.toolTip = "listn"
 
-        for item in [startItem, pauseItem, micItem, libraryItem, meetingItem, bookmarkItem, captionsItem, loginItem, quitItem] {
+        for item in [startItem, pauseItem, micItem, libraryItem, meetingItem, bookmarkItem, captionsItem, loginItem, quitItem, privacyItem] {
             item.target = self
         }
         meetingItem.isHidden = true
@@ -115,6 +117,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         lineItems.forEach { menu.addItem($0) }
         menu.addItem(.separator())
         menu.addItem(errorItem)
+        menu.addItem(privacyItem)
         menu.addItem(meetingItem)
         menu.addItem(bookmarkItem)
         menu.addItem(captionsItem)
@@ -175,11 +178,69 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         if phase == .finishing { return }
         phase = .starting
         errorText = nil
+        privacyPane = nil
         lines = []
         calendarApplied = pendingCalendar != nil
         refresh()
+        checkAccess { [weak self] allowed in
+            guard let self else { return }
+            guard allowed else {
+                self.phase = .idle
+                self.refresh()
+                return
+            }
+            self.startAfterAccess()
+        }
+    }
+
+    /// Ask for (or confirm) access before any audio flows, so a denial is a
+    /// clear message instead of a recording of zeros. Legacy capture runs in
+    /// the engine, a child of this app, and macOS attributes its microphone
+    /// use to listn, so the app asks for the microphone on its behalf.
+    private func checkAccess(_ completion: @escaping (Bool) -> Void) {
+        let needsMic = isLegacy || micOn
+        let needsSystem = !isLegacy
+        let afterMic: (Bool) -> Void = { [weak self] micGranted in
+            guard let self else { return }
+            if needsMic && !micGranted {
+                if self.isLegacy {
+                    self.showPrivacy(.microphone, message: "listn needs the microphone for the legacy input. Allow it in System Settings > Privacy & Security > Microphone.")
+                    completion(false)
+                    return
+                }
+                self.showPrivacy(.microphone, message: "Microphone access is off, so only system audio will be recorded. Allow listn in System Settings > Privacy & Security > Microphone.")
+            }
+            guard needsSystem else { completion(true); return }
+            Permissions.requestSystemAudio { [weak self] granted in
+                guard let self else { return }
+                if !granted {
+                    self.showPrivacy(.audioCapture, message: "listn is not allowed to record system audio. Allow it in System Settings > Privacy & Security > Screen & System Audio Recording, then start again.")
+                    completion(false)
+                    return
+                }
+                completion(true)
+            }
+        }
+        if needsMic {
+            Permissions.requestMicrophone(afterMic)
+        } else {
+            afterMic(true)
+        }
+    }
+
+    private func showPrivacy(_ pane: PrivacyPane, message: String? = nil) {
+        privacyPane = pane
+        errorText = message ?? pane.message
+        refresh()
+    }
+
+    @objc private func openPrivacy(_ sender: Any?) {
+        (privacyPane ?? .microphone).open()
+    }
+
+    private func startAfterAccess() {
         let chosen = source
-        let mic = micOn
+        let mic = micOn && Permissions.microphone() == .granted
         let calendarMatch = pendingCalendar
         calendar.overlapping { [weak self] match in
             guard let self else { return }
@@ -420,6 +481,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 self?.refresh()
             }
         }
+        capture.onSilent = { [weak self] pane in
+            DispatchQueue.main.async { self?.showPrivacy(pane) }
+        }
         capture.onDeviceChange = { [weak self] in
             self?.restartTap(reason: "The audio device changed. Restarting the tap.")
         }
@@ -617,6 +681,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 if lines.count > 6 { lines.removeFirst(lines.count - 6) }
                 refreshLines()
             }
+        case "live.silent":
+            let pane = PrivacyPane(rawValue: event["pane"] as? String ?? "") ?? .microphone
+            showPrivacy(pane, message: event["message"] as? String)
         case "live.paused":
             paused = true
             refresh()
@@ -748,6 +815,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         } else {
             errorItem.isHidden = true
         }
+        privacyItem.isHidden = privacyPane == nil
         libraryItem.title = engineWarmup ? "Starting…" : "Open library"
         libraryItem.isEnabled = !engineWarmup
         if let offered, phase == .idle {
