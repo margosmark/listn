@@ -22,6 +22,10 @@ let package = Package(
                 .linkedFramework("AppKit"),
                 .linkedFramework("CoreAudio"),
                 .linkedFramework("AVFoundation"),
+                .linkedFramework("Carbon"),
+                .linkedFramework("EventKit"),
+                .linkedFramework("UserNotifications"),
+                .linkedFramework("ServiceManagement"),
             ]
         ),
     ]

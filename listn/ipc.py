@@ -30,6 +30,8 @@ Types
 7 PING     either direction. Payload is echoed back.
 8 PONG     the echo.
 9 ERROR    server → client. JSON ``{"message": "..."}``.
+10 BOOKMARK client → server. JSON ``{"note": "optional"}``. Marks the
+   current moment in the transcript.
 
 A new connection replaces the previous client. Replacing a client does not
 stop a recording that client started; the new client can send STOP.
@@ -55,6 +57,7 @@ EVENT = 6
 PING = 7
 PONG = 8
 ERROR = 9
+BOOKMARK = 10
 
 TRACK_SYSTEM = 0
 TRACK_MIC = 1

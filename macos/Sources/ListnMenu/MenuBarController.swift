@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 
 private let preferredBundles = [
     "us.zoom.xos",
@@ -33,6 +34,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let supervisor = PythonSupervisor()
     private let ipc = IPCClient()
     private let capture = CaptureEngine()
+    private let meetings = MeetingWatch()
+    private let calendar = CalendarTitle()
 
     private let startItem = NSMenuItem(title: "Start recording", action: #selector(toggleRecording), keyEquivalent: "")
     private let sourceItem = NSMenuItem(title: "Source: All system audio", action: nil, keyEquivalent: "")
@@ -42,6 +45,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private var lineItems: [NSMenuItem] = []
     private let errorItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let libraryItem = NSMenuItem(title: "Open library", action: #selector(openLibrary), keyEquivalent: "")
+    private let meetingItem = NSMenuItem(title: "Record this meeting", action: #selector(recordOfferedMeeting), keyEquivalent: "")
+    private let bookmarkItem = NSMenuItem(title: "Bookmark this moment", action: #selector(bookmarkMoment), keyEquivalent: "")
+    private let loginItem = NSMenuItem(title: "Launch at login", action: #selector(toggleLogin), keyEquivalent: "")
     private let quitItem = NSMenuItem(title: "Quit listn", action: #selector(quit), keyEquivalent: "")
 
     private var source: Source = .system
@@ -51,6 +57,11 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private var errorText: String?
     private var libraryPort = 8765
     private var localLevels = false
+    private var offered: MeetingHit?
+    private var offeredStop: MeetingHit?
+    private var pendingCalendar: CalendarMatch?
+    private var calendarApplied = false
+    private var liveSessionID: String?
     private var shuttingDown = false
     private var engineWarmup = false
     private var warmupGeneration = 0
@@ -68,9 +79,12 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         statusItem.button?.image = image
         statusItem.button?.toolTip = "listn"
 
-        for item in [startItem, micItem, libraryItem, quitItem] {
+        for item in [startItem, micItem, libraryItem, meetingItem, bookmarkItem, loginItem, quitItem] {
             item.target = self
         }
+        meetingItem.isHidden = true
+        bookmarkItem.keyEquivalent = "b"
+        bookmarkItem.keyEquivalentModifierMask = [.control, .option]
         levelItem.isEnabled = false
         transcriptHeader.isEnabled = false
         errorItem.isEnabled = false
@@ -94,16 +108,25 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         lineItems.forEach { menu.addItem($0) }
         menu.addItem(.separator())
         menu.addItem(errorItem)
+        menu.addItem(meetingItem)
+        menu.addItem(bookmarkItem)
         menu.addItem(libraryItem)
+        menu.addItem(loginItem)
         menu.addItem(quitItem)
         statusItem.menu = menu
         rebuildSourceMenu()
         wireCapture()
+        wireMeetings()
+        Hotkeys.shared.onStartStop = { [weak self] in self?.toggleRecording(nil) }
+        Hotkeys.shared.onBookmark = { [weak self] in self?.bookmarkMoment(nil) }
+        Hotkeys.shared.install()
+        meetings.start()
         warmEngine()
     }
 
     func shutdown() {
         shuttingDown = true
+        meetings.stop()
         _ = bumpCapture()
         captureQueue.sync { capture.stop() }
         ipc.sendStop()
@@ -114,6 +137,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         if menu === self.menu {
             rebuildSourceMenu()
+            refreshPrefs()
         }
     }
 
@@ -126,9 +150,16 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         phase = .starting
         errorText = nil
         lines = []
+        calendarApplied = pendingCalendar != nil
         refresh()
         let chosen = source
         let mic = micOn
+        let calendarMatch = pendingCalendar
+        calendar.overlapping { [weak self] match in
+            guard let self else { return }
+            if self.pendingCalendar == nil { self.pendingCalendar = match }
+            self.applyCalendarIfNeeded()
+        }
         supervisor.ensureRunning { [weak self] result in
             guard let self, !self.shuttingDown else { return }
             switch result {
@@ -136,7 +167,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 self.fail(error.localizedDescription)
             case .success(let info):
                 self.libraryPort = info.port ?? self.supervisor.port
-                self.beginCapture(info, source: chosen, mic: mic)
+                self.beginCapture(info, source: chosen, mic: mic, calendar: calendarMatch ?? self.pendingCalendar)
             }
         }
     }
@@ -201,6 +232,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 }
             case .success(let info):
                 self.libraryPort = info.port ?? self.supervisor.port
+                self.refreshPrefs()
                 self.refresh()
             }
         }
@@ -218,6 +250,102 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         guard token == warmupGeneration else { return }
         engineWarmup = false
         refresh()
+    }
+
+    @objc private func stopOffered(_ sender: Any?) {
+        offeredStop = nil
+        meetingItem.isHidden = true
+        if phase == .recording || phase == .starting { beginStop() }
+    }
+
+    @objc private func recordOfferedMeeting(_ sender: Any?) {
+        guard let hit = offered, phase == .idle else { return }
+        offered = nil
+        meetingItem.isHidden = true
+        source = .app(pid: hit.pid, name: hit.name)
+        meetings.track(hit)
+        toggleRecording(nil)
+    }
+
+    @objc private func bookmarkMoment(_ sender: Any?) {
+        guard phase == .recording else { return }
+        ipc.sendBookmark(note: "Bookmark")
+    }
+
+    @objc private func toggleLogin(_ sender: Any?) {
+        loginItem.state = loginItem.state == .on ? .off : .on
+        applyLoginItem(loginItem.state == .on)
+        savePref("launch_at_login", loginItem.state == .on)
+    }
+
+    private func wireMeetings() {
+        meetings.onOffer = { [weak self] hit in
+            guard let self, self.phase == .idle else { return }
+            self.offered = hit
+            self.refresh()
+        }
+        meetings.onStart = { [weak self] hit in
+            guard let self, self.phase == .idle else { return }
+            self.source = .app(pid: hit.pid, name: hit.name)
+            self.meetings.track(hit)
+            self.toggleRecording(nil)
+        }
+        meetings.onOfferEnd = { [weak self] hit in
+            self?.offeredStop = hit
+            self?.refresh()
+        }
+        meetings.onEnd = { [weak self] _ in
+            guard let self, self.phase == .recording || self.phase == .starting else { return }
+            self.beginStop()
+        }
+    }
+
+    private func refreshPrefs() {
+        guard let url = URL(string: "http://127.0.0.1:\(libraryPort)/api/settings") else { return }
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            guard let self, let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            DispatchQueue.main.async {
+                self.meetings.offer = (json["offer_meetings"] as? Bool) ?? true
+                self.meetings.autoStart = (json["auto_record_meetings"] as? Bool) ?? false
+                let login = (json["launch_at_login"] as? Bool) ?? false
+                self.loginItem.state = login ? .on : .off
+                self.applyLoginItem(login)
+            }
+        }.resume()
+    }
+
+    private func savePref(_ key: String, _ value: Bool) {
+        guard let url = URL(string: "http://127.0.0.1:\(libraryPort)/api/settings") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [key: value])
+        URLSession.shared.dataTask(with: request).resume()
+    }
+
+    private func applyLoginItem(_ enabled: Bool) {
+        let service = SMAppService.mainApp
+        do {
+            if enabled {
+                if service.status != .enabled { try service.register() }
+            } else if service.status == .enabled {
+                try service.unregister()
+            }
+        } catch {
+            errorText = error.localizedDescription
+            refresh()
+        }
+    }
+
+    private func applyCalendarIfNeeded() {
+        guard !calendarApplied, let match = pendingCalendar, let id = liveSessionID, !match.title.isEmpty,
+              let url = URL(string: "http://127.0.0.1:\(libraryPort)/api/sessions/\(id)") else { return }
+        calendarApplied = true
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["title": match.title, "attendees": match.attendees])
+        URLSession.shared.dataTask(with: request).resume()
     }
 
     @objc private func quit(_ sender: Any?) {
@@ -263,7 +391,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
     }
 
-    private func beginCapture(_ info: ServerInfo, source: Source, mic: Bool) {
+    private func beginCapture(_ info: ServerInfo, source: Source, mic: Bool, calendar: CalendarMatch? = nil) {
         guard let path = info.sock else {
             fail(EngineError.noSocket.localizedDescription)
             return
@@ -274,13 +402,16 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             fail(error.localizedDescription)
             return
         }
+        let title = calendar?.title
+        let attendees = calendar?.attendees ?? []
+        if calendar != nil { calendarApplied = true }
         switch source {
         case .system:
-            ipc.sendHelloAndStart(source: "system", appName: nil, appPID: nil, mic: mic)
+            ipc.sendHelloAndStart(source: "system", appName: nil, appPID: nil, mic: mic, title: title, attendees: attendees)
         case .app(let pid, let name):
-            ipc.sendHelloAndStart(source: "app", appName: name, appPID: pid, mic: mic)
+            ipc.sendHelloAndStart(source: "app", appName: name, appPID: pid, mic: mic, title: title, attendees: attendees)
         case .legacy:
-            ipc.sendHelloAndStart(source: "device", appName: nil, appPID: nil, mic: false)
+            ipc.sendHelloAndStart(source: "device", appName: nil, appPID: nil, mic: false, title: title, attendees: attendees)
             localLevels = false
             phase = .recording
             refresh()
@@ -343,6 +474,19 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         case "live.level":
             if !localLevels, let db = event["level_db"] as? Double {
                 levelItem.title = "Level  " + meter(Float(db))
+            }
+        case "live.started":
+            if let status = event["status"] as? [String: Any], let id = status["id"] as? String {
+                liveSessionID = id
+                applyCalendarIfNeeded()
+            }
+        case "live.bookmark":
+            if let mark = event["bookmark"] as? [String: Any] {
+                let t = mark["t"] as? Double ?? 0
+                let note = mark["note"] as? String ?? "Bookmark"
+                lines.append(Line(start: t, speaker: nil, text: "★ \(note)"))
+                if lines.count > 6 { lines.removeFirst(lines.count - 6) }
+                refreshLines()
             }
         case "live.stopped":
             _ = bumpCapture()
@@ -470,6 +614,20 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
         libraryItem.title = engineWarmup ? "Starting…" : "Open library"
         libraryItem.isEnabled = !engineWarmup
+        if let offered, phase == .idle {
+            meetingItem.title = "Record \(offered.label)"
+            meetingItem.isHidden = false
+            meetingItem.isEnabled = true
+        } else if let offeredStop, phase == .recording {
+            meetingItem.title = "\(offeredStop.label) ended — stop"
+            meetingItem.isHidden = false
+            meetingItem.action = #selector(stopOffered)
+            meetingItem.isEnabled = true
+        } else {
+            meetingItem.isHidden = true
+            meetingItem.action = #selector(recordOfferedMeeting)
+        }
+        bookmarkItem.isEnabled = phase == .recording
         let symbol = phase == .recording || phase == .finishing ? "record.circle" : "waveform"
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "listn")
         image?.isTemplate = true

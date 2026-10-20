@@ -51,6 +51,9 @@ class SettingsIn(BaseModel):
     hf_token: str | None = None
     llm_model: str | None = None
     summarize_after: bool | None = None
+    offer_meetings: bool | None = None
+    auto_record_meetings: bool | None = None
+    launch_at_login: bool | None = None
 
 
 class DeviceTestIn(BaseModel):
@@ -65,6 +68,7 @@ class LiveStartIn(BaseModel):
 class SessionPatch(BaseModel):
     title: str | None = None
     speakers: dict[str, str] | None = None
+    attendees: list[str] | None = None
 
 
 class RetranscribeIn(BaseModel):
@@ -287,7 +291,8 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
         meta = _meta(session_id)
         lib = eng().library
         return {"meta": meta.to_dict(), "segments": [s.to_dict() for s in lib.segments(session_id)],
-                "has_audio": lib.audio_path(meta) is not None, "notes": lib.notes(session_id)}
+                "has_audio": lib.audio_path(meta) is not None, "notes": lib.notes(session_id),
+                "bookmarks": lib.bookmarks(session_id)}
 
     @app.patch("/api/sessions/{session_id}")
     def patch_session(session_id: str, body: SessionPatch):
@@ -295,6 +300,13 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
         changes = body.model_dump(exclude_none=True)
         if "title" in changes:
             changes["title"] = changes["title"].strip()[:200] or "Untitled"
+        if "attendees" in changes:
+            names = []
+            for item in changes["attendees"]:
+                text = str(item).strip()[:80]
+                if text and text not in names:
+                    names.append(text)
+            changes["attendees"] = names[:40]
         return eng().library.update(session_id, **changes).to_dict()
 
     @app.delete("/api/sessions/{session_id}")

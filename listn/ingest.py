@@ -31,6 +31,7 @@ from listn.config import Settings, data_dir
 from listn.engine import Engine
 from listn.ipc import (
     AUDIO,
+    BOOKMARK,
     ERROR,
     EVENT,
     HELLO,
@@ -135,6 +136,13 @@ def clear_server_info() -> None:
         return
     if info.get("pid") == os.getpid():
         path.unlink(missing_ok=True)
+
+
+def _attendees(body: dict) -> list[str]:
+    raw = body.get("attendees")
+    if not isinstance(raw, list):
+        return []
+    return [str(item) for item in raw]
 
 
 def _same_user(conn: socket.socket) -> bool:
@@ -319,6 +327,8 @@ class IngestServer:
                             self._on_start(conn, state, payload)
                         elif kind == STOP:
                             self._on_stop(state)
+                        elif kind == BOOKMARK:
+                            self._on_bookmark(decode_json(payload))
                         elif kind == AUDIO:
                             self._on_audio(conn, payload)
                         elif kind == PING:
@@ -402,17 +412,22 @@ class IngestServer:
             title = title.strip()[:200] or None
         try:
             if source == "device":
-                self.engine.start_live(settings, title)
+                self.engine.start_live(settings, title, _attendees(body))
             else:
                 self.engine.start_ingest(settings, {
                     "source": source,
                     "app_name": body.get("app_name") or None,
                     "mic": bool(body.get("mic", True)),
-                }, title)
+                }, title, _attendees(body))
         except RuntimeError as exc:
             self._error(conn, str(exc))
             return
         state.owns_session = True
+
+    def _on_bookmark(self, body: dict) -> None:
+        note = body.get("note") if isinstance(body, dict) else ""
+        if self.engine.add_bookmark(str(note or "")) is None:
+            raise ProtocolError("Nothing is recording.")
 
     def _on_stop(self, state: _Client) -> None:
         if not state.owns_session:
