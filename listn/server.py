@@ -54,6 +54,8 @@ class SettingsIn(BaseModel):
     offer_meetings: bool | None = None
     auto_record_meetings: bool | None = None
     launch_at_login: bool | None = None
+    vocabulary: list[str] | None = None
+    vad_chunks: bool | None = None
 
 
 class DeviceTestIn(BaseModel):

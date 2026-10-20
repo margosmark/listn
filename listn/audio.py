@@ -127,6 +127,75 @@ class WavWriter:
             self._wf = None
 
 
+class PauseChunker:
+    """Cut live audio on a pause, and never later than ``max_seconds``.
+
+    A fixed window splits words that happen to straddle the boundary. This
+    waits until the signal stays under ``threshold`` for ``pause_seconds``,
+    as long as the chunk already has ``min_seconds`` of audio. If nobody
+    pauses, it cuts at ``max_seconds`` so latency stays bounded.
+    """
+
+    def __init__(self, max_seconds: float = 15.0, pause_seconds: float = 0.45,
+                 min_seconds: float = 0.35, threshold: float = 0.012,
+                 rate: int = TARGET_RATE, window_seconds: float = 0.02):
+        self.rate = rate
+        self.max = max(1, int(max_seconds * rate))
+        self.pause = max(1, int(pause_seconds * rate))
+        self.min = max(1, int(min_seconds * rate))
+        self.threshold = float(threshold)
+        self.window = max(1, int(window_seconds * rate))
+        self._buf = np.zeros(0, dtype=np.float32)
+        self.consumed = 0
+
+    def _loud(self, frame: np.ndarray) -> bool:
+        return rms(frame) >= self.threshold
+
+    def _find_cut(self) -> int | None:
+        if self._buf.size >= self.max:
+            return self.max
+        speech = 0
+        silence = 0
+        pos = 0
+        limit = self._buf.size - (self._buf.size % self.window)
+        while pos < limit:
+            frame = self._buf[pos:pos + self.window]
+            if self._loud(frame):
+                speech += self.window
+                silence = 0
+            else:
+                silence += self.window
+                if speech >= self.min and silence >= self.pause:
+                    return pos + self.window
+            pos += self.window
+        return None
+
+    def feed(self, audio: np.ndarray) -> list[tuple[float, np.ndarray]]:
+        self._buf = np.concatenate([self._buf, np.asarray(audio, dtype=np.float32).reshape(-1)])
+        out = []
+        while True:
+            cut = self._find_cut()
+            if cut is None or cut <= 0:
+                break
+            chunk = self._buf[:cut].copy()
+            start = self.consumed / self.rate
+            self._buf = self._buf[cut:]
+            self.consumed += cut
+            if self._loud(chunk):
+                out.append((start, chunk))
+        return out
+
+    def flush(self, min_seconds: float = 0.2) -> list[tuple[float, np.ndarray]]:
+        if self._buf.size < int(min_seconds * self.rate) or not self._loud(self._buf):
+            self.consumed += self._buf.size
+            self._buf = np.zeros(0, dtype=np.float32)
+            return []
+        chunk = (self.consumed / self.rate, self._buf.copy())
+        self.consumed += self._buf.size
+        self._buf = np.zeros(0, dtype=np.float32)
+        return [chunk]
+
+
 class Chunker:
     """Collect 16 kHz mono audio and cut it into transcription chunks.
 
