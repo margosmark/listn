@@ -10,6 +10,7 @@ Layout under the data directory::
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import shutil
@@ -56,9 +57,22 @@ class SessionMeta:
     audio_file: str | None = None
     diarized: bool = False
     speakers: dict = field(default_factory=dict)
+    owner_pid: int | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if not pid or pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def new_id(now: datetime | None = None) -> str:
@@ -144,7 +158,7 @@ class Library:
                 sid = new_id()
             (self.root / sid).mkdir(parents=True)
             meta = SessionMeta(id=sid, title=title, created_at=datetime.now().isoformat(timespec="seconds"),
-                               source=source, **kwargs)
+                               source=source, owner_pid=os.getpid(), **kwargs)
             self.save_meta(meta)
             self.save_segments(sid, [])
             return meta
@@ -215,16 +229,22 @@ class Library:
         with self._lock:
             meta = self.get(session_id)
             for k, v in changes.items():
-                if k in SessionMeta.__dataclass_fields__ and k != "id":
+                if k in SessionMeta.__dataclass_fields__ and k not in ("id", "owner_pid"):
                     setattr(meta, k, v)
+            if changes.get("status") in ("recording", "transcribing"):
+                meta.owner_pid = os.getpid()
             self.save_meta(meta)
             return meta
 
     def recover_interrupted(self) -> int:
-        """Mark sessions left 'recording'/'transcribing' by a crash as errors."""
+        """Mark sessions left 'recording'/'transcribing' by a dead process as errors.
+
+        Sessions owned by another live listn process (e.g. the UI recording
+        while a CLI command starts) are left alone.
+        """
         count = 0
         for meta in self.list():
-            if meta.status in ("recording", "transcribing"):
+            if meta.status in ("recording", "transcribing") and not _pid_alive(meta.owner_pid):
                 meta.status = "error"
                 meta.error = "listn stopped before this session finished. The audio recorded so far is kept; use Retranscribe."
                 self.save_meta(meta)

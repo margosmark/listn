@@ -58,6 +58,17 @@ def test_recover_interrupted(lib):
     assert lib.get(m.id).status == "error"
 
 
+def test_recover_skips_sessions_owned_by_running_process(lib):
+    import os
+
+    m = lib.create("ui is recording", "live", status="recording")
+    meta = lib.get(m.id)
+    meta.owner_pid = os.getppid()
+    lib.save_meta(meta)
+    assert lib.recover_interrupted() == 0
+    assert lib.get(m.id).status == "recording"
+
+
 def test_import_audio_copies_into_session(lib, tmp_path):
     src = tmp_path / "call.MP3"
     src.write_bytes(b"123")
