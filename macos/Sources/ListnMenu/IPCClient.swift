@@ -144,14 +144,15 @@ final class IPCClient {
 
     private func readLoop(_ token: Int) {
         var buffer = Data()
-        var chunk = [UInt8](repeating: 0, count: 65536)
+        let capacity = 65536
+        var chunk = [UInt8](repeating: 0, count: capacity)
         while true {
             lock.lock()
             let current = generation
             let socketFD = fd
             lock.unlock()
             if current != token || socketFD < 0 { break }
-            let count = Darwin.read(socketFD, &chunk, chunk.count)
+            let count = Darwin.read(socketFD, &chunk, capacity)
             if count == 0 { break }
             if count < 0 {
                 if errno == EINTR { continue }

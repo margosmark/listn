@@ -13,6 +13,24 @@ import Darwin
 // The microphone is a separate AVAudioEngine input. The two streams stay
 // separate tracks: track 0 is other people, track 1 is you.
 
+// The SDK imports kAudioObjectSystemObject as Int32 and kAudioObjectUnknown
+// differs between SDK versions, so both are normalized to AudioObjectID once.
+private let systemObject = AudioObjectID(kAudioObjectSystemObject)
+private let noObject = AudioObjectID(kAudioObjectUnknown)
+
+/// A thread-safe slot for values written from a @Sendable completion handler.
+final class Locked<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Value
+
+    init(_ value: Value) { stored = value }
+
+    var value: Value {
+        get { lock.lock(); defer { lock.unlock() }; return stored }
+        set { lock.lock(); stored = newValue; lock.unlock() }
+    }
+}
+
 struct AudioApp {
     var objectID: AudioObjectID
     var pid: pid_t
@@ -21,7 +39,7 @@ struct AudioApp {
 }
 
 func listAudioApps() -> [AudioApp] {
-    let ids = audioObjectIDs(kAudioObjectSystemObject, kAudioHardwarePropertyProcessObjectList)
+    let ids = audioObjectIDs(systemObject, kAudioHardwarePropertyProcessObjectList)
     let selfPID = ProcessInfo.processInfo.processIdentifier
     var apps: [AudioApp] = []
     for objectID in ids {
@@ -40,13 +58,13 @@ func audioObjectID(for pid: pid_t) -> AudioObjectID? {
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain)
     var pidValue = pid
-    var object = AudioObjectID(kAudioObjectUnknown)
+    var object = noObject
     var size = UInt32(MemoryLayout<AudioObjectID>.size)
     let status = AudioObjectGetPropertyData(
-        AudioObjectID(kAudioObjectSystemObject), &address,
+        systemObject, &address,
         UInt32(MemoryLayout<pid_t>.size), &pidValue,
         &size, &object)
-    guard status == noErr, object != kAudioObjectUnknown else { return nil }
+    guard status == noErr, object != noObject else { return nil }
     return object
 }
 
@@ -78,8 +96,8 @@ final class CaptureEngine {
     var onLevels: ((Float, Float) -> Void)?
     var onWarning: ((String) -> Void)?
 
-    private var tapID = AudioObjectID(kAudioObjectUnknown)
-    private var aggregateID = AudioObjectID(kAudioObjectUnknown)
+    private var tapID = noObject
+    private var aggregateID = noObject
     private var procID: AudioDeviceIOProcID?
     private var format = AudioStreamBasicDescription()
     private var micEngine: AVAudioEngine?
@@ -110,9 +128,9 @@ final class CaptureEngine {
         // .unmuted keeps the meeting audible. .mutedWhenTapped would silence it.
         description.muteBehavior = .unmuted
 
-        var newTap = AudioObjectID(kAudioObjectUnknown)
+        var newTap = noObject
         let tapStatus = AudioHardwareCreateProcessTap(description, &newTap)
-        guard tapStatus == noErr, newTap != kAudioObjectUnknown else {
+        guard tapStatus == noErr, newTap != noObject else {
             throw CaptureError.tap(statusText(tapStatus))
         }
         tapID = newTap
@@ -150,13 +168,13 @@ final class CaptureEngine {
             AudioDeviceDestroyIOProcID(aggregateID, procID)
             self.procID = nil
         }
-        if aggregateID != kAudioObjectUnknown {
+        if aggregateID != noObject {
             AudioHardwareDestroyAggregateDevice(aggregateID)
-            aggregateID = AudioObjectID(kAudioObjectUnknown)
+            aggregateID = noObject
         }
-        if tapID != kAudioObjectUnknown {
+        if tapID != noObject {
             AudioHardwareDestroyProcessTap(tapID)
-            tapID = AudioObjectID(kAudioObjectUnknown)
+            tapID = noObject
         }
         systemDB = -120
         micDB = -120
@@ -181,13 +199,13 @@ final class CaptureEngine {
                 ],
             ],
         ]
-        var aggregate = AudioObjectID(kAudioObjectUnknown)
+        var aggregate = noObject
         let status = AudioHardwareCreateAggregateDevice(description as CFDictionary, &aggregate)
-        guard status == noErr, aggregate != kAudioObjectUnknown else {
+        guard status == noErr, aggregate != noObject else {
             throw CaptureError.aggregate(statusText(status))
         }
         aggregateID = aggregate
-        format = try streamFormat(aggregate)
+        format = try tapFormat(tapID)
         guard format.mSampleRate > 0, format.mChannelsPerFrame > 0 else {
             throw CaptureError.format
         }
@@ -208,13 +226,13 @@ final class CaptureEngine {
         let status = AVCaptureDevice.authorizationStatus(for: .audio)
         if status == .notDetermined {
             let semaphore = DispatchSemaphore(value: 0)
-            var granted = false
+            let granted = Locked(false)
             AVCaptureDevice.requestAccess(for: .audio) { ok in
-                granted = ok
+                granted.value = ok
                 semaphore.signal()
             }
             semaphore.wait()
-            if !granted {
+            if !granted.value {
                 throw CaptureError.io("microphone permission denied")
             }
         } else if status == .denied || status == .restricted {
@@ -239,10 +257,11 @@ final class CaptureEngine {
         guard running else { return }
         let channels = Int(format.mChannelsPerFrame)
         guard channels > 0 else { return }
-        guard format.mFormatFlags & kAudioFormatFlagIsFloat != 0 else { return }
+        let flags = format.mFormatFlags
+        guard flags & AudioFormatFlags(kAudioFormatFlagIsFloat) != 0 else { return }
         let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: list))
         guard !buffers.isEmpty else { return }
-        let nonInterleaved = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
+        let nonInterleaved = flags & AudioFormatFlags(kAudioFormatFlagIsNonInterleaved) != 0
         let samples: [Float]
         if nonInterleaved || buffers.count >= channels {
             let frames = Int(buffers[0].mDataByteSize) / MemoryLayout<Float>.size
@@ -320,14 +339,14 @@ private func statusText(_ status: OSStatus) -> String {
     return "OSStatus \(status)"
 }
 
-private func streamFormat(_ object: AudioObjectID) throws -> AudioStreamBasicDescription {
+private func tapFormat(_ tap: AudioObjectID) throws -> AudioStreamBasicDescription {
     var address = AudioObjectPropertyAddress(
-        mSelector: kAudioDevicePropertyStreamFormat,
-        mScope: kAudioObjectPropertyScopeInput,
+        mSelector: kAudioTapPropertyFormat,
+        mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain)
     var format = AudioStreamBasicDescription()
     var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-    let status = AudioObjectGetPropertyData(object, &address, 0, nil, &size, &format)
+    let status = AudioObjectGetPropertyData(tap, &address, 0, nil, &size, &format)
     guard status == noErr else { throw CaptureError.format }
     return format
 }

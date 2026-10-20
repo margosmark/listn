@@ -3,11 +3,11 @@ import PackageDescription
 
 // Language mode v5: this target is AppKit plus Core Audio callbacks, which are
 // not annotated for Swift 6 strict concurrency. The Swift 6.4 toolchain
-// (Command Line Tools) still builds it. Deployment target 14.2 is passed by
-// scripts/build-app.sh so CATapDescription is available without extra guards.
+// (Command Line Tools) still builds it. Process taps need macOS 14.2, which
+// `.v14` cannot express, so the deployment target is given as a string.
 let package = Package(
     name: "ListnMenu",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS("14.2")],
     products: [
         .executable(name: "ListnMenu", targets: ["ListnMenu"]),
     ],
