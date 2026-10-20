@@ -123,6 +123,10 @@ function renderSettings() {
   $("#auto-record").checked = !!s.auto_record_meetings;
   $("#launch-at-login").checked = !!s.launch_at_login;
   $("#vad-chunks").checked = s.vad_chunks !== false;
+  $("#match-speakers").checked = s.match_speakers !== false;
+  const threshold = Number(s.speaker_threshold ?? 0.72);
+  $("#speaker-threshold").value = threshold;
+  $("#speaker-threshold-label").textContent = threshold.toFixed(2);
   if (document.activeElement !== $("#vocabulary")) {
     $("#vocabulary").value = (s.vocabulary || []).join("\n");
   }
@@ -152,12 +156,28 @@ $$("[data-setting]").forEach(input => {
   input.addEventListener("change", () => {
     const key = input.dataset.setting;
     let value = input.type === "checkbox" ? input.checked : input.value;
-    if (key === "chunk_seconds") value = Number(value);
+    if (key === "chunk_seconds" || key === "speaker_threshold") value = Number(value);
     if (key === "language" && value === "") value = null;
     saveSetting(key, value);
   });
 });
 $("#chunk").addEventListener("input", e => { $("#chunk-label").textContent = `${e.target.value}s`; });
+$("#speaker-threshold").addEventListener("input", e => { $("#speaker-threshold-label").textContent = Number(e.target.value).toFixed(2); });
+$("#enroll-btn").addEventListener("click", async () => {
+  const name = $("#enroll-name").value.trim();
+  const file = $("#enroll-file").files[0];
+  if (!name || !file) { toast("Type a name and choose a WAV clip.", "error"); return; }
+  const body = new FormData();
+  body.append("name", name);
+  body.append("file", file);
+  try {
+    const res = await fetch("/api/speakers/enroll", { method: "POST", body });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "Could not save that voice.");
+    $("#enroll-state").textContent = `${data.name} · ${data.clips} clip${data.clips === 1 ? "" : "s"}`;
+    toast(`Learned ${data.name}`);
+  } catch (err) { toast(err.message, "error"); }
+});
 $("#hf-token").addEventListener("change", e => {
   const v = e.target.value.trim();
   e.target.value = "";
@@ -460,8 +480,25 @@ async function openSession(id, seekAt) {
     const label = s.speaker ? (meta.speakers?.[s.speaker] || s.speaker) : null;
     const ts = el(audio ? "button" : "span", { class: `ts ${audio ? "seek" : ""}`, text: clock(s.start), title: audio ? "Play from here" : null });
     if (audio) ts.addEventListener("click", () => { audio.currentTime = s.start; audio.play(); });
-    const row = el("div", { class: "seg" }, ts,
-      el("span", {}, label ? el("span", { class: (s.speaker === "Me" || label === "Me") ? "speaker me" : "speaker", text: `${label}:` }) : null, ...highlight(s.text, state.query)));
+    const who = el("span", {}, label ? el("span", { class: (s.speaker === "Me" || label === "Me") ? "speaker me" : "speaker", text: `${label}:` }) : null, ...highlight(s.text, state.query));
+    const row = el("div", { class: "seg" }, ts, who);
+    if (has_audio && s.speaker !== "Me" && label !== "Me" && s.text !== "[paused]") {
+      const name = el("input", {
+        class: "who", type: "text", placeholder: "This is…", maxlength: "60",
+        value: label && label !== "Others" ? label : "",
+        "aria-label": "Name this speaker",
+      });
+      name.addEventListener("change", async () => {
+        const person = name.value.trim();
+        if (!person) return;
+        try {
+          await api("POST", "/api/speakers/correct", { session_id: id, start: s.start, name: person });
+          toast(`Learned ${person}`);
+          openSession(id);
+        } catch (err) { toast(err.message, "error"); }
+      });
+      row.append(name);
+    }
     row.dataset.start = s.start; row.dataset.end = s.end;
     return row;
   });

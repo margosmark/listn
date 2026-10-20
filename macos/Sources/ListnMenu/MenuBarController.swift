@@ -47,7 +47,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let libraryItem = NSMenuItem(title: "Open library", action: #selector(openLibrary), keyEquivalent: "")
     private let meetingItem = NSMenuItem(title: "Record this meeting", action: #selector(recordOfferedMeeting), keyEquivalent: "")
     private let bookmarkItem = NSMenuItem(title: "Bookmark this moment", action: #selector(bookmarkMoment), keyEquivalent: "")
+    private let captionsItem = NSMenuItem(title: "Live captions", action: #selector(toggleCaptions), keyEquivalent: "")
     private let loginItem = NSMenuItem(title: "Launch at login", action: #selector(toggleLogin), keyEquivalent: "")
+    private let captions = CaptionsWindow()
     private let quitItem = NSMenuItem(title: "Quit listn", action: #selector(quit), keyEquivalent: "")
 
     private var source: Source = .system
@@ -79,7 +81,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         statusItem.button?.image = image
         statusItem.button?.toolTip = "listn"
 
-        for item in [startItem, micItem, libraryItem, meetingItem, bookmarkItem, loginItem, quitItem] {
+        for item in [startItem, micItem, libraryItem, meetingItem, bookmarkItem, captionsItem, loginItem, quitItem] {
             item.target = self
         }
         meetingItem.isHidden = true
@@ -110,6 +112,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(errorItem)
         menu.addItem(meetingItem)
         menu.addItem(bookmarkItem)
+        menu.addItem(captionsItem)
         menu.addItem(libraryItem)
         menu.addItem(loginItem)
         menu.addItem(quitItem)
@@ -265,6 +268,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         source = .app(pid: hit.pid, name: hit.name)
         meetings.track(hit)
         toggleRecording(nil)
+    }
+
+    @objc private func toggleCaptions(_ sender: Any?) {
+        captions.toggle()
+        captionsItem.state = captions.isVisible ? .on : .off
+        if captions.isVisible {
+            captions.showLines(lines.map { (speaker: $0.speaker, text: $0.text) })
+        }
     }
 
     @objc private func bookmarkMoment(_ sender: Any?) {
@@ -628,6 +639,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             meetingItem.action = #selector(recordOfferedMeeting)
         }
         bookmarkItem.isEnabled = phase == .recording
+        captionsItem.state = captions.isVisible ? .on : .off
         let symbol = phase == .recording || phase == .finishing ? "record.circle" : "waveform"
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "listn")
         image?.isTemplate = true
@@ -657,6 +669,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             } else {
                 item.isHidden = true
             }
+        }
+        if captions.isVisible {
+            captions.showLines(lines.map { (speaker: $0.speaker, text: $0.text) })
         }
     }
 }

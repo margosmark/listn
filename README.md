@@ -134,6 +134,19 @@ ScreenCaptureKit is not used. It can capture app audio, but the permission is sc
 
 The tap is private and **unmuted**, so the meeting keeps playing through your speakers. Nothing is muted and nothing is exclusive.
 
+## Known speakers
+
+Voices on the Others track can be matched to people you have already named. The embedding is 64 log-magnitude bands of a short clip, mean-centred and normalised. Nothing is downloaded. Profiles live in `speakers/<name>.json` (up to 24 clips each). A match has to clear the threshold in Settings (default 0.72). **Me** is never enrolled; that track is already you.
+
+Teach a voice in either of two ways:
+
+- In a saved session, type a name in **This is…** on an Others line. That clip is added to the profile and the line is renamed.
+- In Settings, save a short WAV of one person talking.
+
+The next meeting compares each Others chunk with those profiles and labels the line when it is confident. Correcting a wrong name adds the new clip, so the profile gets better. Turn matching off with *Match known voices on the Others track*.
+
+The menu bar can show a floating captions window (**Live captions**). It stays above other windows, including full-screen spaces, and does not take keyboard focus. It is off until you turn it on.
+
 ## Speaker labels (optional, for more than Me / Others)
 
 1. `uv sync --extra diarize`
@@ -154,6 +167,7 @@ sessions/<id>/transcript.json
 sessions/<id>/audio.wav             # mix for playback
 sessions/<id>/audio-system.wav      # Others
 sessions/<id>/audio-mic.wav         # Me
+speakers/<name>.json            # voice profile, no model download
 ```
 
 Legacy and file recordings are a single `audio.wav` (or the imported file). Recordings are 16 kHz 16-bit WAV. Turn off *Keep the audio recording* in the web UI if you only want text. Models are cached in `~/.cache/huggingface`.
@@ -205,9 +219,10 @@ This repo's tests do not open a process tap. On the Mac, check:
 6. A short call: your voice is **Me**, the other side is **Others**, in the menu and in the library.
 7. Open Library. The web UI loads on `127.0.0.1` only. The live page shows the same lines. Export still works.
 8. Start a Zoom or Meet call. The menu offers to record, and with automatic recording on it starts by itself and offers to stop when the call ends. An overlapping calendar event titles the session. Control-Option-B leaves a bookmark you can seek to. Launch at login survives a reboot.
-9. Quit and reopen. If you denied a permission, System Settings shows **listn** (not "python" or a blank name) under System Audio Recording and Microphone.
-10. Legacy: install BlackHole only if you want it, pick it in the web UI, choose **Legacy input device** in the menu, and confirm the old path still records.
-11. With `uv sync --extra mlx` and model `large-v3-turbo`, two live tracks stay caught up (the UI should not sit on "N chunks waiting" during normal speech).
+9. Name an Others line in the library (**This is…**). Record again with that person on the far side: the new lines should use that name when the match is confident. **Live captions** stays above a full-screen meeting and updates as lines arrive.
+10. Quit and reopen. If you denied a permission, System Settings shows **listn** (not "python" or a blank name) under System Audio Recording and Microphone.
+11. Legacy: install BlackHole only if you want it, pick it in the web UI, choose **Legacy input device** in the menu, and confirm the old path still records.
+12. With `uv sync --extra mlx` and model `large-v3-turbo`, two live tracks stay caught up (the UI should not sit on "N chunks waiting" during normal speech).
 
 ## Troubleshooting
 

@@ -56,6 +56,8 @@ class SettingsIn(BaseModel):
     launch_at_login: bool | None = None
     vocabulary: list[str] | None = None
     vad_chunks: bool | None = None
+    match_speakers: bool | None = None
+    speaker_threshold: float | None = None
 
 
 class DeviceTestIn(BaseModel):
@@ -85,6 +87,12 @@ class NotesIn(BaseModel):
 
 class AskIn(BaseModel):
     question: str = ""
+
+
+class SpeakerCorrectIn(BaseModel):
+    session_id: str
+    start: float
+    name: str
 
 
 def _host_ok(host_header: str) -> bool:
@@ -280,6 +288,53 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
 
         index = SearchIndex(eng().library)
         return {"results": index.sessions_for(q), "hits": index.search(q)}
+
+    @app.get("/api/speakers")
+    def speakers():
+        from listn.speakers import SpeakerBook
+
+        return {"speakers": SpeakerBook().list(), "threshold": app.state.settings.speaker_threshold}
+
+    @app.post("/api/speakers/correct")
+    def correct_speaker(body: SpeakerCorrectIn):
+        from listn.speakers import SpeakerBook, correct_segment
+
+        name = " ".join(body.name.split())
+        if not name:
+            raise HTTPException(400, "Type the person's name.")
+        try:
+            return correct_segment(eng().library, SpeakerBook(), body.session_id, body.start, name)
+        except FileNotFoundError as exc:
+            raise HTTPException(400, str(exc))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except KeyError:
+            raise HTTPException(404, "Session not found.")
+
+    @app.post("/api/speakers/enroll")
+    async def enroll_speaker(name: str = Form(""), file: UploadFile = File(...)):
+        from listn.speakers import SpeakerBook
+
+        label = " ".join(name.split())
+        if not label:
+            raise HTTPException(400, "Type the person's name.")
+        raw = await file.read()
+        if not raw or len(raw) > 20_000_000:
+            raise HTTPException(400, "Choose a short WAV clip.")
+        tmp = Path(tempfile.mkdtemp(prefix="lt")) / "clip.wav"
+        try:
+            tmp.write_bytes(raw)
+            from listn.audio import read_wav
+
+            audio = read_wav(tmp)
+        except Exception as exc:
+            raise HTTPException(400, f"Could not read that clip ({exc}). Use a WAV file.")
+        finally:
+            shutil.rmtree(tmp.parent, ignore_errors=True)
+        try:
+            return SpeakerBook().enroll(label, audio)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
 
     @app.post("/api/ask")
     def ask_library(body: AskIn):

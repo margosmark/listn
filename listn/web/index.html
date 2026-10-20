@@ -183,6 +183,22 @@
       <input type="checkbox" id="vad-chunks" data-setting="vad_chunks">
       <span>Cut live audio on pauses</span>
     </label>
+    <label class="toggle">
+      <input type="checkbox" id="match-speakers" data-setting="match_speakers">
+      <span>Match known voices on the Others track</span>
+    </label>
+    <label class="field">
+      <span>Voice match threshold: <strong id="speaker-threshold-label"></strong></span>
+      <input type="range" id="speaker-threshold" min="0.4" max="0.95" step="0.01" data-setting="speaker_threshold">
+      <small class="muted">Higher means fewer wrong names. Correcting a line in the library teaches the voice.</small>
+    </label>
+    <label class="field">
+      <span>Enroll a voice from a WAV clip</span>
+      <input type="text" id="enroll-name" placeholder="Name" maxlength="60" autocomplete="off">
+      <input type="file" id="enroll-file" accept=".wav,audio/wav">
+      <button type="button" class="btn ghost small" id="enroll-btn">Save voice</button>
+      <small class="muted" id="enroll-state">A few seconds of one person talking is enough. You can also name a line in a saved session.</small>
+    </label>
     <label class="field">
       <span>Vocabulary <em class="muted">(one name or term per line)</em></span>
       <textarea id="vocabulary" rows="5" placeholder="Priya&#10;Q3 forecast"></textarea>

@@ -89,6 +89,8 @@ class Settings:
     launch_at_login: bool = False
     vocabulary: list = field(default_factory=list)
     vad_chunks: bool = True
+    match_speakers: bool = True
+    speaker_threshold: float = 0.72
 
     @classmethod
     def path(cls) -> Path:
@@ -125,6 +127,11 @@ class Settings:
 
         self.vocabulary = clean_vocabulary(self.vocabulary)
         self.vad_chunks = bool(self.vad_chunks)
+        self.match_speakers = bool(self.match_speakers)
+        try:
+            self.speaker_threshold = min(0.95, max(0.4, float(self.speaker_threshold)))
+        except (TypeError, ValueError):
+            self.speaker_threshold = 0.72
         return self
 
     def save(self) -> None:
