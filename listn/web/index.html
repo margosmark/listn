@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>listn</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%234f46e5'/><path d='M9 20v-8M13 23V9M17 20v-8M21 17v-2' stroke='white' stroke-width='2.4' stroke-linecap='round'/></svg>">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M9 20v-8M13 23V9M17 20v-8M21 17v-2" /></svg></span>
+    <span class="brand-name">listn</span>
+  </div>
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-view="live" class="tab active">Live</button>
+    <button role="tab" data-view="files" class="tab">Transcribe file</button>
+    <button role="tab" data-view="library" class="tab">Library</button>
+  </nav>
+  <div class="topbar-right">
+    <span class="local-badge" title="The server only listens on 127.0.0.1. Audio and transcripts never leave this Mac.">
+      <span class="dot"></span>Local only
+    </span>
+    <button class="icon-btn" id="settings-btn" aria-label="Settings" title="Settings">
+      <svg viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
+    </button>
+  </div>
+</header>
+
+<main>
+  <!-- LIVE -->
+  <section class="view active" id="view-live">
+    <div class="live-grid">
+      <aside class="panel controls">
+        <h2>Capture</h2>
+        <div id="guidance" class="guidance"></div>
+
+        <label class="field">
+          <span>Input device</span>
+          <div class="row">
+            <select id="device"></select>
+            <button class="btn ghost small" id="refresh-devices" title="Re-scan devices">Rescan</button>
+          </div>
+        </label>
+        <div class="row gap">
+          <button class="btn secondary small" id="test-device">Test input</button>
+          <span id="test-result" class="muted small-text"></span>
+        </div>
+        <div id="test-meters" class="test-meters"></div>
+
+        <div class="two">
+          <label class="field">
+            <span>Model</span>
+            <select id="model" data-setting="model"></select>
+          </label>
+          <label class="field">
+            <span>Language</span>
+            <select id="language" data-setting="language"></select>
+          </label>
+        </div>
+
+        <label class="toggle">
+          <input type="checkbox" id="save-audio" data-setting="save_audio">
+          <span>Keep the audio recording</span>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="diarize-after" data-setting="diarize_after">
+          <span>Label speakers after stopping</span>
+        </label>
+        <p class="hint" id="diarize-hint"></p>
+
+        <label class="field">
+          <span>Title <em class="muted">(optional)</em></span>
+          <input type="text" id="live-title" placeholder="e.g. Weekly design review" maxlength="200">
+        </label>
+      </aside>
+
+      <section class="panel stage">
+        <div class="stage-head">
+          <button class="record-btn" id="record-btn" aria-label="Start recording">
+            <span class="record-icon"></span>
+            <span class="record-label">Start</span>
+          </button>
+          <div class="stage-meta">
+            <div class="timer" id="timer">00:00</div>
+            <div class="status-line" id="live-status">Ready when you are.</div>
+            <div class="meter" aria-hidden="true"><div class="meter-fill" id="meter-fill"></div></div>
+          </div>
+          <div class="stage-stats" id="live-stats"></div>
+        </div>
+        <div class="transcript live-transcript" id="live-transcript">
+          <div class="empty" id="live-empty">
+            <svg viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"/><path d="M19 11a7 7 0 0 1-14 0M12 18v3"/></svg>
+            <p>Press <strong>Start</strong> and the transcript will appear here as people speak.</p>
+            <p class="muted">Tip: use <em>Test input</em> first to make sure listn hears your meeting audio.</p>
+          </div>
+        </div>
+        <div class="stage-foot">
+          <label class="toggle small"><input type="checkbox" id="autoscroll" checked><span>Auto-scroll</span></label>
+          <button class="btn ghost small" id="open-live-session" hidden>Open in library</button>
+        </div>
+      </section>
+    </div>
+  </section>
+
+  <!-- FILES -->
+  <section class="view" id="view-files">
+    <div class="files-grid">
+      <section class="panel">
+        <h2>Transcribe an audio file</h2>
+        <p class="muted">WAV, MP3, M4A, FLAC, OGG, and video files with audio. The file is copied into your private listn library.</p>
+        <label class="dropzone" id="dropzone">
+          <input type="file" id="file-input" accept=".wav,.mp3,.m4a,.flac,.ogg,.aac,.mp4,.mov,.webm,.aiff,.aif,audio/*" multiple>
+          <svg viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+          <strong>Drop audio here</strong>
+          <span class="muted">or click to choose files</span>
+        </label>
+        <div id="file-picked" class="file-picked"></div>
+        <div class="two">
+          <label class="field"><span>Model</span><select id="file-model" data-setting="model"></select></label>
+          <label class="field"><span>Language</span><select id="file-language" data-setting="language"></select></label>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="file-diarize">
+          <span>Label speakers</span>
+        </label>
+        <p class="hint" id="file-diarize-hint"></p>
+        <button class="btn primary" id="file-submit" disabled>Transcribe</button>
+      </section>
+      <section class="panel">
+        <h2>Queue</h2>
+        <div id="jobs" class="jobs"><p class="muted empty-small">No files in progress.</p></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- LIBRARY -->
+  <section class="view" id="view-library">
+    <div class="library-grid">
+      <aside class="panel lib-list">
+        <div class="search">
+          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          <input type="search" id="search" placeholder="Search transcripts" autocomplete="off">
+        </div>
+        <div id="sessions" class="sessions"></div>
+      </aside>
+      <section class="panel lib-detail" id="detail">
+        <div class="empty">
+          <svg viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h10"/></svg>
+          <p>Select a recording or transcript to read, play, or export it.</p>
+        </div>
+      </section>
+    </div>
+  </section>
+</main>
+
+<dialog id="settings-dialog">
+  <form method="dialog" class="dialog-body" id="settings-form">
+    <h2>Settings</h2>
+    <label class="field"><span>Transcription backend</span><select id="backend" data-setting="backend"></select></label>
+    <p class="hint" id="backend-hint"></p>
+    <label class="field">
+      <span>Live chunk length: <strong id="chunk-label"></strong></span>
+      <input type="range" id="chunk" min="3" max="20" step="1" data-setting="chunk_seconds">
+      <small class="muted">Shorter means lower delay. Longer gives Whisper more context and better accuracy.</small>
+    </label>
+    <label class="field">
+      <span>Hugging Face token <em class="muted">(only for the first speaker-model download)</em></span>
+      <input type="password" id="hf-token" placeholder="hf_..." autocomplete="off">
+      <small class="muted" id="hf-token-state"></small>
+    </label>
+    <div class="field">
+      <span>Data folder</span>
+      <code id="data-dir"></code>
+    </div>
+    <div class="dialog-actions">
+      <button class="btn primary" value="close">Done</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<script src="/static/app.js" type="module"></script>
+</body>
+</html>

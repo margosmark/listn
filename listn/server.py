@@ -1,0 +1,337 @@
+"""Localhost-only web UI and JSON API.
+
+The server binds to 127.0.0.1 only. Requests whose Host header isn't a
+loopback name are rejected (blocks DNS-rebinding), and state-changing
+requests must come from the UI's own origin (blocks cross-site requests from
+other pages open in your browser).
+"""
+
+from __future__ import annotations
+
+import json
+import queue
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from listn import __version__, diarize
+from listn import devices as devmod
+from listn.capture import DeviceError, measure_levels
+from listn.config import BACKENDS, MODELS, Settings, data_dir
+from listn.engine import Engine
+from listn.library import AUDIO_EXTS, EXPORT_FORMATS, export
+from listn.transcriber import available_backends, resolve_backend
+
+WEB_DIR = Path(__file__).parent / "web"
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+MIME = {"txt": "text/plain", "md": "text/markdown", "srt": "application/x-subrip",
+        "vtt": "text/vtt", "json": "application/json"}
+
+
+class SettingsIn(BaseModel):
+    device: str | None = None
+    model: str | None = None
+    language: str | None = None
+    backend: str | None = None
+    chunk_seconds: float | None = None
+    save_audio: bool | None = None
+    diarize_after: bool | None = None
+    hf_token: str | None = None
+
+
+class DeviceTestIn(BaseModel):
+    device: str | None = None
+    seconds: float = 2.0
+
+
+class LiveStartIn(BaseModel):
+    title: str | None = None
+
+
+class SessionPatch(BaseModel):
+    title: str | None = None
+    speakers: dict[str, str] | None = None
+
+
+class RetranscribeIn(BaseModel):
+    diarize: bool = False
+
+
+def _host_ok(host_header: str) -> bool:
+    host = host_header.strip().lower()
+    if host.startswith("["):
+        name = host.split("]")[0] + "]"
+    else:
+        name = host.split(":")[0]
+    return name in LOOPBACK_HOSTS
+
+
+def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
+    app = FastAPI(title="listn", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.engine = engine or Engine(sd=sd)
+    app.state.sd = sd
+    app.state.settings = Settings.load()
+
+    def eng() -> Engine:
+        return app.state.engine
+
+    @app.middleware("http")
+    async def local_only(request: Request, call_next):
+        if not _host_ok(request.headers.get("host", "")):
+            return PlainTextResponse("listn only answers on localhost.", status_code=403)
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            origin = request.headers.get("origin")
+            if origin:
+                origin_host = origin.split("://", 1)[-1]
+                if not _host_ok(origin_host):
+                    return PlainTextResponse("Cross-origin request blocked.", status_code=403)
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+
+    def _sd():
+        if app.state.sd is not None:
+            return app.state.sd
+        import sounddevice
+
+        return sounddevice
+
+    def device_report() -> dict:
+        try:
+            sd = _sd()
+            all_devices = devmod.list_all(sd)
+            output = devmod.default_output_name(sd)
+        except Exception as exc:
+            return {"inputs": [], "default_output": None, "selected": None,
+                    "guidance": [{"level": "error", "title": "Audio system unavailable", "detail": str(exc)}]}
+        inputs = [d for d in all_devices if d.inputs > 0]
+        selected = None
+        try:
+            selected = devmod.resolve(app.state.settings.device, all_devices).name
+        except LookupError:
+            pass
+        return {"inputs": [d.to_dict() for d in inputs], "default_output": output, "selected": selected,
+                "guidance": devmod.setup_guidance(all_devices, output)}
+
+    @app.get("/api/status")
+    def status():
+        e = eng()
+        return {
+            "version": __version__,
+            "settings": app.state.settings.public(),
+            "models": MODELS,
+            "backends": BACKENDS,
+            "backend_available": available_backends(),
+            "resolved_backend": resolve_backend(app.state.settings.backend),
+            "diarization_available": diarize.available(),
+            "data_dir": str(data_dir()),
+            "live": e.live.status() if e.live else None,
+            "live_active": e.live_active(),
+            "jobs": [j.to_dict() for j in e.jobs.values()],
+        }
+
+    @app.get("/api/devices")
+    def get_devices():
+        return device_report()
+
+    @app.post("/api/devices/test")
+    def test_device(body: DeviceTestIn):
+        if eng().live_active():
+            raise HTTPException(409, "Stop the current recording before testing a device.")
+        try:
+            return measure_levels(body.device or app.state.settings.device,
+                                  seconds=min(5.0, max(0.5, body.seconds)), sd=_sd())
+        except DeviceError as exc:
+            raise HTTPException(400, str(exc))
+
+    @app.get("/api/settings")
+    def get_settings():
+        return app.state.settings.public()
+
+    @app.put("/api/settings")
+    def put_settings(body: SettingsIn):
+        current = app.state.settings
+        changes = body.model_dump(exclude_unset=True)
+        if "model" in changes and changes["model"] not in MODELS:
+            raise HTTPException(400, f"Unknown model. Choose one of {', '.join(MODELS)}.")
+        if "backend" in changes and changes["backend"] not in BACKENDS:
+            raise HTTPException(400, f"Unknown backend. Choose one of {', '.join(BACKENDS)}.")
+        for key, value in changes.items():
+            setattr(current, key, value)
+        current.validated().save()
+        return current.public()
+
+    @app.post("/api/live/start")
+    def live_start(body: LiveStartIn):
+        try:
+            session = eng().start_live(Settings(**{**app.state.settings.__dict__}), body.title)
+        except RuntimeError as exc:
+            raise HTTPException(409 if "already" in str(exc) else 400, str(exc))
+        return session.status()
+
+    @app.post("/api/live/stop")
+    def live_stop():
+        meta = eng().stop_live(wait=False)
+        if meta is None:
+            raise HTTPException(409, "Nothing is recording.")
+        return {"id": meta.id}
+
+    @app.get("/api/live")
+    def live_status():
+        e = eng()
+        if not e.live:
+            return {"live": None}
+        return {"live": e.live.status(), "segments": [s.to_dict() for s in e.live.segments]}
+
+    @app.post("/api/files")
+    async def upload(file: UploadFile = File(...), title: str = Form(""), diarize_speakers: bool = Form(False)):
+        name = Path(file.filename or "audio").name
+        ext = Path(name).suffix.lower()
+        if ext not in AUDIO_EXTS:
+            raise HTTPException(400, f"Unsupported file type '{ext or name}'. Use one of: {', '.join(sorted(AUDIO_EXTS))}.")
+        tmp_dir = data_dir() / "tmp"
+        tmp_dir.mkdir(exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=tmp_dir, suffix=ext, delete=False) as tmp:
+            shutil.copyfileobj(file.file, tmp, length=1024 * 1024)
+            tmp_path = Path(tmp.name)
+        settings = Settings(**{**app.state.settings.__dict__})
+        job = eng().enqueue_file(tmp_path, title.strip() or Path(name).stem, settings, diarize_speakers, move=True)
+        eng().library.update(job.meta.id, source_name=name)
+        return job.to_dict()
+
+    @app.post("/api/jobs/{session_id}/cancel")
+    def cancel_job(session_id: str):
+        if not eng().cancel_job(session_id):
+            raise HTTPException(404, "No running job for that session.")
+        return {"ok": True}
+
+    def _meta(session_id: str):
+        try:
+            return eng().library.get(session_id)
+        except KeyError:
+            raise HTTPException(404, "Session not found.")
+
+    @app.get("/api/sessions")
+    def sessions(q: str = ""):
+        return {"results": eng().library.search(q)}
+
+    @app.get("/api/sessions/{session_id}")
+    def session(session_id: str):
+        meta = _meta(session_id)
+        lib = eng().library
+        return {"meta": meta.to_dict(), "segments": [s.to_dict() for s in lib.segments(session_id)],
+                "has_audio": lib.audio_path(meta) is not None}
+
+    @app.patch("/api/sessions/{session_id}")
+    def patch_session(session_id: str, body: SessionPatch):
+        _meta(session_id)
+        changes = body.model_dump(exclude_none=True)
+        if "title" in changes:
+            changes["title"] = changes["title"].strip()[:200] or "Untitled"
+        return eng().library.update(session_id, **changes).to_dict()
+
+    @app.delete("/api/sessions/{session_id}")
+    def delete_session(session_id: str):
+        e = eng()
+        if e.live_active() and e.live.meta.id == session_id:
+            raise HTTPException(409, "Stop the recording before deleting it.")
+        if session_id in e.jobs:
+            raise HTTPException(409, "Cancel the transcription before deleting it.")
+        _meta(session_id)
+        e.library.delete(session_id)
+        return {"ok": True}
+
+    @app.post("/api/sessions/{session_id}/retranscribe")
+    def retranscribe(session_id: str, body: RetranscribeIn):
+        e = eng()
+        meta = _meta(session_id)
+        audio = e.library.audio_path(meta)
+        if audio is None:
+            raise HTTPException(400, "This session has no saved audio to transcribe.")
+        if session_id in e.jobs or (e.live_active() and e.live.meta.id == session_id):
+            raise HTTPException(409, "This session is busy.")
+        settings = Settings(**{**app.state.settings.__dict__})
+        return e.enqueue_file(audio, meta.title, settings, body.diarize, existing=meta).to_dict()
+
+    @app.get("/api/sessions/{session_id}/export")
+    def export_session(session_id: str, format: str = "txt"):
+        meta = _meta(session_id)
+        if format not in EXPORT_FORMATS:
+            raise HTTPException(400, f"Format must be one of {', '.join(EXPORT_FORMATS)}.")
+        body = export(meta, eng().library.segments(session_id), format)
+        safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in meta.title).strip() or meta.id
+        return Response(body, media_type=f"{MIME[format]}; charset=utf-8",
+                        headers={"Content-Disposition": f'attachment; filename="{safe}.{format}"'})
+
+    @app.get("/api/sessions/{session_id}/audio")
+    def session_audio(session_id: str):
+        meta = _meta(session_id)
+        path = eng().library.audio_path(meta)
+        if path is None:
+            raise HTTPException(404, "No audio saved for this session.")
+        return FileResponse(path)
+
+    @app.post("/api/sessions/{session_id}/reveal")
+    def reveal(session_id: str):
+        meta = _meta(session_id)
+        target = eng().library.audio_path(meta) or (eng().library.root / meta.id)
+        if sys.platform != "darwin":
+            return {"ok": False, "path": str(target)}
+        subprocess.run(["open", "-R", str(target)], check=False)
+        return {"ok": True, "path": str(target)}
+
+    @app.get("/api/events")
+    def events():
+        bus = eng().bus
+        q = bus.subscribe()
+
+        def stream():
+            try:
+                yield "retry: 2000\n\n"
+                while True:
+                    try:
+                        event = q.get(timeout=15)
+                    except queue.Empty:
+                        yield ": keepalive\n\n"
+                        continue
+                    yield f"data: {json.dumps(event)}\n\n"
+            finally:
+                bus.unsubscribe(q)
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
+    @app.get("/")
+    def index():
+        return FileResponse(WEB_DIR / "index.html")
+
+    app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
+
+    @app.exception_handler(Exception)
+    async def unhandled(request: Request, exc: Exception):
+        return JSONResponse({"detail": f"Unexpected error: {exc}"}, status_code=500)
+
+    return app
+
+
+def serve(port: int = 8765, open_browser: bool = True) -> None:
+    import threading
+    import webbrowser
+
+    import uvicorn
+
+    app = create_app()
+    url = f"http://127.0.0.1:{port}"
+    if open_browser:
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    print(f"listn is running at {url}  (local only; Ctrl+C to quit)")
+    print(f"Data directory: {data_dir()}")
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
