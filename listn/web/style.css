@@ -142,7 +142,8 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .test-meters .bar > div { height: 100%; background: var(--ok); }
 
 .transcript { flex: 1; overflow: auto; padding: 14px 18px 30px; }
-.seg { display: grid; grid-template-columns: 62px 1fr; gap: 12px; padding: 6px 8px; border-radius: 8px; animation: fadein .25s ease-out; }
+.seg { display: grid; grid-template-columns: 62px 1fr auto; gap: 12px; padding: 6px 8px; border-radius: 8px; animation: fadein .25s ease-out; align-items: start; }
+.seg input.who { width: 120px; padding: 2px 8px; font-size: 12px; }
 .seg:hover { background: var(--bg); }
 .seg .ts { font: 12px/1.9 var(--mono); color: var(--muted); cursor: default; background: none; border: 0; padding: 0; text-align: left; }
 .seg .ts.seek { cursor: pointer; color: var(--accent); }

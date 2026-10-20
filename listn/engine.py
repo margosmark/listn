@@ -348,6 +348,16 @@ class LiveSession:
                 break
             track, start, chunk = item
             speaker = TRACK_SPEAKER.get(track)
+            if speaker == "Others" and self.settings.match_speakers:
+                from listn.speakers import SpeakerBook
+
+                matched, _score = SpeakerBook().match(chunk, self.settings.speaker_threshold)
+                if matched:
+                    speaker = matched
+                    self.meta.speakers = dict(self.meta.speakers or {})
+                    if self.meta.speakers.get(matched) != matched:
+                        self.meta.speakers[matched] = matched
+                        self.library.save_meta(self.meta)
             try:
                 raw = model.transcribe(
                     chunk, language=self.settings.language,
