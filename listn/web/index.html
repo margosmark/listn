@@ -179,12 +179,21 @@
       <input type="checkbox" id="launch-at-login" data-setting="launch_at_login">
       <span>Launch at login</span>
     </label>
+    <label class="toggle">
+      <input type="checkbox" id="vad-chunks" data-setting="vad_chunks">
+      <span>Cut live audio on pauses</span>
+    </label>
+    <label class="field">
+      <span>Vocabulary <em class="muted">(one name or term per line)</em></span>
+      <textarea id="vocabulary" rows="5" placeholder="Priya&#10;Q3 forecast"></textarea>
+      <small class="muted">Whisper sees these as its initial prompt. faster-whisper also gets them as hotwords.</small>
+    </label>
     <label class="field"><span>Transcription backend</span><select id="backend" data-setting="backend"></select></label>
     <p class="hint" id="backend-hint"></p>
     <label class="field">
       <span>Live chunk length: <strong id="chunk-label"></strong></span>
       <input type="range" id="chunk" min="3" max="20" step="1" data-setting="chunk_seconds">
-      <small class="muted">Shorter means lower delay. Longer gives Whisper more context and better accuracy.</small>
+      <small class="muted">Live audio is cut on a pause. This is the longest a chunk can run if nobody pauses.</small>
     </label>
     <label class="field">
       <span>Notes model <em class="muted">(MLX, downloaded once)</em></span>

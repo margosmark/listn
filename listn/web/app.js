@@ -122,6 +122,10 @@ function renderSettings() {
   $("#offer-meetings").checked = s.offer_meetings !== false;
   $("#auto-record").checked = !!s.auto_record_meetings;
   $("#launch-at-login").checked = !!s.launch_at_login;
+  $("#vad-chunks").checked = s.vad_chunks !== false;
+  if (document.activeElement !== $("#vocabulary")) {
+    $("#vocabulary").value = (s.vocabulary || []).join("\n");
+  }
   if (document.activeElement !== $("#llm-model")) $("#llm-model").value = s.llm_model || "";
   $("#chunk").value = s.chunk_seconds;
   $("#chunk-label").textContent = `${s.chunk_seconds}s`;
@@ -160,6 +164,10 @@ $("#hf-token").addEventListener("change", e => {
   saveSetting("hf_token", v || null);
 });
 $("#settings-btn").addEventListener("click", () => $("#settings-dialog").showModal());
+$("#vocabulary").addEventListener("change", e => {
+  const words = e.target.value.split("\n").map(s => s.trim()).filter(Boolean);
+  saveSetting("vocabulary", words);
+});
 
 /* ---------- devices ---------- */
 async function loadDevices() {

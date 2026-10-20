@@ -110,11 +110,11 @@ class Transcriber:
         self.model_name = model
 
     def segments(self, audio: np.ndarray, language: str | None = None,
-                 prompt: str | None = None, vad: bool = True) -> Iterator[RawSegment]:
+                 prompt: str | None = None, vad: bool = True, hotwords: str | None = None) -> Iterator[RawSegment]:
         raise NotImplementedError
 
     def transcribe(self, audio: np.ndarray, language: str | None = None, prompt: str | None = None,
-                   vad: bool = True, offset: float = 0.0,
+                   vad: bool = True, offset: float = 0.0, hotwords: str | None = None,
                    progress: Callable[[float], None] | None = None) -> list[RawSegment]:
         """Transcribe and filter. Segment times are shifted by ``offset``."""
         audio = np.asarray(audio, dtype=np.float32).reshape(-1)
@@ -123,7 +123,7 @@ class Transcriber:
         quiet = rms(audio) < SPEECH_RMS_GATE * 2
         duration = audio.size / TARGET_RATE
         out = []
-        for seg in self.segments(audio, language, prompt, vad):
+        for seg in self.segments(audio, language, prompt, vad, hotwords):
             text = seg.text.strip()
             if progress and duration > 0:
                 progress(min(1.0, seg.end / duration))
@@ -156,11 +156,18 @@ class FasterWhisper(Transcriber):
             on_download=(lambda: download(f"Downloading Whisper '{model}' (one time)...")) if download else None,
         )
 
-    def segments(self, audio, language=None, prompt=None, vad=True):
-        segs, _info = self._model.transcribe(
-            audio, language=language, initial_prompt=prompt, vad_filter=vad,
+    def segments(self, audio, language=None, prompt=None, vad=True, hotwords=None):
+        kwargs = dict(
+            language=language, initial_prompt=prompt, vad_filter=vad,
             beam_size=5, condition_on_previous_text=False,
         )
+        if hotwords:
+            kwargs["hotwords"] = hotwords
+        try:
+            segs, _info = self._model.transcribe(audio, **kwargs)
+        except TypeError:
+            kwargs.pop("hotwords", None)
+            segs, _info = self._model.transcribe(audio, **kwargs)
         for s in segs:
             yield RawSegment(s.start, s.end, s.text, getattr(s, "no_speech_prob", 0.0))
 
@@ -173,7 +180,7 @@ class _WindowedBackend(Transcriber):
     def _run(self, audio, language, prompt) -> list[dict]:
         raise NotImplementedError
 
-    def segments(self, audio, language=None, prompt=None, vad=True):
+    def segments(self, audio, language=None, prompt=None, vad=True, hotwords=None):
         step = self.window_seconds * TARGET_RATE
         carry = prompt
         for start in range(0, audio.size, step):

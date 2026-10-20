@@ -25,7 +25,8 @@ from pathlib import Path
 import numpy as np
 
 from listn import diarize
-from listn.audio import TARGET_RATE, Chunker, StreamResampler, WavWriter, decode_file, mix_mono, read_wav, rms, to_mono
+from listn.audio import TARGET_RATE, Chunker, PauseChunker, StreamResampler, WavWriter, decode_file, mix_mono, read_wav, rms, to_mono
+from listn.vocab import hotword_string, prompt_with_vocabulary
 from listn.ipc import TRACK_MIC, TRACK_SPEAKER, TRACK_SYSTEM
 from listn.capture import open_input
 from listn.config import Settings
@@ -218,6 +219,11 @@ class LiveSession:
         except queue.Full:
             self.dropped_blocks += 1
 
+    def _chunker(self):
+        if self.settings.vad_chunks:
+            return PauseChunker(max_seconds=max(self.settings.chunk_seconds, 2.0))
+        return Chunker(self.settings.chunk_seconds)
+
     def _pipeline(self) -> None:
         try:
             if self.mode == "ingest":
@@ -234,7 +240,7 @@ class LiveSession:
 
     def _pipeline_device(self) -> None:
         resampler = StreamResampler(self._rate)
-        chunker = Chunker(self.settings.chunk_seconds)
+        chunker = self._chunker()
         last_level = 0.0
         while not (self._stop.is_set() and self._blocks.empty()):
                 try:
@@ -293,7 +299,7 @@ class LiveSession:
             level = rms(audio)
             self._track_levels[track] = 20 * np.log10(level) if level > 1e-6 else -120.0
             self.level_db = max(self._track_levels.values())
-            chunker = chunkers.setdefault(track, Chunker(self.settings.chunk_seconds))
+            chunker = chunkers.setdefault(track, self._chunker())
             for start, chunk in chunker.feed(audio):
                 self.pending_chunks += 1
                 self._chunks.put((track, offsets[track] + start, chunk))
@@ -343,7 +349,10 @@ class LiveSession:
             track, start, chunk = item
             speaker = TRACK_SPEAKER.get(track)
             try:
-                raw = model.transcribe(chunk, language=self.settings.language, prompt=prompts.get(track), offset=start)
+                raw = model.transcribe(
+                    chunk, language=self.settings.language,
+                    prompt=prompt_with_vocabulary(self.settings.vocabulary, prompts.get(track)),
+                    hotwords=hotword_string(self.settings.vocabulary), offset=start)
             except Exception as exc:
                 self._emit("live.error", message=f"Transcription failed for one chunk: {exc}")
                 raw = []

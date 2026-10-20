@@ -107,7 +107,7 @@ class FakeTranscriber(Transcriber):
         super().__init__(model)
         self.calls = 0
 
-    def segments(self, audio, language=None, prompt=None, vad=True):
+    def segments(self, audio, language=None, prompt=None, vad=True, hotwords=None):
         self.calls += 1
         duration = audio.size / 16000
         yield RawSegment(0.0, duration / 2, f"chunk {self.calls} first half")

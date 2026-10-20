@@ -118,6 +118,10 @@ Backends:
 - **mlx** (`--extra mlx`): Apple Silicon GPU. This is the backend the menu bar setup is meant to use.
 - **openai-whisper** (`--extra openai`): the original implementation, for comparison.
 
+Live audio is cut on a pause (about 0.45 seconds of quiet) instead of a fixed clock, and never runs longer than the chunk length in Settings. On a 10-second test with two utterances, one of them crossing the old 6-second mark, fixed chunks cut 1 of the 2 utterances and held the first for 4.6 seconds after it ended. Pause chunking cut 0 of the 2 and closed each one 0.5 seconds after it ended. That comparison is `tests/test_vad.py`.
+
+Names and jargon go in Settings, one per line. They are Whisper's initial prompt on every backend. faster-whisper also receives them as hotwords.
+
 Live chunks are a bit less accurate than a whole file. For an important meeting, open it in the library and **Retranscribe**.
 
 ## How capture is split

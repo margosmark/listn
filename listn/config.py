@@ -87,6 +87,8 @@ class Settings:
     offer_meetings: bool = True
     auto_record_meetings: bool = False
     launch_at_login: bool = False
+    vocabulary: list = field(default_factory=list)
+    vad_chunks: bool = True
 
     @classmethod
     def path(cls) -> Path:
@@ -119,6 +121,10 @@ class Settings:
         self.offer_meetings = bool(self.offer_meetings)
         self.auto_record_meetings = bool(self.auto_record_meetings)
         self.launch_at_login = bool(self.launch_at_login)
+        from listn.vocab import clean_vocabulary
+
+        self.vocabulary = clean_vocabulary(self.vocabulary)
+        self.vad_chunks = bool(self.vad_chunks)
         return self
 
     def save(self) -> None:
