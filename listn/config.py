@@ -84,6 +84,9 @@ class Settings:
     hf_token: str | None = None
     llm_model: str = DEFAULT_LLM
     summarize_after: bool = True
+    offer_meetings: bool = True
+    auto_record_meetings: bool = False
+    launch_at_login: bool = False
 
     @classmethod
     def path(cls) -> Path:
@@ -113,6 +116,9 @@ class Settings:
         self.hf_token = (self.hf_token or "").strip() or None
         self.llm_model = (self.llm_model or DEFAULT_LLM).strip()[:200] or DEFAULT_LLM
         self.summarize_after = bool(self.summarize_after)
+        self.offer_meetings = bool(self.offer_meetings)
+        self.auto_record_meetings = bool(self.auto_record_meetings)
+        self.launch_at_login = bool(self.launch_at_login)
         return self
 
     def save(self) -> None:

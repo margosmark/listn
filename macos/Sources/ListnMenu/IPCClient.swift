@@ -12,6 +12,7 @@ private let frameStart: UInt8 = 4
 private let frameStop: UInt8 = 5
 private let frameEvent: UInt8 = 6
 private let frameError: UInt8 = 9
+private let frameBookmark: UInt8 = 10
 private let maxFrame = 8 * 1024 * 1024
 
 enum IPCError: LocalizedError {
@@ -88,14 +89,23 @@ final class IPCClient {
         }
     }
 
-    func sendHelloAndStart(source: String, appName: String?, appPID: Int32?, mic: Bool) {
+    func sendHelloAndStart(source: String, appName: String?, appPID: Int32?, mic: Bool,
+                           title: String? = nil, attendees: [String] = []) {
         var body: [String: Any] = ["source": source, "mic": mic]
         if let appName { body["app_name"] = appName }
         if let appPID { body["app_pid"] = appPID }
+        if let title, !title.isEmpty { body["title"] = title }
+        if !attendees.isEmpty { body["attendees"] = attendees }
         writeQueue.async { [weak self] in
             guard let self else { return }
             self.writeAll(self.jsonFrame(frameHello, ["client": "listn-menu", "version": 1]))
             self.writeAll(self.jsonFrame(frameStart, body))
+        }
+    }
+
+    func sendBookmark(note: String = "Bookmark") {
+        writeQueue.async { [weak self] in
+            self?.writeAll(self?.jsonFrame(frameBookmark, ["note": note]) ?? Data())
         }
     }
 

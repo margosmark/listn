@@ -58,6 +58,7 @@ class SessionMeta:
     diarized: bool = False
     speakers: dict = field(default_factory=dict)
     owner_pid: int | None = None
+    attendees: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -204,6 +205,28 @@ class Library:
         except (OSError, ValueError):
             return None
         return raw if isinstance(raw, dict) else None
+
+    def save_bookmarks(self, session_id: str, bookmarks: list[dict]) -> None:
+        with self._lock:
+            self._write_json(self._dir(session_id) / "bookmarks.json", bookmarks)
+
+    def bookmarks(self, session_id: str) -> list[dict]:
+        try:
+            raw = json.loads((self._dir(session_id) / "bookmarks.json").read_text())
+        except (OSError, ValueError):
+            return []
+        if not isinstance(raw, list):
+            return []
+        out = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                t = float(item.get("t", 0))
+            except (TypeError, ValueError):
+                continue
+            out.append({"t": round(t, 2), "note": str(item.get("note") or "Bookmark")[:200]})
+        return out
 
     def get(self, session_id: str) -> SessionMeta:
         path = self._dir(session_id) / "meta.json"

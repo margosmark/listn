@@ -49,7 +49,14 @@ What the menu does:
 - A **level** meter
 - The latest **transcript lines** (Me vs Others)
 - **Open library**, which is the web UI
+- **Record Zoom** (or whichever meeting just started using audio), when that offer is on
+- **Bookmark this moment** while a recording is running. Bookmarks show up in the transcript and jump the audio.
+- **Launch at login**
 - **Quit**, which also stops the engine if the app started it
+
+Control-Option-R starts or stops a recording. Control-Option-B drops a bookmark. Neither hotkey needs Accessibility access.
+
+The menu watches Zoom, Teams, Webex, FaceTime, a Slack huddle, and a browser window whose title looks like Meet, Zoom, Teams, or Webex. It asks before recording unless *Start recording automatically* is on, and it asks again when that call ends. The first time, macOS asks to read your calendars. An event that overlaps "now" becomes the session title and its attendees are stored with the recording. The all-day event loses to the shorter meeting. Calendar access stays on this Mac.
 
 The app starts `listn ui --no-browser` in the background as soon as it launches, using the `listn` written into the bundle at build time (your `.venv`). If you move the `.app` but not the checkout, set `LISTN_BIN` to the `listn` script. Logs: `~/Library/Application Support/listn/engine.log`.
 
@@ -180,7 +187,7 @@ macos/
 
 ### Capture socket
 
-Frames are little-endian: `uint32 length | uint8 type | payload`. Types are HELLO, WELCOME, AUDIO, START, STOP, EVENT, PING, PONG, ERROR. AUDIO is `track | sample rate | channels | float32 PCM`, track 0 system and track 1 microphone. START's `source` is `system`, `app`, or `device` (the legacy input). Details are in `listn/ipc.py`. The Python tests drive this with a fake client, including a client that reconnects mid-recording.
+Frames are little-endian: `uint32 length | uint8 type | payload`. Types are HELLO, WELCOME, AUDIO, START, STOP, EVENT, PING, PONG, ERROR, BOOKMARK. AUDIO is `track | sample rate | channels | float32 PCM`, track 0 system and track 1 microphone. START's `source` is `system`, `app`, or `device` (the legacy input). Details are in `listn/ipc.py`. The Python tests drive this with a fake client, including a client that reconnects mid-recording.
 
 ## On a Mac, before you trust it
 
@@ -193,9 +200,10 @@ This repo's tests do not open a process tap. On the Mac, check:
 5. A Zoom, Teams, or browser tab can be chosen as the only source, and other apps' audio stays out of Others.
 6. A short call: your voice is **Me**, the other side is **Others**, in the menu and in the library.
 7. Open Library. The web UI loads on `127.0.0.1` only. The live page shows the same lines. Export still works.
-8. Quit and reopen. If you denied a permission, System Settings shows **listn** (not "python" or a blank name) under System Audio Recording and Microphone.
-9. Legacy: install BlackHole only if you want it, pick it in the web UI, choose **Legacy input device** in the menu, and confirm the old path still records.
-10. With `uv sync --extra mlx` and model `large-v3-turbo`, two live tracks stay caught up (the UI should not sit on "N chunks waiting" during normal speech).
+8. Start a Zoom or Meet call. The menu offers to record, and with automatic recording on it starts by itself and offers to stop when the call ends. An overlapping calendar event titles the session. Control-Option-B leaves a bookmark you can seek to. Launch at login survives a reboot.
+9. Quit and reopen. If you denied a permission, System Settings shows **listn** (not "python" or a blank name) under System Audio Recording and Microphone.
+10. Legacy: install BlackHole only if you want it, pick it in the web UI, choose **Legacy input device** in the menu, and confirm the old path still records.
+11. With `uv sync --extra mlx` and model `large-v3-turbo`, two live tracks stay caught up (the UI should not sit on "N chunks waiting" during normal speech).
 
 ## Troubleshooting
 

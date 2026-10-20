@@ -72,6 +72,14 @@
           <input type="checkbox" id="summarize-after" data-setting="summarize_after">
           <span>Summarize when a recording ends</span>
         </label>
+        <label class="toggle">
+          <input type="checkbox" id="offer-meetings" data-setting="offer_meetings">
+          <span>Offer to record when a meeting starts</span>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="auto-record" data-setting="auto_record_meetings">
+          <span>Start recording automatically</span>
+        </label>
         <p class="hint" id="diarize-hint"></p>
 
         <label class="field">
@@ -167,6 +175,10 @@
 <dialog id="settings-dialog">
   <form method="dialog" class="dialog-body" id="settings-form">
     <h2>Settings</h2>
+    <label class="toggle">
+      <input type="checkbox" id="launch-at-login" data-setting="launch_at_login">
+      <span>Launch at login</span>
+    </label>
     <label class="field"><span>Transcription backend</span><select id="backend" data-setting="backend"></select></label>
     <p class="hint" id="backend-hint"></p>
     <label class="field">

@@ -119,6 +119,9 @@ function renderSettings() {
   $("#save-audio").checked = !!s.save_audio;
   $("#diarize-after").checked = !!s.diarize_after;
   $("#summarize-after").checked = s.summarize_after !== false;
+  $("#offer-meetings").checked = s.offer_meetings !== false;
+  $("#auto-record").checked = !!s.auto_record_meetings;
+  $("#launch-at-login").checked = !!s.launch_at_login;
   if (document.activeElement !== $("#llm-model")) $("#llm-model").value = s.llm_model || "";
   $("#chunk").value = s.chunk_seconds;
   $("#chunk-label").textContent = `${s.chunk_seconds}s`;
@@ -383,6 +386,7 @@ async function openSession(id, seekAt) {
     el("span", { text: when }), el("span", { text: clock(meta.duration) }),
     el("span", { text: meta.source === "live" ? `Live · ${meta.source_name || "input"}` : `File · ${meta.source_name || ""}` }),
     meta.model ? el("span", { text: `${meta.model} · ${meta.backend || ""}` }) : null,
+    (meta.attendees || []).length ? el("span", { text: meta.attendees.join(", ") }) : null,
     el("span", { text: `${segments.length} segments` }));
 
   const audio = has_audio ? el("audio", { controls: true, preload: "metadata", src: `/api/sessions/${id}/audio` }) : null;
@@ -443,6 +447,7 @@ async function openSession(id, seekAt) {
   if (!segments.length) {
     body.append(el("div", { class: "empty" }, el("p", { text: busy ? "Transcription in progress…" : "No speech was transcribed in this session." })));
   }
+  const marks = (data.bookmarks || []).map(mark => ({ kind: "bookmark", ...mark }));
   const rows = segments.map(s => {
     const label = s.speaker ? (meta.speakers?.[s.speaker] || s.speaker) : null;
     const ts = el(audio ? "button" : "span", { class: `ts ${audio ? "seek" : ""}`, text: clock(s.start), title: audio ? "Play from here" : null });
@@ -452,7 +457,15 @@ async function openSession(id, seekAt) {
     row.dataset.start = s.start; row.dataset.end = s.end;
     return row;
   });
-  body.append(...rows);
+  const markRows = marks.map(mark => {
+    const ts = el(audio ? "button" : "span", { class: `ts ${audio ? "seek" : ""}`, text: clock(mark.t) });
+    if (audio) ts.addEventListener("click", () => { audio.currentTime = mark.t; audio.play(); });
+    const row = el("div", { class: "seg bookmark" }, ts, el("span", { text: mark.note || "Bookmark" }));
+    row.dataset.start = mark.t; row.dataset.end = mark.t + 0.4;
+    return row;
+  });
+  const ordered = [...rows, ...markRows].sort((a, b) => +a.dataset.start - +b.dataset.start);
+  body.append(...ordered);
   if (audio) {
     audio.addEventListener("timeupdate", () => {
       const t = audio.currentTime;

@@ -35,6 +35,17 @@ from listn.transcriber import get_transcriber, resolve_backend
 log = logging.getLogger("listn")
 
 
+def _clean_attendees(attendees: list) -> list[str]:
+    names = []
+    for item in attendees:
+        text = str(item).strip()
+        if text and text not in names:
+            names.append(text[:80])
+        if len(names) >= 40:
+            break
+    return names
+
+
 class Cancelled(Exception):
     pass
 
@@ -132,7 +143,7 @@ class LiveSession:
         except queue.Full:
             self.dropped_blocks += 1
 
-    def start(self) -> None:
+    def start(self, attendees: list | None = None) -> None:
         if self.settings.save_audio:
             self._writer = WavWriter(self.library.new_audio_path(self.meta.id, ".wav"))
             self.meta.audio_file = self._writer.path.name
@@ -147,6 +158,8 @@ class LiveSession:
         self.device_info = {"name": opened.device.name, "channels": opened.channels,
                             "samplerate": int(opened.samplerate), "kind": opened.device.kind}
         self.meta.source_name = opened.device.name
+        if attendees:
+            self.meta.attendees = _clean_attendees(attendees)
         self.library.save_meta(self.meta)
         self.state = "loading-model"
         self._threads = [
@@ -157,7 +170,7 @@ class LiveSession:
             t.start()
         self._emit("live.started", status=self.status())
 
-    def start_ingest(self, source: dict) -> None:
+    def start_ingest(self, source: dict, attendees: list | None = None) -> None:
         """Record PCM pushed in through the capture socket instead of an input device.
 
         ``source`` has ``source`` (``system`` or ``app``), optional ``app_name``,
@@ -176,6 +189,8 @@ class LiveSession:
             label += " + microphone"
         self.meta.source_name = label
         self.meta.speakers = {"Me": "Me", "Others": "Others"}
+        if attendees:
+            self.meta.attendees = _clean_attendees(attendees)
         self.device_info = {
             "name": label,
             "kind": "process-tap",
@@ -477,25 +492,37 @@ class Engine:
     def live_active(self) -> bool:
         return self.live is not None and self.live.state not in ("done", "error")
 
-    def start_live(self, settings: Settings, title: str | None = None) -> LiveSession:
+    def start_live(self, settings: Settings, title: str | None = None, attendees: list | None = None) -> LiveSession:
         with self._lock:
             if self.live_active():
                 raise RuntimeError("A recording is already running.")
             session = LiveSession(self.library, self.bus, settings, title, sd=self.sd,
                                   transcriber_factory=self._factory)
-            session.start()
+            session.start(attendees)
             self.live = session
             return session
 
-    def start_ingest(self, settings: Settings, source: dict, title: str | None = None) -> LiveSession:
+    def start_ingest(self, settings: Settings, source: dict, title: str | None = None,
+                     attendees: list | None = None) -> LiveSession:
         with self._lock:
             if self.live_active():
                 raise RuntimeError("A recording is already running.")
             session = LiveSession(self.library, self.bus, settings, title, sd=self.sd,
                                   transcriber_factory=self._factory)
-            session.start_ingest(source)
+            session.start_ingest(source, attendees)
             self.live = session
             return session
+
+    def add_bookmark(self, note: str = "") -> dict | None:
+        session = self.live
+        if session is None or not self.live_active():
+            return None
+        item = {"t": round(session._elapsed_seconds(), 2), "note": (note or "Bookmark").strip()[:200] or "Bookmark"}
+        marks = self.library.bookmarks(session.meta.id)
+        marks.append(item)
+        self.library.save_bookmarks(session.meta.id, marks)
+        self.bus.publish({"type": "live.bookmark", "session": session.meta.id, "bookmark": item})
+        return item
 
     def stop_live(self, wait: bool = False) -> SessionMeta | None:
         session = self.live

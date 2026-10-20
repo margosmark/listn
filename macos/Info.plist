@@ -30,5 +30,9 @@
 	<string>listn captures system audio so it can transcribe meetings and other sound playing on this Mac. Audio stays on this computer.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>listn uses the microphone so your own voice is included in the transcript and labelled as you. Audio stays on this computer.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>listn reads your calendars to title a recording with the meeting that is happening now and to attach its attendees. Events stay on this Mac.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>listn reads your calendars to title a recording with the meeting that is happening now and to attach its attendees. Events stay on this Mac.</string>
 </dict>
 </plist>
