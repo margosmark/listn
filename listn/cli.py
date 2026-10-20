@@ -183,7 +183,12 @@ def cmd_transcribe(args) -> int:
 
 def cmd_list(args) -> int:
     lib = Library()
-    results = lib.search(args.query or "")
+    if args.query:
+        from listn.index import SearchIndex
+
+        results = SearchIndex(lib).sessions_for(args.query)
+    else:
+        results = lib.search("")
     if not results:
         print("No sessions yet." if not args.query else f"Nothing matches '{args.query}'.")
         return 0

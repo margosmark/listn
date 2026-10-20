@@ -97,6 +97,12 @@ The model is `mlx-community/Qwen2.5-7B-Instruct-4bit` (about 4.3 GB), via `mlx-l
 uv run listn summarize <session-id>
 ```
 
+## Ask your meetings
+
+The library search box matches keywords and, separately, a local embedding of each transcript line. The embedding is a hashed mix of words and character trigrams stored in `search-index.json`. It does not download a model. Lines are re-embedded only when that session's transcript changes.
+
+**Ask your meetings** answers from those lines with the same local notes model. Each answer cites the session and the timestamp; choosing a citation opens the recording at that line. Without MLX the answer quotes the closest lines and the citations still seek the audio.
+
 A settings file left over from an older run keeps whatever model you saved. In the web UI, set the model to `large-v3-turbo` and the backend to Auto (or MLX).
 
 Backends:

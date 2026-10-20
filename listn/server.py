@@ -77,6 +77,10 @@ class NotesIn(BaseModel):
     actions: list[dict] = []
 
 
+class AskIn(BaseModel):
+    question: str = ""
+
+
 def _host_ok(host_header: str) -> bool:
     host = host_header.strip().lower()
     if host.startswith("["):
@@ -258,7 +262,25 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
 
     @app.get("/api/sessions")
     def sessions(q: str = ""):
+        from listn.index import SearchIndex
+
+        if q.strip():
+            return {"results": SearchIndex(eng().library).sessions_for(q)}
         return {"results": eng().library.search(q)}
+
+    @app.get("/api/search")
+    def search(q: str = ""):
+        from listn.index import SearchIndex
+
+        index = SearchIndex(eng().library)
+        return {"results": index.sessions_for(q), "hits": index.search(q)}
+
+    @app.post("/api/ask")
+    def ask_library(body: AskIn):
+        from listn.ask import ask
+        from listn.index import SearchIndex
+
+        return ask(SearchIndex(eng().library), body.question, app.state.settings)
 
     @app.get("/api/sessions/{session_id}")
     def session(session_id: str):
