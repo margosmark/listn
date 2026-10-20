@@ -37,43 +37,56 @@ def to_mono(block: np.ndarray) -> np.ndarray:
     return block[:, active].mean(axis=1).astype(np.float32)
 
 
-def resample(audio: np.ndarray, src_rate: float, dst_rate: int = TARGET_RATE) -> np.ndarray:
-    audio = np.asarray(audio, dtype=np.float32)
-    if audio.size == 0 or int(round(src_rate)) == dst_rate:
-        return audio
-    ratio = src_rate / dst_rate
-    if abs(ratio - round(ratio)) < 1e-9 and round(ratio) > 1:
-        factor = int(round(ratio))
-        usable = (audio.size // factor) * factor
-        return audio[:usable].reshape(-1, factor).mean(axis=1).astype(np.float32)
-    n_out = int(round(audio.size * dst_rate / src_rate))
-    if n_out <= 0:
-        return np.zeros(0, dtype=np.float32)
-    x_old = np.arange(audio.size, dtype=np.float64)
-    x_new = np.linspace(0, audio.size - 1, n_out)
-    return np.interp(x_new, x_old, audio).astype(np.float32)
+def lowpass_taps(src_rate: float, dst_rate: float, n_taps: int = 95) -> np.ndarray:
+    """Windowed-sinc anti-alias filter just below the target Nyquist."""
+    cutoff = 0.45 * dst_rate / src_rate
+    m = np.arange(n_taps) - (n_taps - 1) / 2
+    h = 2 * cutoff * np.sinc(2 * cutoff * m) * np.blackman(n_taps)
+    return (h / h.sum()).astype(np.float32)
 
 
 class StreamResampler:
-    """Resample a block stream without dropping samples at block edges."""
+    """Resample a block stream continuously (filter state and phase carry over).
+
+    Downsampling low-passes first: BlackHole usually runs at 48 kHz, and
+    naive decimation folds 8-24 kHz content back into the speech band.
+    """
 
     def __init__(self, src_rate: float, dst_rate: int = TARGET_RATE):
         self.src_rate = float(src_rate)
         self.dst_rate = dst_rate
-        ratio = self.src_rate / dst_rate
-        self.factor = int(round(ratio)) if abs(ratio - round(ratio)) < 1e-9 else 0
-        self._carry = np.zeros(0, dtype=np.float32)
+        self.passthrough = int(round(self.src_rate)) == dst_rate
+        self.step = self.src_rate / dst_rate
+        self.taps = lowpass_taps(self.src_rate, dst_rate) if self.src_rate > dst_rate else None
+        self._hist = np.zeros(0 if self.taps is None else self.taps.size - 1, dtype=np.float32)
+        self._prev: float | None = None
+        self._pos = 0.0
 
     def process(self, block: np.ndarray) -> np.ndarray:
-        block = np.asarray(block, dtype=np.float32)
-        if int(round(self.src_rate)) == self.dst_rate:
+        block = np.asarray(block, dtype=np.float32).reshape(-1)
+        if self.passthrough or block.size == 0:
             return block
-        if self.factor > 1:
-            data = np.concatenate([self._carry, block])
-            usable = (data.size // self.factor) * self.factor
-            self._carry = data[usable:]
-            return data[:usable].reshape(-1, self.factor).mean(axis=1).astype(np.float32)
-        return resample(block, self.src_rate, self.dst_rate)
+        if self.taps is not None:
+            x = np.concatenate([self._hist, block])
+            y = np.convolve(x, self.taps, mode="valid").astype(np.float32)
+            self._hist = x[-(self.taps.size - 1):]
+        else:
+            y = block
+        if self._prev is None:
+            arr, base = y, 0
+        else:
+            arr, base = np.concatenate([[self._prev], y]), -1
+        last = y.size - 1
+        count = int(np.floor((last - self._pos) / self.step)) + 1 if self._pos <= last else 0
+        positions = self._pos + self.step * np.arange(count)
+        out = np.interp(positions - base, np.arange(arr.size), arr).astype(np.float32)
+        self._pos = self._pos + self.step * count - y.size
+        self._prev = float(y[-1])
+        return out
+
+
+def resample(audio: np.ndarray, src_rate: float, dst_rate: int = TARGET_RATE) -> np.ndarray:
+    return StreamResampler(src_rate, dst_rate).process(audio)
 
 
 def to_int16(audio: np.ndarray) -> np.ndarray:

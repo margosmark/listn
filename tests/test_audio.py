@@ -36,13 +36,22 @@ def test_resample_preserves_duration_and_pitch(src):
     assert peak_hz == pytest.approx(440, abs=3)
 
 
-def test_stream_resampler_keeps_every_sample_across_blocks():
-    audio = sine(440, 1.0, 48000)
-    rs = StreamResampler(48000)
+@pytest.mark.parametrize("src", [48000, 44100])
+def test_stream_resampler_matches_one_shot_across_blocks(src):
+    audio = sine(440, 1.0, src)
+    rs = StreamResampler(src)
     pieces = [rs.process(audio[i:i + 1000]) for i in range(0, audio.size, 1000)]
     joined = np.concatenate(pieces)
-    assert joined.size == 16000
-    np.testing.assert_allclose(joined, resample(audio, 48000), atol=1e-6)
+    one_shot = resample(audio, src)
+    assert joined.size == one_shot.size
+    np.testing.assert_allclose(joined, one_shot, atol=1e-5)
+
+
+def test_resample_suppresses_aliasing():
+    # A 10 kHz tone at 48 kHz would alias to 6 kHz at 16 kHz without filtering.
+    out = resample(sine(10000, 1.0, 48000), 48000)
+    assert rms(out[200:]) < 0.01 * rms(sine(10000, 1.0, 48000))
+    assert rms(resample(sine(1000, 1.0, 48000), 48000)[200:]) == pytest.approx(0.5 / np.sqrt(2), rel=0.02)
 
 
 def test_to_int16_clips_instead_of_wrapping():
