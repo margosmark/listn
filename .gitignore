@@ -1,32 +1,28 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
+*.egg-info/
+build/
+dist/
+.venv/
 venv/
-env/
-ENV/
-.venv
+.pytest_cache/
 
-# Whisper model cache
-*.pt
-~/.cache/whisper/
-
-# Output files
-*.txt
+# Audio and transcripts never belong in the repo. listn stores them in its
+# data directory (`listn path`); these patterns catch stray copies.
+*.wav
+*.mp3
+*.m4a
+*.flac
+*_transcript.txt
 transcription*.txt
 transcripts/
 
-# Environment
+# Local config
 .env
 
-# IDE
+# Editors / macOS
 .vscode/
 .idea/
 *.swp
-*.swo
-*~
-
-# macOS
 .DS_Store
