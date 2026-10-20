@@ -163,6 +163,9 @@ class Library:
             self.save_segments(sid, [])
             return meta
 
+    def session_path(self, session_id: str) -> Path:
+        return self._dir(session_id)
+
     def audio_path(self, meta: SessionMeta) -> Path | None:
         if not meta.audio_file:
             return None

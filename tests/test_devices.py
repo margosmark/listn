@@ -70,7 +70,8 @@ def _titles(notes):
 def test_guidance_missing_blackhole():
     raw = [dev("MacBook Pro Microphone", 1), dev("MacBook Pro Speakers", 0, 2)]
     notes = devmod.setup_guidance(build(raw), "MacBook Pro Speakers")
-    assert "BlackHole is not installed" in _titles(notes)
+    assert "No BlackHole needed" in _titles(notes)
+    assert notes[0]["level"] == "ok"
 
 
 def test_guidance_missing_multi_output():

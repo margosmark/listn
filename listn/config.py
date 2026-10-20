@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import sys
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 MODELS = ["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"]
@@ -26,6 +27,30 @@ def disable_network_telemetry() -> None:
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
     os.environ.setdefault("DO_NOT_TRACK", "1")
     os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "0")
+
+
+def apple_silicon() -> bool:
+    return sys.platform == "darwin" and platform.machine() == "arm64"
+
+
+def default_model() -> str:
+    """Live model for a fresh install.
+
+    On Apple Silicon, ``large-v3-turbo`` is the default when mlx-whisper is
+    installed. It is a distilled large-v3 (about 1.6 GB): on an M-series GPU
+    a 6-second chunk finishes well inside the chunk interval, including when
+    system audio and the microphone are transcribed one after the other.
+    Without MLX, turbo would run on CPU and can fall behind two live tracks,
+    so the default stays ``small``. Other machines stay on ``small`` too.
+    """
+    if apple_silicon():
+        try:
+            import mlx_whisper  # noqa: F401
+
+            return "large-v3-turbo"
+        except ImportError:
+            return "small"
+    return "small"
 
 
 def data_dir() -> Path:
@@ -48,7 +73,7 @@ def data_dir() -> Path:
 @dataclass
 class Settings:
     device: str | None = None
-    model: str = "small"
+    model: str = field(default_factory=default_model)
     language: str | None = None
     backend: str = "auto"
     chunk_seconds: float = 6.0

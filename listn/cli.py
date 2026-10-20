@@ -32,7 +32,8 @@ def _settings_from(args) -> Settings:
 
 
 def _add_model_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--model", choices=MODELS, help="Whisper model (default: saved setting, initially 'small')")
+    p.add_argument("--model", choices=MODELS,
+                   help="Whisper model (default: saved setting; first run is large-v3-turbo on Apple Silicon with MLX, otherwise small)")
     p.add_argument("--language", metavar="CODE", help="Language code such as en, es, de (default: auto-detect)")
     p.add_argument("--backend", choices=BACKENDS, help="Transcription backend (default: auto)")
     p.add_argument("--speakers", action="store_true", help="Label speakers with pyannote (needs the diarize extra)")
@@ -114,7 +115,8 @@ def cmd_live(args) -> int:
         kind = event.get("type")
         if kind == "live.segments":
             for seg in event["segments"]:
-                print(f"[{fmt_clock(seg['start'])}] {seg['text']}", flush=True)
+                who = f"{seg['speaker']}: " if seg.get("speaker") else ""
+                print(f"[{fmt_clock(seg['start'])}] {who}{seg['text']}", flush=True)
         elif kind == "live.status" and event.get("message") not in ("Listening",):
             print(f"  ({event['message']})", file=sys.stderr)
         elif kind == "live.error":

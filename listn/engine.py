@@ -25,7 +25,8 @@ from pathlib import Path
 import numpy as np
 
 from listn import diarize
-from listn.audio import TARGET_RATE, Chunker, StreamResampler, WavWriter, decode_file, rms, to_mono
+from listn.audio import TARGET_RATE, Chunker, StreamResampler, WavWriter, decode_file, mix_mono, read_wav, rms, to_mono
+from listn.ipc import TRACK_MIC, TRACK_SPEAKER, TRACK_SYSTEM
 from listn.capture import open_input
 from listn.config import Settings
 from listn.library import Library, Segment, SessionMeta
@@ -88,7 +89,11 @@ class LiveSession:
         self._chunks: queue.Queue = queue.Queue()
         self._stop = threading.Event()
         self._capture_done = threading.Event()
+        self.mode = "device"
         self._writer: WavWriter | None = None
+        self._writers: dict[int, WavWriter] = {}
+        self._track_levels: dict[int, float] = {}
+        self._ingest_started: float | None = None
         self._stream = None
         self._threads: list[threading.Thread] = []
         self._started = time.monotonic()
@@ -102,8 +107,9 @@ class LiveSession:
             "id": self.meta.id,
             "title": self.meta.title,
             "state": self.state,
-            "elapsed": round(self._samples / TARGET_RATE, 1),
+            "elapsed": round(self._elapsed_seconds(), 1),
             "level_db": round(self.level_db, 1),
+            "capture": self.mode,
             "dropped_blocks": self.dropped_blocks,
             "overflows": self.overflows,
             "pending_chunks": self.pending_chunks,
@@ -112,6 +118,11 @@ class LiveSession:
             "model": self.meta.model,
             "backend": self.meta.backend,
         }
+
+    def _elapsed_seconds(self) -> float:
+        if self.mode == "ingest" and self._ingest_started:
+            return time.monotonic() - self._ingest_started
+        return self._samples / TARGET_RATE
 
     def _callback(self, indata, frames, time_info, status):
         if status:
@@ -146,12 +157,71 @@ class LiveSession:
             t.start()
         self._emit("live.started", status=self.status())
 
+    def start_ingest(self, source: dict) -> None:
+        """Record PCM pushed in through the capture socket instead of an input device.
+
+        ``source`` has ``source`` (``system`` or ``app``), optional ``app_name``,
+        and ``mic``. System audio is track 0 and labelled Others. The microphone
+        is track 1 and labelled Me. pyannote, if enabled, runs only on the
+        system track so it does not rename Me.
+        """
+        self.mode = "ingest"
+        self._ingest_started = time.monotonic()
+        kind = source.get("source") or "system"
+        if kind == "app" and source.get("app_name"):
+            label = str(source["app_name"])
+        else:
+            label = "All system audio"
+        if source.get("mic", True):
+            label += " + microphone"
+        self.meta.source_name = label
+        self.meta.speakers = {"Me": "Me", "Others": "Others"}
+        self.device_info = {
+            "name": label,
+            "kind": "process-tap",
+            "channels": 2 if source.get("mic", True) else 1,
+            "samplerate": None,
+            "source": kind,
+            "mic": bool(source.get("mic", True)),
+        }
+        self.library.save_meta(self.meta)
+        self.state = "loading-model"
+        self._threads = [
+            threading.Thread(target=self._pipeline, name="listn-pipeline", daemon=True),
+            threading.Thread(target=self._transcribe_loop, name="listn-transcribe", daemon=True),
+        ]
+        for thread in self._threads:
+            thread.start()
+        self._emit("live.started", status=self.status())
+
+    def push_audio(self, track: int, sample_rate: int, samples: np.ndarray) -> None:
+        if self.mode != "ingest" or self._stop.is_set():
+            raise RuntimeError("Not accepting captured audio.")
+        block = np.array(samples, dtype=np.float32, copy=True)
+        try:
+            self._blocks.put_nowait((int(track), int(sample_rate), block))
+        except queue.Full:
+            self.dropped_blocks += 1
+
     def _pipeline(self) -> None:
+        try:
+            if self.mode == "ingest":
+                self._pipeline_ingest()
+            else:
+                self._pipeline_device()
+        except Exception as exc:
+            log.exception("pipeline failed")
+            self._emit("live.error", message=f"Audio pipeline error: {exc}")
+        finally:
+            self._close_writers()
+            self._capture_done.set()
+            self._chunks.put(None)
+
+    def _pipeline_device(self) -> None:
         resampler = StreamResampler(self._rate)
         chunker = Chunker(self.settings.chunk_seconds)
         last_level = 0.0
-        try:
-            while not (self._stop.is_set() and self._blocks.empty()):
+        while not (self._stop.is_set() and self._blocks.empty()):
                 try:
                     block = self._blocks.get(timeout=0.2)
                 except queue.Empty:
@@ -164,24 +234,77 @@ class LiveSession:
                 self.level_db = 20 * np.log10(level) if level > 1e-6 else -120.0
                 for start, chunk in chunker.feed(mono):
                     self.pending_chunks += 1
-                    self._chunks.put((start, chunk))
+                    self._chunks.put((None, start, chunk))
                 now = time.monotonic()
                 if now - last_level > 0.25:
                     last_level = now
                     self._emit("live.level", level_db=round(self.level_db, 1),
-                               elapsed=round(self._samples / TARGET_RATE, 1),
+                               elapsed=round(self._elapsed_seconds(), 1),
                                pending=self.pending_chunks, dropped=self.dropped_blocks)
+        for start, chunk in chunker.flush():
+            self.pending_chunks += 1
+            self._chunks.put((None, start, chunk))
+
+    def _pipeline_ingest(self) -> None:
+        resamplers: dict[int, StreamResampler] = {}
+        chunkers: dict[int, Chunker] = {}
+        offsets: dict[int, float] = {}
+        last_level = 0.0
+        while not (self._stop.is_set() and self._blocks.empty()):
+            try:
+                track, rate, block = self._blocks.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if track not in (TRACK_SYSTEM, TRACK_MIC) or rate <= 0:
+                continue
+            mono = to_mono(block)
+            if mono.size == 0:
+                continue
+            resampler = resamplers.get(track)
+            if resampler is None or int(round(resampler.src_rate)) != int(round(rate)):
+                resampler = StreamResampler(float(rate))
+                resamplers[track] = resampler
+            audio = resampler.process(mono)
+            if audio.size == 0:
+                continue
+            if track not in offsets:
+                origin = self._ingest_started or time.monotonic()
+                offsets[track] = max(0.0, time.monotonic() - origin)
+                if self.settings.save_audio:
+                    self._open_track_writer(track, offsets[track])
+            writer = self._writers.get(track)
+            if writer is not None:
+                writer.write(audio)
+            level = rms(audio)
+            self._track_levels[track] = 20 * np.log10(level) if level > 1e-6 else -120.0
+            self.level_db = max(self._track_levels.values())
+            chunker = chunkers.setdefault(track, Chunker(self.settings.chunk_seconds))
+            for start, chunk in chunker.feed(audio):
+                self.pending_chunks += 1
+                self._chunks.put((track, offsets[track] + start, chunk))
+            now = time.monotonic()
+            if now - last_level > 0.25:
+                last_level = now
+                self._emit("live.level", level_db=round(self.level_db, 1),
+                           levels={"system": round(self._track_levels.get(TRACK_SYSTEM, -120.0), 1),
+                                   "mic": round(self._track_levels.get(TRACK_MIC, -120.0), 1)},
+                           elapsed=round(self._elapsed_seconds(), 1),
+                           pending=self.pending_chunks, dropped=self.dropped_blocks)
+        for track, chunker in chunkers.items():
             for start, chunk in chunker.flush():
                 self.pending_chunks += 1
-                self._chunks.put((start, chunk))
-        except Exception as exc:
-            log.exception("pipeline failed")
-            self._emit("live.error", message=f"Audio pipeline error: {exc}")
-        finally:
-            if self._writer:
-                self._writer.close()
-            self._capture_done.set()
-            self._chunks.put(None)
+                self._chunks.put((track, offsets.get(track, 0.0) + start, chunk))
+
+    def _open_track_writer(self, track: int, offset: float) -> None:
+        name = "audio-system.wav" if track == TRACK_SYSTEM else "audio-mic.wav"
+        writer = WavWriter(self.library.session_path(self.meta.id) / name)
+        pad = int(round(max(0.0, offset) * TARGET_RATE))
+        if pad:
+            writer.write(np.zeros(pad, dtype=np.float32))
+        self._writers[track] = writer
+        if not self.meta.audio_file:
+            self.meta.audio_file = name
+            self.library.save_meta(self.meta)
 
     def _transcribe_loop(self) -> None:
         try:
@@ -196,23 +319,28 @@ class LiveSession:
         if self.state == "loading-model":
             self.state = "listening"
         self._emit("live.status", message="Listening", state=self.state)
-        prompt = None
+        prompts: dict = {}
+        recent: dict = {}
         while True:
             item = self._chunks.get()
             if item is None:
                 break
-            start, chunk = item
+            track, start, chunk = item
+            speaker = TRACK_SPEAKER.get(track)
             try:
-                raw = model.transcribe(chunk, language=self.settings.language, prompt=prompt, offset=start)
+                raw = model.transcribe(chunk, language=self.settings.language, prompt=prompts.get(track), offset=start)
             except Exception as exc:
                 self._emit("live.error", message=f"Transcription failed for one chunk: {exc}")
                 raw = []
             finally:
                 self.pending_chunks -= 1
-            new = [Segment(round(s.start, 2), round(s.end, 2), s.text) for s in raw]
+            new = [Segment(round(s.start, 2), round(s.end, 2), s.text, speaker) for s in raw]
             if new:
+                bucket = recent.setdefault(track, [])
+                bucket.extend(new)
+                prompts[track] = " ".join(s.text for s in bucket[-3:])[-200:]
                 self.segments.extend(new)
-                prompt = " ".join(s.text for s in self.segments[-3:])[-200:]
+                self.segments.sort(key=lambda s: (s.start, s.speaker or ""))
                 self.library.save_segments(self.meta.id, self.segments)
                 self._emit("live.segments", segments=[s.to_dict() for s in new])
 
@@ -233,21 +361,68 @@ class LiveSession:
         if wait:
             finisher.join()
 
+    def _close_writers(self) -> None:
+        if self._writer is not None:
+            self._writer.close()
+        for writer in self._writers.values():
+            writer.close()
+
+    def _write_mixdown(self) -> None:
+        tracks = []
+        root = self.library.session_path(self.meta.id)
+        for name in ("audio-system.wav", "audio-mic.wav"):
+            path = root / name
+            if not path.exists():
+                continue
+            audio = read_wav(path)
+            if audio.size:
+                tracks.append(audio)
+        if not tracks:
+            return
+        mixed = mix_mono(tracks)
+        if mixed.size == 0:
+            return
+        out = WavWriter(root / "audio.wav")
+        try:
+            out.write(mixed)
+        finally:
+            out.close()
+        self.meta.audio_file = "audio.wav"
+
+    def _diarize_saved(self, path: Path, segments: list[Segment]) -> tuple[list[Segment], dict]:
+        audio = decode_file(path)
+        return diarize.diarize_segments(audio, segments, self.settings.resolved_hf_token())
+
     def _finish(self) -> None:
         for t in self._threads:
             t.join()
-        self.meta.duration = round(self._samples / TARGET_RATE, 2)
+        if self.mode == "ingest":
+            self._write_mixdown()
+            ends = [writer.seconds for writer in self._writers.values()]
+            self.meta.duration = round(max(ends) if ends else self._elapsed_seconds(), 2)
+        else:
+            self.meta.duration = round(self._samples / TARGET_RATE, 2)
         self.library.save_segments(self.meta.id, self.segments)
-        if self.settings.diarize_after and self.segments and self._writer:
+        if self.settings.diarize_after and self.segments:
             self.state = "diarizing"
             self._emit("live.status", message="Identifying speakers...", state=self.state)
             try:
-                audio = decode_file(self._writer.path)
-                labelled, names = diarize.diarize_segments(audio, self.segments, self.settings.resolved_hf_token())
-                self.segments = labelled
-                self.meta.speakers = names
-                self.meta.diarized = True
-                self.library.save_segments(self.meta.id, self.segments)
+                if self.mode == "ingest":
+                    system = self.library.session_path(self.meta.id) / "audio-system.wav"
+                    others = [s for s in self.segments if s.speaker != "Me"]
+                    me = [s for s in self.segments if s.speaker == "Me"]
+                    if system.exists() and others:
+                        labelled, names = self._diarize_saved(system, others)
+                        self.segments = sorted(me + labelled, key=lambda s: (s.start, s.speaker or ""))
+                        self.meta.speakers = {"Me": "Me", **names}
+                        self.meta.diarized = True
+                        self.library.save_segments(self.meta.id, self.segments)
+                elif self._writer is not None:
+                    labelled, names = self._diarize_saved(self._writer.path, self.segments)
+                    self.segments = labelled
+                    self.meta.speakers = names
+                    self.meta.diarized = True
+                    self.library.save_segments(self.meta.id, self.segments)
             except Exception as exc:
                 self._emit("live.error", message=f"Speaker labels skipped: {exc}")
         self.meta.status = "done"
@@ -259,8 +434,7 @@ class LiveSession:
         self.state = "error"
         self.meta.status = "error"
         self.meta.error = message
-        if self._writer:
-            self._writer.close()
+        self._close_writers()
         self.library.save_meta(self.meta)
         self._emit("live.error", message=message)
 
@@ -307,6 +481,16 @@ class Engine:
             session = LiveSession(self.library, self.bus, settings, title, sd=self.sd,
                                   transcriber_factory=self._factory)
             session.start()
+            self.live = session
+            return session
+
+    def start_ingest(self, settings: Settings, source: dict, title: str | None = None) -> LiveSession:
+        with self._lock:
+            if self.live_active():
+                raise RuntimeError("A recording is already running.")
+            session = LiveSession(self.library, self.bus, settings, title, sd=self.sd,
+                                  transcriber_factory=self._factory)
+            session.start_ingest(source)
             self.live = session
             return session
 

@@ -9,7 +9,7 @@ const LANGUAGES = [
 ];
 const MODEL_NOTES = {
   "tiny": "tiny · fastest", "base": "base · fast", "small": "small · balanced",
-  "medium": "medium · accurate", "large-v3": "large-v3 · most accurate", "large-v3-turbo": "large-v3-turbo · accurate & quick",
+  "medium": "medium · accurate", "large-v3": "large-v3 · most accurate", "large-v3-turbo": "large-v3-turbo · default live model on Apple Silicon",
 };
 const BACKEND_NOTES = {
   "auto": "Auto: MLX on Apple Silicon when installed, otherwise faster-whisper.",
@@ -216,7 +216,12 @@ function renderLive() {
   if (live) {
     $("#timer").textContent = clock(live.elapsed);
     const stats = [];
-    if (live.device) stats.push(`${live.device.name} · ${live.device.channels} ch · ${(live.device.samplerate / 1000).toFixed(1)} kHz`);
+    if (live.device) {
+      const bits = [live.device.name];
+      if (live.device.channels) bits.push(`${live.device.channels} ch`);
+      if (live.device.samplerate) bits.push(`${(live.device.samplerate / 1000).toFixed(1)} kHz`);
+      stats.push(bits.join(" · "));
+    }
     if (live.model) stats.push(`${live.model} on ${live.backend}`);
     if (live.pending_chunks > 1) stats.push(`${live.pending_chunks} chunks waiting`);
     if (live.dropped_blocks) stats.push(`${live.dropped_blocks} audio blocks dropped`);
@@ -231,7 +236,10 @@ function appendLiveSegments(segs) {
   const box = $("#live-transcript");
   $("#live-empty")?.remove();
   for (const s of segs) {
-    box.append(el("div", { class: "seg" }, el("span", { class: "ts", text: clock(s.start) }), el("span", { text: s.text })));
+    const who = s.speaker
+      ? el("span", { class: s.speaker === "Me" ? "speaker me" : "speaker", text: `${s.speaker}:` })
+      : null;
+    box.append(el("div", { class: "seg" }, el("span", { class: "ts", text: clock(s.start) }), el("span", {}, who, document.createTextNode(s.text))));
   }
   if ($("#autoscroll").checked) box.scrollTop = box.scrollHeight;
 }
@@ -436,7 +444,7 @@ async function openSession(id) {
     const ts = el(audio ? "button" : "span", { class: `ts ${audio ? "seek" : ""}`, text: clock(s.start), title: audio ? "Play from here" : null });
     if (audio) ts.addEventListener("click", () => { audio.currentTime = s.start; audio.play(); });
     const row = el("div", { class: "seg" }, ts,
-      el("span", {}, label ? el("span", { class: "speaker", text: `${label}:` }) : null, ...highlight(s.text, state.query)));
+      el("span", {}, label ? el("span", { class: (s.speaker === "Me" || label === "Me") ? "speaker me" : "speaker", text: `${label}:` }) : null, ...highlight(s.text, state.query)));
     row.dataset.start = s.start; row.dataset.end = s.end;
     return row;
   });

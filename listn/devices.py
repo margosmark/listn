@@ -183,9 +183,9 @@ def setup_guidance(devices: list[Device], output_name: str | None) -> list[dict]
 
     if not has_blackhole:
         notes.append({
-            "level": "warn",
-            "title": "BlackHole is not installed",
-            "detail": "To capture system audio (Zoom, Meet, browser), install BlackHole with `brew install blackhole-2ch`, then reboot or restart Core Audio. Until then you can only transcribe a microphone.",
+            "level": "ok",
+            "title": "No BlackHole needed",
+            "detail": "Record from the listn menu bar app. It captures system audio with a Core Audio process tap and your microphone at the same time, and labels you as Me. The device list on this page is only for a microphone or, if you install one, a legacy BlackHole or aggregate input.",
         })
     elif not multi_output:
         notes.append({
@@ -206,7 +206,7 @@ def setup_guidance(devices: list[Device], output_name: str | None) -> list[dict]
     if has_capture and not notes:
         notes.append({
             "level": "ok",
-            "title": "System audio capture looks ready",
-            "detail": "Pick the BlackHole (or aggregate) input and use Test input to confirm you see signal.",
+            "title": "Legacy device capture looks ready",
+            "detail": "BlackHole is routed, so this page can record through the selected input. The menu bar app is the usual way to record: it taps system audio directly and does not need BlackHole.",
         })
     return notes

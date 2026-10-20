@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>listn</string>
+	<key>CFBundleExecutable</key>
+	<string>Listn</string>
+	<key>CFBundleIdentifier</key>
+	<string>local.listn.menu</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>listn</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.3.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.3.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.2</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>listn captures system audio so it can transcribe meetings and other sound playing on this Mac. Audio stays on this computer.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>listn uses the microphone so your own voice is included in the transcript and labelled as you. Audio stays on this computer.</string>
+</dict>
+</plist>

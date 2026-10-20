@@ -203,3 +203,34 @@ def decode_file(path: Path, rate: int = TARGET_RATE) -> np.ndarray:
     if not chunks:
         return np.zeros(0, dtype=np.float32)
     return np.concatenate(chunks).astype(np.float32)
+
+
+def read_wav(path: Path) -> np.ndarray:
+    """Read a 16-bit WAV file listn wrote, as mono float32 in [-1, 1]."""
+    with wave.open(str(path), "rb") as wf:
+        channels = wf.getnchannels()
+        if wf.getsampwidth() != 2:
+            raise ValueError(f"{Path(path).name} is not 16-bit PCM.")
+        raw = wf.readframes(wf.getnframes())
+    if not raw:
+        return np.zeros(0, dtype=np.float32)
+    pcm = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    if channels > 1:
+        pcm = to_mono(pcm.reshape(-1, channels))
+    return np.ascontiguousarray(pcm, dtype=np.float32)
+
+
+def mix_mono(tracks: list[np.ndarray]) -> np.ndarray:
+    """Sum mono tracks that already share a timeline, clipping peaks.
+
+    A missing or empty track contributes nothing, so a mic-only or
+    system-only recording is not attenuated.
+    """
+    present = [np.asarray(t, dtype=np.float32).reshape(-1) for t in tracks if np.size(t)]
+    if not present:
+        return np.zeros(0, dtype=np.float32)
+    length = max(t.size for t in present)
+    mixed = np.zeros(length, dtype=np.float32)
+    for track in present:
+        mixed[: track.size] += track
+    return np.clip(mixed, -1.0, 1.0)
