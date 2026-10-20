@@ -361,7 +361,7 @@ async function loadSessions() {
   } catch (err) { box.replaceChildren(el("div", { class: "empty" }, el("p", { text: err.message }))); }
 }
 
-async function openSession(id) {
+async function openSession(id, seekAt) {
   state.selected = id;
   $$(".session").forEach(s => s.classList.remove("active"));
   const detail = $("#detail");
@@ -461,8 +461,34 @@ async function openSession(id) {
   }
   detail.replaceChildren(head, body);
   const firstHit = body.querySelector("mark");
-  if (firstHit) firstHit.scrollIntoView({ block: "center" });
+  if (seekAt != null && audio) {
+    audio.currentTime = seekAt;
+    audio.play().catch(() => {});
+    const row = rows.find(r => Math.abs(+r.dataset.start - seekAt) < 0.05) || rows.find(r => seekAt >= +r.dataset.start && seekAt < +r.dataset.end);
+    if (row) row.scrollIntoView({ block: "center" });
+  } else if (firstHit) firstHit.scrollIntoView({ block: "center" });
 }
+
+$("#ask-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const question = $("#ask-input").value.trim();
+  const box = $("#ask-answer");
+  if (!question) { box.hidden = true; return; }
+  box.hidden = false;
+  box.replaceChildren(el("p", { class: "muted", text: "Looking through the library…" }));
+  try {
+    const data = await api("POST", "/api/ask", { question });
+    const cites = (data.citations || []).map(hit => el("button", {
+      class: "cite",
+      text: `${hit.title} · ${clock(hit.start)}`,
+      title: hit.text,
+      onclick: () => openSession(hit.session_id, hit.start),
+    }));
+    box.replaceChildren(el("p", { text: data.answer }), cites.length ? el("div", { class: "cites" }, ...cites) : null);
+  } catch (err) {
+    box.replaceChildren(el("p", { text: err.message }));
+  }
+});
 
 function renderNotes(id, notes, busy) {
   const box = el("div", { class: "notes" });
