@@ -1,0 +1,17 @@
+# Core dependencies for audio transcription
+sounddevice==0.4.6       # Audio capture (PortAudio wrapper)
+numpy==1.26.4            # Audio data handling
+openai-whisper==20231117 # Whisper transcription model
+torch==2.1.0             # Required by Whisper (M1 optimized)
+
+# Speaker diarization (optional - installed by setup.sh if selected)
+# Requires FFmpeg: brew install ffmpeg
+# pyannote.audio==3.1.1  # Speaker identification and diarization
+# soundfile              # Audio file I/O for diarization
+
+# Post-processing (optional - for process_audio.py script)
+# librosa                # Audio file loading for post-processing
+
+# Optional but recommended
+python-dotenv==1.0.0     # Configuration from .env file
+rich==13.7.0             # Beautiful console output
