@@ -35,6 +35,12 @@ from listn.transcriber import get_transcriber, resolve_backend
 
 log = logging.getLogger("listn")
 
+# A real microphone never delivers exact zeros; its noise floor is far above
+# this. Exact zeros for a couple of seconds mean macOS is withholding audio.
+DIGITAL_SILENCE = 1e-5
+SILENCE_CHECK_SECONDS = 2.0
+TRACK_KEYS = {TRACK_SYSTEM: "system", TRACK_MIC: "mic"}
+
 
 def _clean_attendees(attendees: list) -> list[str]:
     names = []
@@ -112,6 +118,10 @@ class LiveSession:
         self._samples = 0
         self.paused = False
         self._pause_started: float | None = None
+        self.late_blocks = 0
+        self._peaks: dict[str, float] = {}
+        self._heard: dict[str, float] = {}
+        self.silent_tracks: list[str] = []
         self._segment_lock = threading.Lock()
         self._last_disk = 0.0
 
@@ -134,6 +144,7 @@ class LiveSession:
             "model": self.meta.model,
             "backend": self.meta.backend,
             "paused": self.paused,
+            "silent_tracks": list(self.silent_tracks),
         }
 
     def _elapsed_seconds(self) -> float:
@@ -215,14 +226,38 @@ class LiveSession:
             thread.start()
         self._emit("live.started", status=self.status())
 
-    def push_audio(self, track: int, sample_rate: int, samples: np.ndarray) -> None:
+    def push_audio(self, track: int, sample_rate: int, samples: np.ndarray) -> bool:
+        """Queue captured PCM. Returns False (and drops it) once the session is stopping."""
         if self.mode != "ingest" or self._stop.is_set():
-            raise RuntimeError("Not accepting captured audio.")
+            self.late_blocks += 1
+            return False
         block = np.array(samples, dtype=np.float32, copy=True)
         try:
             self._blocks.put_nowait((int(track), int(sample_rate), block))
         except queue.Full:
             self.dropped_blocks += 1
+        return True
+
+    def _note_signal(self, key: str, audio: np.ndarray) -> None:
+        """Watch for digital silence: macOS sends exact zeros when privacy access is missing."""
+        if audio.size == 0:
+            return
+        peak = float(np.max(np.abs(audio)))
+        self._peaks[key] = max(self._peaks.get(key, 0.0), peak)
+        self._heard[key] = self._heard.get(key, 0.0) + audio.size / TARGET_RATE
+        if key in self.silent_tracks or key == "system":
+            return
+        if self._heard[key] >= SILENCE_CHECK_SECONDS and self._peaks[key] <= DIGITAL_SILENCE:
+            self.silent_tracks.append(key)
+            from listn.privacy import silence_message
+
+            message, pane = silence_message(key)
+            self._emit("live.silent", track=key, message=message, pane=pane)
+
+    def all_silent(self) -> bool:
+        if not self._heard:
+            return True
+        return all(self._peaks.get(key, 0.0) <= DIGITAL_SILENCE for key in self._heard)
 
     def _chunker(self):
         if self.settings.vad_chunks:
@@ -274,6 +309,7 @@ class LiveSession:
                     self.level_db = -120.0
                     continue
                 was_paused = False
+                self._note_signal("input", mono)
                 if self._writer:
                     self._writer.write(mono)
                 level = rms(mono)
@@ -336,6 +372,7 @@ class LiveSession:
                 self.level_db = -120.0
                 continue
             was_paused = False
+            self._note_signal(TRACK_KEYS[track], audio)
             if writer is not None:
                 writer.write(audio)
             level = rms(audio)
@@ -439,13 +476,14 @@ class LiveSession:
         self.paused = False
         self._pause_started = None
         self.state = "listening"
-        if end - start >= 0.05:
-            gap = Segment(round(start, 2), round(max(end, start + 0.05), 2), "[paused]", None)
-            with self._segment_lock:
-                self.segments.append(gap)
-                self.segments.sort(key=lambda s: (s.start, s.speaker or ""))
-                self.library.save_segments(self.meta.id, self.segments)
-            self._emit("live.segments", segments=[gap.to_dict()])
+        # A pause is always marked, even one shorter than the audio that has
+        # arrived since, so the transcript shows that it happened.
+        gap = Segment(round(start, 2), round(max(end, start + 0.05), 2), "[paused]", None)
+        with self._segment_lock:
+            self.segments.append(gap)
+            self.segments.sort(key=lambda s: (s.start, s.speaker or ""))
+            self.library.save_segments(self.meta.id, self.segments)
+        self._emit("live.segments", segments=[gap.to_dict()])
         self._emit("live.resumed", state=self.state)
         self._emit("live.status", message="Listening", state=self.state)
         return True
@@ -565,7 +603,18 @@ class LiveSession:
                     self.library.save_segments(self.meta.id, self.segments)
             except Exception as exc:
                 self._emit("live.error", message=f"Speaker labels skipped: {exc}")
-        self.meta.status = "done"
+        from listn.privacy import SILENT_SESSION
+
+        spoken = [s for s in self.segments if s.text != "[paused]"]
+        silent = self.all_silent()
+        if silent:
+            self.meta.status = "error"
+            self.meta.silent = True
+            self.meta.error = SILENT_SESSION
+        else:
+            self.meta.status = "done"
+            if not spoken:
+                self.meta.warning = "No speech was recognised in this recording."
         self.library.save_meta(self.meta)
         self.state = "done"
         self._emit("live.stopped", session=self.meta.id, meta=self.meta.to_dict())
@@ -576,7 +625,8 @@ class LiveSession:
             apply_retention(self.library, self.settings.audio_retention_days)
         except OSError:
             log.exception("Retention pass failed")
-        schedule_notes(self.library, self.meta.id, self.settings, self.bus)
+        if spoken:
+            schedule_notes(self.library, self.meta.id, self.settings, self.bus)
 
     def _fail(self, message: str) -> None:
         self.state = "error"

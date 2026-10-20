@@ -286,6 +286,22 @@ function appendLiveSegments(segs) {
   if ($("#autoscroll").checked) box.scrollTop = box.scrollHeight;
 }
 
+async function openPrivacy(pane) {
+  try {
+    const r = await api("POST", "/api/privacy/open", { pane });
+    if (!r.opened) toast("Open System Settings > Privacy & Security on the Mac.");
+  } catch (err) { toast(err.message, "error"); }
+}
+
+function showPrivacyBanner(message, pane) {
+  const banner = $("#privacy-banner");
+  $("#privacy-message").textContent = message;
+  banner.dataset.pane = pane || "microphone";
+  banner.hidden = false;
+}
+
+$("#privacy-open").addEventListener("click", () => openPrivacy($("#privacy-banner").dataset.pane || "microphone"));
+
 $("#pause-btn").addEventListener("click", async () => {
   const paused = state.live && state.live.state === "paused";
   try { await api("POST", paused ? "/api/live/resume" : "/api/live/pause"); }
@@ -302,6 +318,7 @@ $("#record-btn").addEventListener("click", async () => {
       setLiveStatus("Finishing the last chunks…");
     } else {
       $("#live-transcript").replaceChildren();
+      $("#privacy-banner").hidden = true;
       state.liveSegments = [];
       state.live = await api("POST", "/api/live/start", { title: $("#live-title").value.trim() || null });
       setLiveStatus("Loading model… audio is already being captured.");
@@ -468,7 +485,9 @@ async function openSession(id, seekAt) {
   const notes = data.notes;
   const notesBox = renderNotes(id, notes, busy);
   const head = el("div", { class: "detail-head" }, title, metaLine, notesBox,
-    meta.error ? el("div", { class: "error-box", text: meta.error }) : null,
+    meta.error ? el("div", { class: "error-box" }, meta.error,
+      meta.silent ? el("button", { class: "btn secondary small", text: "Open Privacy Settings", onclick: () => openPrivacy("microphone") }) : null) : null,
+    meta.warning ? el("div", { class: "note warn", text: meta.warning }) : null,
     meta.audio_removed ? el("div", { class: "note", text: "The audio was deleted by the retention rule. The transcript and notes are still here." }) : null,
     audio,
     el("div", { class: "detail-actions" }, exportMenu, copyBtn, retrans, speakersBtn, el("span", { class: "sep" }), reveal, del));
@@ -626,6 +645,10 @@ function connectEvents() {
         setLiveStatus(ev.message === "Listening" ? "Listening… transcript appears every few seconds." : ev.message);
         renderLive(); break;
       case "live.segments": state.liveSegments.push(...ev.segments); appendLiveSegments(ev.segments); break;
+      case "live.silent":
+        showPrivacyBanner(ev.message, ev.pane);
+        toast(ev.message, "error");
+        break;
       case "live.paused":
         if (state.live) state.live.state = "paused";
         setLiveStatus("Paused. The gap stays in the transcript.");

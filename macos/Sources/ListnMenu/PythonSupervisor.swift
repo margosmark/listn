@@ -81,8 +81,24 @@ final class PythonSupervisor {
            let sock = existing.sock,
            FileManager.default.fileExists(atPath: sock),
            httpReady(port) {
-            spawned = false
-            return existing
+            let wanted = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+            guard let wanted, existing.version != wanted else {
+                spawned = false
+                return existing
+            }
+            // An engine left over from an older build speaks an older protocol;
+            // replace it, but never in the middle of a recording or a job.
+            guard engineIdle(port) else {
+                spawned = false
+                return existing
+            }
+            NSLog("listn: engine %@ does not match app %@; restarting it", existing.version ?? "unknown", wanted)
+            kill(existing.pid, SIGTERM)
+            let deadline = Date().addingTimeInterval(6)
+            while Date() < deadline, pidAlive(existing.pid) {
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            if pidAlive(existing.pid) { kill(existing.pid, SIGKILL) }
         }
         let binary = try findEngine()
         let spec = launchSpec(binary)
@@ -188,6 +204,23 @@ final class PythonSupervisor {
         }.resume()
         _ = semaphore.wait(timeout: .now() + 0.8)
         return ok.value
+    }
+
+    private func engineIdle(_ port: Int) -> Bool {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/api/status") else { return false }
+        let semaphore = DispatchSemaphore(value: 0)
+        let idle = Locked(false)
+        URLSession.shared.dataTask(with: URLRequest(url: url, timeoutInterval: 1.0)) { data, _, _ in
+            if let data,
+               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let live = object["live_active"] as? Bool ?? true
+                let jobs = object["jobs"] as? [Any] ?? []
+                idle.value = !live && jobs.isEmpty
+            }
+            semaphore.signal()
+        }.resume()
+        _ = semaphore.wait(timeout: .now() + 1.5)
+        return idle.value
     }
 
     private func openLog() throws -> FileHandle {

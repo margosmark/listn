@@ -88,6 +88,10 @@ class NotesIn(BaseModel):
     actions: list[dict] = []
 
 
+class PrivacyIn(BaseModel):
+    pane: str = "microphone"
+
+
 class AskIn(BaseModel):
     question: str = ""
 
@@ -234,6 +238,14 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
         except RuntimeError as exc:
             raise HTTPException(409 if "already" in str(exc) else 400, str(exc))
         return session.status()
+
+    @app.post("/api/privacy/open")
+    def open_privacy(body: PrivacyIn):
+        from listn.privacy import PANES, open_pane
+
+        if body.pane not in PANES:
+            raise HTTPException(400, f"Unknown pane. Choose one of {', '.join(PANES)}.")
+        return {"opened": open_pane(body.pane), "url": PANES[body.pane]}
 
     @app.post("/api/live/pause")
     def live_pause():
