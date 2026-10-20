@@ -8,12 +8,14 @@ other pages open in your browser).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -74,10 +76,19 @@ def _host_ok(host_header: str) -> bool:
 
 
 def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
-    app = FastAPI(title="listn", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        app.state.shutting_down.set()
+        if app.state.engine.live_active():
+            app.state.engine.stop_live(wait=True)
+
+    app = FastAPI(title="listn", version=__version__, docs_url=None, redoc_url=None, openapi_url=None,
+                  lifespan=lifespan)
     app.state.engine = engine or Engine(sd=sd)
     app.state.sd = sd
     app.state.settings = Settings.load()
+    app.state.shutting_down = threading.Event()
 
     def eng() -> Engine:
         return app.state.engine
@@ -294,15 +305,22 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
         bus = eng().bus
         q = bus.subscribe()
 
+        stopping = app.state.shutting_down
+
         def stream():
             try:
                 yield "retry: 2000\n\n"
-                while True:
+                idle = 0.0
+                while not stopping.is_set():
                     try:
-                        event = q.get(timeout=15)
+                        event = q.get(timeout=0.5)
                     except queue.Empty:
-                        yield ": keepalive\n\n"
+                        idle += 0.5
+                        if idle >= 15:
+                            idle = 0.0
+                            yield ": keepalive\n\n"
                         continue
+                    idle = 0.0
                     yield f"data: {json.dumps(event)}\n\n"
             finally:
                 bus.unsubscribe(q)
@@ -322,16 +340,42 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
     return app
 
 
-def serve(port: int = 8765, open_browser: bool = True) -> None:
-    import threading
+class _Server:
+    """uvicorn.Server that ends open event streams as soon as Ctrl+C arrives.
+
+    Otherwise graceful shutdown waits forever on the browser's EventSource.
+    """
+
+    def __new__(cls, app: FastAPI, port: int):
+        import uvicorn
+
+        class Server(uvicorn.Server):
+            def handle_exit(self, sig, frame):
+                app.state.shutting_down.set()
+                super().handle_exit(sig, frame)
+
+        config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning",
+                                timeout_graceful_shutdown=3)
+        return Server(config)
+
+
+def serve(port: int = 8765, open_browser: bool = True, app: FastAPI | None = None) -> None:
     import webbrowser
 
-    import uvicorn
+    import socket
 
-    app = create_app()
     url = f"http://127.0.0.1:{port}"
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        if probe.connect_ex(("127.0.0.1", port)) == 0:
+            print(f"Port {port} is already in use. If listn is already running, open {url}; "
+                  f"otherwise pick another port with `listn ui --port <n>`.")
+            if open_browser:
+                webbrowser.open(url)
+            return
+    app = app or create_app()
+    server = _Server(app, port)
     if open_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     print(f"listn is running at {url}  (local only; Ctrl+C to quit)")
     print(f"Data directory: {data_dir()}")
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+    server.run()
