@@ -1,3 +1,5 @@
+import json
+import os
 import time
 
 import pytest
@@ -17,6 +19,20 @@ def client(data_dir, fake_factory):
     app = create_app(engine=engine, sd=sd)
     with TestClient(app, base_url="http://127.0.0.1:8765") as c:
         yield c
+
+
+def test_capture_socket_is_private(client, data_dir):
+    import stat
+
+    sock = data_dir / "capture.sock"
+    assert sock.exists()
+    info = os.stat(sock)
+    assert stat.S_ISSOCK(info.st_mode)
+    assert info.st_mode & 0o777 == 0o600
+    server = json.loads((data_dir / "server.json").read_text())
+    assert server["pid"] == os.getpid()
+    assert server["sock"] == str(sock)
+    assert client.get("/api/status").json()["capture_sock"] == str(sock)
 
 
 def test_rejects_non_loopback_host(client):

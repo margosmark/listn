@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import queue
 import shutil
 import subprocess
@@ -17,6 +18,8 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+
+log = logging.getLogger("listn")
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
@@ -78,10 +81,21 @@ def _host_ok(host_header: str) -> bool:
 def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
+        from listn.ingest import IngestServer
+
+        try:
+            ingest = IngestServer(app.state.engine, port=app.state.http_port)
+            ingest.start()
+            app.state.ingest = ingest
+        except OSError as exc:
+            log.warning("Capture socket unavailable: %s", exc)
+            app.state.ingest = None
         yield
         app.state.shutting_down.set()
         if app.state.engine.live_active():
             app.state.engine.stop_live(wait=True)
+        if app.state.ingest is not None:
+            app.state.ingest.stop()
 
     app = FastAPI(title="listn", version=__version__, docs_url=None, redoc_url=None, openapi_url=None,
                   lifespan=lifespan)
@@ -89,6 +103,8 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
     app.state.sd = sd
     app.state.settings = Settings.load()
     app.state.shutting_down = threading.Event()
+    app.state.http_port = None
+    app.state.ingest = None
 
     def eng() -> Engine:
         return app.state.engine
@@ -148,6 +164,7 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
             "live": e.live.status() if e.live else None,
             "live_active": e.live_active(),
             "jobs": [j.to_dict() for j in e.jobs.values()],
+            "capture_sock": str(app.state.ingest.path) if getattr(app.state, "ingest", None) and app.state.ingest.path else None,
         }
 
     @app.get("/api/devices")
@@ -373,6 +390,7 @@ def serve(port: int = 8765, open_browser: bool = True, app: FastAPI | None = Non
                 webbrowser.open(url)
             return
     app = app or create_app()
+    app.state.http_port = port
     server = _Server(app, port)
     if open_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()

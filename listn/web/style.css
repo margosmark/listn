@@ -148,6 +148,7 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .seg .ts.seek { cursor: pointer; color: var(--accent); }
 .seg .ts.seek:hover { text-decoration: underline; }
 .seg .speaker { font-weight: 650; margin-right: 6px; }
+.seg .speaker.me { color: var(--accent); }
 .seg.active { background: var(--accent-soft); }
 mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 1px; }
 @keyframes fadein { from { opacity: 0; transform: translateY(3px); } }

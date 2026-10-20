@@ -1,103 +1,115 @@
 # listn
 
-Private, local-only transcription of your Mac's system audio (Zoom, Meet, Teams, browser, anything you can hear) and of audio files, using Whisper running on your own machine.
+Private, local-only transcripts of what you hear on your Mac, and of audio files, using Whisper on the machine itself.
 
-- **Live**: capture system audio through BlackHole and watch the transcript stream in as people talk. The recording is saved alongside it.
-- **Files**: transcribe WAV, MP3, M4A, FLAC, OGG, or video files, with progress.
-- **Library**: search every transcript, play the audio from any line, rename speakers, and export to TXT, Markdown, SRT, VTT, or JSON.
-- **Speaker labels** (optional): pyannote diarization over the whole recording.
-- **Web UI and CLI**: the same engine runs behind both.
+The everyday controls are a **menu bar app**. It captures system audio with a Core Audio process tap (macOS 14.2 or later) and, at the same time, your microphone. Those stay on separate tracks, so your own speech is labelled **Me** and everyone else **Others**. You can record every app or just one (Zoom, Teams, a browser). BlackHole is not required.
 
-**Local only.** The UI server binds to `127.0.0.1` and refuses requests from other host names or cross-site pages. There are no cloud APIs and no telemetry (Hugging Face and pyannote usage reporting are switched off). The only network access is the one-time model download. After that, listn runs offline.
+The menu bar app does not transcribe. It feeds audio to the Python engine, which still does transcription, optional diarization, the library, exports, the CLI, and the web UI.
+
+**Local only.** The web UI binds to `127.0.0.1` and refuses other host names. The menu bar talks to the engine over a Unix socket in your data folder (`capture.sock`, mode 0600), not over the network. There are no cloud APIs and no telemetry. The only network access is the one-time model download.
 
 ---
 
 ## Install (macOS)
 
-You need Python 3.10–3.13 and [Homebrew](https://brew.sh).
+You need Python 3.10–3.13, Swift 6 (the Command Line Tools are enough; a full Xcode install is not), and [Homebrew](https://brew.sh). This was written for Apple Silicon. An M5 Pro with 48 GB is plenty for the default live model.
 
 ```bash
-# 1. BlackHole: a virtual audio device that lets listn hear system audio
-brew install blackhole-2ch            # then restart your Mac (or: sudo killall coreaudiod)
-
-# 2. listn
-brew install uv                       # fast Python package manager
-git clone <this repo> listn && cd listn
-uv sync                               # creates .venv with the pinned versions from uv.lock
-
-# Optional extras
-uv sync --extra mlx                   # Apple Silicon GPU backend (recommended on M-series Macs)
-uv sync --extra diarize               # speaker labels (pulls in PyTorch, ~1 GB)
-uv sync --extra mlx --extra diarize   # both
+brew install uv
+cd listn
+uv sync --extra mlx          # Apple Silicon GPU backend; this is the one to install
 ```
 
-Prefer plain pip? `python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && pip install -e .`
-(`requirements-all.txt` pins every optional extra too.)
+`uv sync` without `--extra mlx` still runs, on the CPU, but live transcription of two tracks will lag. See [Models](#models-and-backends).
 
-### Route audio so you can hear it *and* listn can capture it (one time)
-
-1. Open **Audio MIDI Setup** (Applications → Utilities).
-2. Click **+** → **Create Multi-Output Device**, then tick your speakers/headphones **and** BlackHole 2ch. Put your speakers first and enable *Drift Correction* on BlackHole.
-3. In **System Settings → Sound → Output**, choose the Multi-Output Device. Or route just your meeting app by picking it as that app's speaker.
-
-To capture **your own microphone as well** (both sides of a call), create an **Aggregate Device** in Audio MIDI Setup with BlackHole 2ch and your mic, and pick it as listn's input. listn opens every channel and mixes only the ones carrying sound.
-
-The first time you record, macOS asks for microphone permission for your terminal app. This is needed even for BlackHole. If you missed the prompt, enable it under System Settings → Privacy & Security → Microphone.
-
----
-
-## Run
+BlackHole is optional. Install it only if you want the old "pick an input device" path:
 
 ```bash
-uv run listn            # opens the UI at http://127.0.0.1:8765
+brew install blackhole-2ch   # optional legacy input, then reboot or: sudo killall coreaudiod
 ```
 
-The Live tab checks your setup and tells you what's missing: BlackHole not installed, no Multi-Output Device, or system output not routed to BlackHole. **Test input** shows per-channel levels so you can confirm listn hears your meeting before you rely on it.
+## Menu bar app
 
-### CLI
+From the repo:
 
 ```bash
-uv run listn devices                      # list inputs + setup checks
-uv run listn devices --test               # 2-second level check on the chosen device
-uv run listn live                         # record + live transcript in the terminal (Ctrl+C to stop)
-uv run listn live --device "Aggregate" --model medium --language en --speakers
-uv run listn transcribe call.m4a --format srt --output call.srt
-uv run listn transcribe *.mp3 --output transcripts/
-uv run listn list                         # recent sessions
-uv run listn list "quarterly budget"      # search transcripts
+macos/scripts/build-app.sh
+open macos/Listn.app
+```
+
+The script runs `swift build -c release` for macOS 14.2, assembles `macos/Listn.app`, copies `Info.plist` (system-audio and microphone usage strings, menu-bar agent, minimum 14.2), and ad-hoc signs the bundle with `codesign --sign -`. Ad-hoc signing is what makes the permission prompts stick to this app. Rebuilding changes the signature, so macOS may ask again.
+
+The first time you record, macOS asks for **System Audio Recording** and **Microphone**. Allow both. If you dismissed them: System Settings → Privacy & Security → System Audio Recording, and Microphone. The app does not appear in the Dock (`LSUIElement`).
+
+What the menu does:
+
+- **Start / Stop recording**
+- **Source:** all system audio, one app that is currently doing audio, or the legacy input device selected in the web UI
+- **Microphone** on or off. On the legacy device this toggle is disabled, because that device already is whatever you routed into it
+- A **level** meter
+- The latest **transcript lines** (Me vs Others)
+- **Open library**, which is the web UI
+- **Quit**, which also stops the engine if the app started it
+
+The app starts `listn ui --no-browser` itself, using the `listn` written into the bundle at build time (your `.venv`). If you move the `.app` but not the checkout, set `LISTN_BIN` to the `listn` script. Logs: `~/Library/Application Support/listn/engine.log`.
+
+You do not need to start the web server yourself. Open Library does that once the engine is up (`http://127.0.0.1:8765`).
+
+## Web UI and CLI
+
+```bash
+uv run listn                 # http://127.0.0.1:8765
+uv run listn ui --no-browser --port 8765
+uv run listn devices
+uv run listn devices --test
+uv run listn live            # legacy input device in the terminal
+uv run listn transcribe call.m4a --format srt
+uv run listn list "budget"
 uv run listn export <session-id> --format md
-uv run listn path                         # where your data lives
+uv run listn path
 ```
 
-`--device` takes a name, part of a name, or an index. listn stores the device by name, because macOS renumbers devices whenever you plug in headphones. With no device set, it picks BlackHole, then an aggregate device, then your default input. Settings chosen in the UI (model, language, device) also apply to the CLI.
+The Live page's device picker is the **legacy** path: a microphone, or BlackHole / an aggregate device if you set one up. The page says so. Starting a recording there does not use the process tap. Everyday meetings should be started from the menu bar; the transcript still shows up in the web UI while it is open, because both share the same engine.
 
----
+`--device` takes a name, part of a name, or an index. With nothing selected, the legacy path prefers BlackHole, then an aggregate, then the default input.
 
 ## Models and backends
 
 | Model | Download | Notes |
 |---|---|---|
 | `tiny` / `base` | 75 / 145 MB | Fastest; fine for clear speech |
-| `small` (default) | 480 MB | Good balance for live use |
+| `small` | 480 MB | Default when MLX is not available |
 | `medium` | 1.5 GB | Noticeably better on accents and jargon |
-| `large-v3-turbo` | 1.6 GB | Near large-v3 accuracy, much faster; great with MLX |
+| `large-v3-turbo` | 1.6 GB | Default live model on Apple Silicon with MLX |
 | `large-v3` | 3 GB | Most accurate, slowest |
 
-Backends (Settings → Transcription backend):
+**Why `large-v3-turbo` on this Mac.** It is a distilled large-v3: similar accuracy, about 1.6 GB, and much faster. With MLX on an M5 Pro (48 GB), one 6-second chunk finishes well inside that 6 seconds, and doing it twice — system audio, then the microphone — still keeps up. `auto` selects the MLX backend when `mlx-whisper` imports on Apple Silicon. If MLX is not installed, the default model stays `small`, because turbo on CPU int8 can fall behind two live tracks.
 
-- **faster-whisper** (default, always installed): CTranslate2 int8 on CPU. About 4x faster than the original openai-whisper, uses much less memory, doesn't need PyTorch, and includes voice-activity detection that removes most "Thanks for watching!" hallucinations on silence.
-- **mlx** (`--extra mlx`): runs on the Apple Silicon GPU. `auto` picks it when installed on an M-series Mac.
-- **openai-whisper** (`--extra openai`): the original implementation, kept for comparison.
+A settings file left over from an older run keeps whatever model you saved. In the web UI, set the model to `large-v3-turbo` and the backend to Auto (or MLX).
 
-Live transcription works on short chunks (6 s by default, adjustable), so accuracy is a bit lower than on a whole file. For important meetings, open the session in the Library and click **Retranscribe**, optionally with a bigger model, or **Label speakers**. Both run over the full recording.
+Backends:
 
-## Speaker labels
+- **faster-whisper** (always installed): CTranslate2 int8 on CPU, with voice-activity detection.
+- **mlx** (`--extra mlx`): Apple Silicon GPU. This is the backend the menu bar setup is meant to use.
+- **openai-whisper** (`--extra openai`): the original implementation, for comparison.
+
+Live chunks are a bit less accurate than a whole file. For an important meeting, open it in the library and **Retranscribe**.
+
+## How capture is split
+
+The menu bar sends two PCM streams over the socket. Track 0 is system audio (or the one app you picked) and is labelled **Others**. Track 1 is the microphone and is labelled **Me**. Each track is resampled, saved, and transcribed on its own, so the labels do not depend on a diarization model. That is the reliable split for a call.
+
+If you turn on speaker labels, pyannote runs only on the system track after you stop, and Me is left alone. Rename either name in the library.
+
+ScreenCaptureKit is not used. It can capture app audio, but the permission is screen recording and the API is built around video. Process taps are the audio API for this, they have been in macOS since 14.2, and 26.7 has them.
+
+The tap is private and **unmuted**, so the meeting keeps playing through your speakers. Nothing is muted and nothing is exclusive.
+
+## Speaker labels (optional, for more than Me / Others)
 
 1. `uv sync --extra diarize`
 2. Accept the terms for [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) and [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0), and create a read token at <https://huggingface.co/settings/tokens>.
-3. Paste the token in Settings, or `export HF_TOKEN=...`. It's needed only for the first download. The token is saved in `settings.json` with owner-only permissions.
-
-Speakers are identified over the whole recording after you stop, so labels stay consistent. You can rename "Speaker 1" to a real name in the Library, and exports use your names.
+3. Paste the token in Settings, or `export HF_TOKEN=...`. It is only needed for the first download.
 
 ## Where your data lives
 
@@ -105,40 +117,76 @@ Speakers are identified over the whole recording after you stop, so labels stay 
 
 ```
 settings.json
-sessions/<id>/meta.json  transcript.json  audio.wav|.mp3|...
+server.json                 # port, pid, capture socket path
+capture.sock                # menu bar ↔ engine, mode 0600
+engine.log                  # only if the menu bar app started the engine
+sessions/<id>/meta.json
+sessions/<id>/transcript.json
+sessions/<id>/audio.wav             # mix for playback
+sessions/<id>/audio-system.wav      # Others
+sessions/<id>/audio-mic.wav         # Me
 ```
 
-Nothing is written to the repo or the current directory unless you pass `--output`. Recordings are 16 kHz mono WAV, about 115 MB per hour. Turn off *Keep the audio recording* if you only want text. Models are cached in `~/.cache/huggingface`.
+Legacy and file recordings are a single `audio.wav` (or the imported file). Recordings are 16 kHz 16-bit WAV. Turn off *Keep the audio recording* in the web UI if you only want text. Models are cached in `~/.cache/huggingface`.
 
----
+The socket path has to fit in a Unix socket address (about 100 bytes). The default path does.
 
 ## Development
 
 ```bash
 uv sync
-uv run pytest           # hardware-free: fake sounddevice + fake Whisper
+uv run pytest        # no audio hardware: fake devices, fake Whisper, fake capture client
 ```
 
-Layout:
+The Swift app does not build on Linux. `macos/scripts/build-app.sh` exits there on purpose.
 
 ```
 listn/
-  cli.py          `listn` entry point (ui, devices, live, transcribe, list, export, path)
-  server.py       FastAPI app + localhost guard; serves listn/web/ (plain HTML/CSS/JS, no build step)
-  engine.py       live sessions (capture → resample → WAV + chunker → Whisper), file job queue, event bus
-  capture.py      opening input streams with channel/rate fallbacks, level test
-  devices.py      device discovery, name-based selection, BlackHole setup guidance
-  audio.py        mixing, anti-aliased resampling, quiet-point chunking, WAV writer, file decoding
-  transcriber.py  faster-whisper / MLX / openai-whisper backends, hallucination filter
-  diarize.py      pyannote pipeline + speaker assignment
-  library.py      session storage, search, export formats
+  cli.py          listn entry point
+  server.py       localhost web UI; starts the capture socket with the server
+  ingest.py       Unix-socket server (one client; a new connection replaces the old)
+  ipc.py          frame codec shared with the menu bar app
+  engine.py       device capture and ingest capture, file jobs, events
+  capture.py      legacy input streams
+  devices.py      device discovery; BlackHole guidance is legacy-only
+  audio.py        mixing, resampling, chunking, WAV
+  transcriber.py  faster-whisper / MLX / openai-whisper
+  diarize.py      optional pyannote, whole recording
+  library.py      sessions, search, export
+macos/
+  Package.swift
+  Info.plist
+  Sources/ListnMenu/
+  scripts/build-app.sh
 ```
+
+### Capture socket
+
+Frames are little-endian: `uint32 length | uint8 type | payload`. Types are HELLO, WELCOME, AUDIO, START, STOP, EVENT, PING, PONG, ERROR. AUDIO is `track | sample rate | channels | float32 PCM`, track 0 system and track 1 microphone. START's `source` is `system`, `app`, or `device` (the legacy input). Details are in `listn/ipc.py`. The Python tests drive this with a fake client, including a client that reconnects mid-recording.
+
+## On a Mac, before you trust it
+
+This repo's tests do not open a process tap. On the Mac, check:
+
+1. `macos/scripts/build-app.sh` finishes and `codesign --verify macos/Listn.app` is clean.
+2. `open macos/Listn.app`. The menu bar icon appears and no Dock icon does.
+3. Start recording. macOS asks for system-audio recording and the microphone. After allowing both, the menu's level meter moves when system audio plays and when you speak.
+4. Playback of other apps does **not** go silent while the tap is running.
+5. A Zoom, Teams, or browser tab can be chosen as the only source, and other apps' audio stays out of Others.
+6. A short call: your voice is **Me**, the other side is **Others**, in the menu and in the library.
+7. Open Library. The web UI loads on `127.0.0.1` only. The live page shows the same lines. Export still works.
+8. Quit and reopen. If you denied a permission, System Settings shows **listn** (not "python" or a blank name) under System Audio Recording and Microphone.
+9. Legacy: install BlackHole only if you want it, pick it in the web UI, choose **Legacy input device** in the menu, and confirm the old path still records.
+10. With `uv sync --extra mlx` and model `large-v3-turbo`, two live tracks stay caught up (the UI should not sit on "N chunks waiting" during normal speech).
 
 ## Troubleshooting
 
-- **Transcript is empty / Test input says "No signal"**: system output isn't going through BlackHole. Choose the Multi-Output Device as output, and check the meeting app's own speaker setting.
-- **"Could not open 'Aggregate Device'"**: in Audio MIDI Setup, make sure every sub-device uses the same sample rate and one of them is the clock source.
-- **Live lags behind**: the UI shows "N chunks waiting". Pick a smaller model, install the MLX backend, or raise the chunk length.
-- **Device missing after installing BlackHole**: restart Core Audio (`sudo killall coreaudiod`) and click **Rescan**.
+- **Menu says it cannot find the engine.** Run `uv sync --extra mlx` in the repo and rebuild, or `export LISTN_BIN=/absolute/path/to/.venv/bin/listn`.
+- **System audio permission denied.** System Settings → Privacy & Security → System Audio Recording → listn. Rebuilds can change the ad-hoc signature and clear the grant.
+- **An app is missing from Source.** It has to have opened an audio device. Start the meeting audio, then open the menu again.
+- **The meter stays silent.** Confirm the meeting is actually playing, and that you did not pick a single app that is quiet. Tap auto-start is off so recording begins immediately; silence until someone speaks is normal.
+- **Legacy transcript is empty.** That path still needs BlackHole (or an aggregate) routed in Audio MIDI Setup. The menu-bar tap does not.
+- **Live lags.** Install the MLX extra, use `large-v3-turbo` rather than `large-v3`, or raise the chunk length in Settings.
+- **Port 8765 is taken.** Quit the other listn (`engine.log` will say so). The menu bar will not attach to a pre-0.3 server that has no capture socket.
 
 MIT License.

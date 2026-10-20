@@ -26,3 +26,7 @@ transcripts/
 .idea/
 *.swp
 .DS_Store
+
+# Menu bar app build products (built on a Mac; this repo also builds on Linux)
+macos/.build/
+macos/Listn.app/
