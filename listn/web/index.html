@@ -68,6 +68,10 @@
           <input type="checkbox" id="diarize-after" data-setting="diarize_after">
           <span>Label speakers after stopping</span>
         </label>
+        <label class="toggle">
+          <input type="checkbox" id="summarize-after" data-setting="summarize_after">
+          <span>Summarize when a recording ends</span>
+        </label>
         <p class="hint" id="diarize-hint"></p>
 
         <label class="field">
@@ -164,6 +168,11 @@
       <span>Live chunk length: <strong id="chunk-label"></strong></span>
       <input type="range" id="chunk" min="3" max="20" step="1" data-setting="chunk_seconds">
       <small class="muted">Shorter means lower delay. Longer gives Whisper more context and better accuracy.</small>
+    </label>
+    <label class="field">
+      <span>Notes model <em class="muted">(MLX, downloaded once)</em></span>
+      <input type="text" id="llm-model" data-setting="llm_model" spellcheck="false">
+      <small class="muted">Default is Qwen2.5-7B-Instruct 4-bit, about 4.3 GB. It runs after Whisper, so both fit in 48 GB. Without MLX, notes are extracted from the transcript instead.</small>
     </label>
     <label class="field">
       <span>Hugging Face token <em class="muted">(only for the first speaker-model download)</em></span>

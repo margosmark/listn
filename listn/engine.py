@@ -429,6 +429,9 @@ class LiveSession:
         self.library.save_meta(self.meta)
         self.state = "done"
         self._emit("live.stopped", session=self.meta.id, meta=self.meta.to_dict())
+        from listn.summary import schedule_notes
+
+        schedule_notes(self.library, self.meta.id, self.settings, self.bus)
 
     def _fail(self, message: str) -> None:
         self.state = "error"
@@ -585,3 +588,7 @@ class Engine:
         meta = self.library.update(job.meta.id, status="error" if error else "done", error=error)
         self.jobs.pop(job.meta.id, None)
         self.bus.publish({"type": "job.done", "job": job.to_dict(), "meta": meta.to_dict(), "error": error})
+        if not error:
+            from listn.summary import schedule_notes
+
+            schedule_notes(self.library, job.meta.id, Settings.load(), self.bus)

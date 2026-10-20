@@ -194,6 +194,17 @@ class Library:
         with self._lock:
             self._write_json(self._dir(session_id) / "transcript.json", [s.to_dict() for s in segments])
 
+    def save_notes(self, session_id: str, notes: dict) -> None:
+        with self._lock:
+            self._write_json(self._dir(session_id) / "summary.json", notes)
+
+    def notes(self, session_id: str) -> dict | None:
+        try:
+            raw = json.loads((self._dir(session_id) / "summary.json").read_text())
+        except (OSError, ValueError):
+            return None
+        return raw if isinstance(raw, dict) else None
+
     def get(self, session_id: str) -> SessionMeta:
         path = self._dir(session_id) / "meta.json"
         try:

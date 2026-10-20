@@ -218,6 +218,24 @@ def cmd_path(args) -> int:
     return 0
 
 
+def cmd_summarize(args) -> int:
+    from listn.summary import write_notes
+
+    lib = Library()
+    try:
+        lib.get(args.id)
+    except KeyError:
+        print(f"No session '{args.id}'.", file=sys.stderr)
+        return 1
+    notes = write_notes(lib, args.id, Settings.load())
+    print(notes["summary"])
+    for decision in notes["decisions"]:
+        print(f"Decision: {decision}")
+    for action in notes["actions"]:
+        print(f"Action ({action['owner']}): {action['text']}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="listn", description="Local-only system audio transcription for macOS.")
     p.add_argument("--version", action="version", version=f"listn {__version__}")
@@ -263,6 +281,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     pa = sub.add_parser("path", help="Print the data directory")
     pa.set_defaults(func=cmd_path)
+
+    sm = sub.add_parser("summarize", help="Write a local summary, decisions, and action items")
+    sm.add_argument("id")
+    sm.set_defaults(func=cmd_summarize)
     return p
 
 
