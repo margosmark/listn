@@ -235,51 +235,68 @@ def test_absurd_frame_length_is_rejected(ingest):
 def test_dual_track_session_labels_me_and_others(ingest):
     server, engine = ingest
     client = FakeClient(server.path)
-    client.hello()
-    client.send(encode_json(START, {
-        "source": "app",
-        "app_name": "Zoom",
-        "mic": True,
-        "title": "Standup",
-        "model": "tiny",
-        "chunk_seconds": 2,
-    }))
-    client.send(encode_audio(0, 48000, tone(2.6, 48000, 220)))
-    client.send(encode_audio(1, 16000, tone(2.6, 16000, 330)))
+    try:
+        client.hello()
+        client.send(encode_json(START, {
+            "source": "app",
+            "app_name": "Zoom",
+            "mic": True,
+            "title": "Standup",
+            "model": "tiny",
+            "chunk_seconds": 2,
+        }))
+        wait_for(lambda: engine.live_active())
+        live = engine.live
+        client.send(encode_audio(0, 48000, tone(2.6, 48000, 220)))
+        client.send(encode_audio(1, 16000, tone(2.6, 16000, 330)))
+        # AUDIO and STOP share one stream, so the server cannot stop
+        # before both tones are queued. Joining the workers waits until
+        # the flush and the labels exist. A socket read is not that
+        # signal: the event bus drops frames once a subscriber is full,
+        # which happened under a full-suite load.
+        client.send(encode_frame(STOP))
+        assert live is not None
+        for thread in live._threads:
+            thread.join(timeout=60)
+            assert not thread.is_alive(), thread.name
+        with live._segment_lock:
+            segments = list(live.segments)
+        assert {segment.speaker for segment in segments} >= {"Me", "Others"}
+        assert all("Thanks for watching" not in segment.text for segment in segments)
+        while True:
+            try:
+                item = client.frames.get_nowait()
+            except queue.Empty:
+                break
+            if not isinstance(item, tuple):
+                continue
+            kind, payload = item
+            if kind != EVENT:
+                continue
+            event = json.loads(payload)
+            if event["type"] != "live.segments":
+                continue
+            assert all("Thanks for watching" not in segment["text"] for segment in event["segments"])
 
-    speakers = set()
-    end = time.monotonic() + 10
-    while time.monotonic() < end and speakers != {"Me", "Others"}:
-        payload = client.wait_kind(EVENT, timeout=end - time.monotonic())
-        event = json.loads(payload)
-        if event["type"] == "live.segments":
-            speakers.update(seg["speaker"] for seg in event["segments"])
-            assert all("Thanks for watching" not in seg["text"] for seg in event["segments"])
-    assert speakers == {"Me", "Others"}
+        wait_for(lambda: engine.live is not None and not engine.live_active(), timeout=30)
 
-    client.send(encode_frame(STOP))
-    end = time.monotonic() + 10
-    while time.monotonic() < end:
-        event = json.loads(client.wait_kind(EVENT, timeout=end - time.monotonic()))
-        if event["type"] == "live.stopped":
-            break
-    else:
-        raise AssertionError("session did not stop")
-
-    meta = engine.library.get(engine.live.meta.id)
-    assert meta.status == "done"
-    assert meta.source_name == "Zoom + microphone"
-    assert meta.duration > 2
-    segs = engine.library.segments(meta.id)
-    assert {s.speaker for s in segs} == {"Me", "Others"}
-    assert segs == sorted(segs, key=lambda s: (s.start, s.speaker or ""))
-    root = engine.library.session_path(meta.id)
-    for name in ("audio-system.wav", "audio-mic.wav", "audio.wav"):
-        assert (root / name).exists()
-    with wave.open(str(root / "audio.wav"), "rb") as wf:
-        assert wf.getnchannels() == 1 and wf.getframerate() == 16000
-        assert wf.getnframes() > 16000
-    client.close()
+        meta = engine.library.get(engine.live.meta.id)
+        assert meta.status == "done"
+        assert meta.source_name == "Zoom + microphone"
+        assert meta.duration > 2
+        segs = engine.library.segments(meta.id)
+        assert {s.speaker for s in segs} == {"Me", "Others"}
+        assert segs == sorted(segs, key=lambda s: (s.start, s.speaker or ""))
+        root = engine.library.session_path(meta.id)
+        for name in ("audio-system.wav", "audio-mic.wav", "audio.wav"):
+            assert (root / name).exists()
+        with wave.open(str(root / "audio.wav"), "rb") as wf:
+            assert wf.getnchannels() == 1 and wf.getframerate() == 16000
+            assert wf.getnframes() > 16000
+    finally:
+        client.close()
+        if engine.live_active():
+            engine.stop_live(wait=True)
 
 
 def test_replacing_the_client_does_not_drop_the_recording(ingest):
