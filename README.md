@@ -50,7 +50,23 @@ tccutil reset AudioCapture local.listn.menu
 
 To make grants survive rebuilds, create a self-signed code-signing certificate once (Keychain Access → Certificate Assistant → Create a Certificate, type *Code Signing*, name it `listn local`) and build with `LISTN_SIGN_IDENTITY="listn local" macos/scripts/build-app.sh`.
 
-**Silent input.** If a track delivers only exact zeros for about two seconds, the menu and the web UI say *listn isn't receiving audio* and show **Open Privacy Settings**, which opens the right pane (Microphone, or Screen & System Audio Recording). System audio is only flagged while something is actually playing, because a quiet Mac is zeros too. A finished recording that never heard any signal is saved as an error ("no audio reached listn"), not as a done session with an empty transcript. Audio that arrives but holds no speech is saved as done, with a warning.
+**Silent input.** If a track delivers only exact zeros for about two seconds, the menu bar icon changes to a warning and its title becomes **No audio**. The menu's first item says capture returned silence and points at `~/Library/Application Support/listn/capture.log`, with **Open Privacy Settings** under it. That is not only a permission error: a tap with no clock, or a microphone that is open but handing back zeros, looks the same. The log records the default devices (including an HDMI or DisplayPort output, which has no volume control), the tap and aggregate status codes, the formats, the first buffer peaks, and each second of a self-test. A finished recording that never heard any signal is saved as an error, not as a done session with an empty transcript.
+
+The system-audio tap's aggregate device is clocked to the current default output, and it follows when that output changes. A display output is tapped on that device. The microphone is a separate Core Audio callback on the default input, not the tap and not AVAudioEngine.
+
+**Self-test.** Quit listn first (`open` will not pass arguments to an app that is already running). This launch is the one whose permission prompts belong to listn:
+
+```bash
+open macos/Listn.app --args --selftest 8
+```
+
+Then read `~/Library/Application Support/listn/selftest.log` (the same lines are appended to `capture.log`). A direct run prints to the terminal as well, but macOS attributes its microphone prompt to the shell, so use it only to compare:
+
+```bash
+macos/Listn.app/Contents/MacOS/Listn --selftest 8
+```
+
+Exit status is 0 when any stream peaked above silence, 2 when both stayed silent, and 1 when capture could not start. The default is 5 seconds, and the maximum is 30.
 
 **Engine version.** The app compares the running engine's version (from `server.json`) with its own. An engine left over from an older build is restarted when it is idle; one in the middle of a recording or a file job is left alone until next time.
 
@@ -246,7 +262,7 @@ Frames are little-endian: `uint32 length | uint8 type | payload`. Types are HELL
 This repo's tests do not open a process tap. On the Mac, check:
 
 1. `macos/scripts/build-app.sh` finishes and `codesign --verify --deep --strict macos/Listn.app` is clean. `macos/Listn.app/Contents/Resources/python/bin/listn --version` prints the app version.
-2. After a rebuild, run the two `tccutil reset` lines from *Menu bar app*, record, and allow both prompts. The level meter moves. Deny the microphone in System Settings and record again: within a few seconds the menu shows the privacy message and **Open Privacy Settings** opens the Microphone pane.
+2. After a rebuild, run the two `tccutil reset` lines from *Menu bar app*. Quit listn, play some audio, and run `open macos/Listn.app --args --selftest 8`. `~/Library/Application Support/listn/selftest.log` should show `aggregate clocked to` with `noErr` and a non-zero peak on system or mic. Then record from the menu: the level meter moves. If capture is silence, the menu bar says **No audio** and **Open Privacy Settings** is at the top of the menu.
 3. `open macos/Listn.app`. The menu bar icon appears and no Dock icon does. If an older engine was running, `engine.log` shows a fresh start with the new version.
 4. Start recording. macOS asks for system-audio recording and the microphone. After allowing both, the menu's level meter moves when system audio plays and when you speak.
 5. Playback of other apps does **not** go silent while the tap is running.
@@ -267,7 +283,7 @@ This repo's tests do not open a process tap. On the Mac, check:
 ## Troubleshooting
 
 - **Menu says it cannot find the engine.** Run `uv sync --extra mlx` in the repo and rebuild, or `export LISTN_BIN=/absolute/path/to/.venv/bin/listn`.
-- **Every recording is silent (peak 0, empty transcript).** A permission is missing or belongs to an older build. Run the two `tccutil reset … local.listn.menu` lines from *Menu bar app*, quit any old `listn ui` process, reopen the app, and allow both prompts. Sign with `LISTN_SIGN_IDENTITY` so this stops happening on every rebuild.
+- **Every recording is silent (peak 0, empty transcript).** The menu should say **No audio** and name `capture.log`. Read that log: `default output` should be the device you are playing through (an HDMI monitor is clocked on purpose), `aggregate clocked to` should be `noErr`, and `first second` should show a non-zero peak while something is playing. If the lines show a tap-only fallback, the clock device was rejected. Run `open macos/Listn.app --args --selftest 8` after quitting listn and compare system vs mic peaks. Permissions still matter after an ad-hoc rebuild: run the two `tccutil reset … local.listn.menu` lines from *Menu bar app* and allow both prompts, or sign with `LISTN_SIGN_IDENTITY`.
 - **System audio permission denied.** System Settings → Privacy & Security → Screen & System Audio Recording → listn.
 - **An app is missing from Source.** It has to have opened an audio device. Start the meeting audio, then open the menu again.
 - **The meter stays silent.** Confirm the meeting is actually playing, and that you did not pick a single app that is quiet. Tap auto-start is off so recording begins immediately; silence until someone speaks is normal.

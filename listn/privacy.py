@@ -1,8 +1,9 @@
-"""macOS privacy panes and the messages shown when capture is withheld.
+"""macOS privacy panes and the messages shown when capture is silence.
 
-When an app lacks Microphone or System Audio Recording access, macOS does
-not raise an error: the stream runs and every sample is zero. listn treats
-a couple of seconds of exact zeros as that case and says which pane to fix.
+macOS delivers exact zeros both when permission is missing and when the tap
+or the microphone is opened in a way that never receives samples. The message
+says the capture is silence and points at capture.log; the Settings pane is
+there for the case where access really was reset.
 """
 
 from __future__ import annotations
@@ -16,18 +17,26 @@ PANES = {
 }
 
 SILENT_SESSION = (
-    "listn received only silence. macOS sends silence when listn is not allowed to record. "
-    "Allow listn in System Settings > Privacy & Security > Microphone and "
-    "Screen & System Audio Recording, then record again."
+    "This recording is silence. listn received audio frames, but every sample was zero. "
+    "See ~/Library/Application Support/listn/capture.log."
 )
 
 
 def silence_message(track: str) -> tuple[str, str]:
     if track == "system":
-        return ("listn isn't receiving system audio. Allow it in System Settings > Privacy & Security > "
-                "Screen & System Audio Recording.", "audio-capture")
-    return ("listn isn't receiving audio from the microphone. Allow it in System Settings > Privacy & Security > "
-            "Microphone, then start again.", "microphone")
+        return (
+            "listn is recording, but system audio returned silence (every sample is zero). "
+            "See ~/Library/Application Support/listn/capture.log. "
+            "If access was reset, allow listn in System Settings > Privacy & Security > "
+            "Screen & System Audio Recording.",
+            "audio-capture",
+        )
+    return (
+        "listn is recording, but the microphone returned silence (every sample is zero). "
+        "See ~/Library/Application Support/listn/capture.log. "
+        "If access was reset, allow listn in System Settings > Privacy & Security > Microphone.",
+        "microphone",
+    )
 
 
 def open_pane(pane: str) -> bool:

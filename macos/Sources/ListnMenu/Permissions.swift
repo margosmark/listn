@@ -23,9 +23,9 @@ enum PrivacyPane: String {
     var message: String {
         switch self {
         case .microphone:
-            return "listn isn't receiving audio from the microphone. Allow it in System Settings > Privacy & Security > Microphone."
+            return "listn is recording, but the microphone returned silence (every sample is zero). See ~/Library/Application Support/listn/capture.log. Open Privacy Settings if access was reset."
         case .audioCapture:
-            return "listn isn't receiving system audio. Allow it in System Settings > Privacy & Security > Screen & System Audio Recording."
+            return "listn is recording, but system audio returned silence (every sample is zero). See ~/Library/Application Support/listn/capture.log. Open Privacy Settings if access was reset."
         }
     }
 

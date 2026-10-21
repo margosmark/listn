@@ -1,35 +1,18 @@
 import AppKit
-import AVFoundation
 import CoreAudio
-import Darwin
+import Foundation
 
-// System audio is captured with a Core Audio process tap (macOS 14.2+), not
-// ScreenCaptureKit. A tap needs only the system-audio recording permission
-// (NSAudioCaptureUsageDescription). It can take every process or one app, and
-// muteBehavior .unmuted leaves speakers and headphones playing normally.
-// ScreenCaptureKit would also work, but it asks for screen recording and is
-// built around video frames, which this app never wants.
+// System audio is a Core Audio process tap (macOS 14.2+). The tap is placed
+// in a private aggregate device whose clock is the default output, including
+// an HDMI or DisplayPort monitor that has no volume control. Without that
+// clock the IO proc runs and every sample is zero.
 //
-// The microphone is a separate AVAudioEngine input. The two streams stay
-// separate tracks: track 0 is other people, track 1 is you.
+// The microphone is its own AudioDeviceIOProc on the default input device.
+// It does not use AVAudioEngine and it does not share the tap aggregate, so
+// a silent tap cannot zero the mic (or the other way around).
 
-// The SDK imports kAudioObjectSystemObject as Int32 and kAudioObjectUnknown
-// differs between SDK versions, so both are normalized to AudioObjectID once.
 private let systemObject = AudioObjectID(kAudioObjectSystemObject)
 private let noObject = AudioObjectID(kAudioObjectUnknown)
-
-/// A thread-safe slot for values written from a @Sendable completion handler.
-final class Locked<Value>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var stored: Value
-
-    init(_ value: Value) { stored = value }
-
-    var value: Value {
-        get { lock.lock(); defer { lock.unlock() }; return stored }
-        set { lock.lock(); stored = newValue; lock.unlock() }
-    }
-}
 
 struct AudioApp {
     var objectID: AudioObjectID
@@ -82,23 +65,48 @@ enum CaptureError: LocalizedError {
         case .aggregate(let detail):
             return "Could not open the audio tap (\(detail))."
         case .io(let detail):
-            return "Could not start the audio tap (\(detail))."
+            return "Could not start audio capture (\(detail))."
         case .format:
-            return "The audio tap did not report a usable format."
+            return "The audio device did not report a usable format."
         case .noProcess(let name):
             return "\(name) is not playing audio yet. Start the meeting, then pick it again."
         }
     }
 }
 
+struct StreamMeter {
+    var peak: Float = 0
+    var sum: Float = 0
+    var count: Int = 0
+    var callbacks: Int = 0
+
+    var rmsDB: Float {
+        guard count > 0 else { return -120 }
+        let mean = sum / Float(count)
+        if mean < 1e-12 { return -120 }
+        return 20 * log10(sqrt(mean))
+    }
+
+    mutating func add(_ samples: [Float]) {
+        callbacks += 1
+        count += samples.count
+        for sample in samples {
+            let value = abs(sample)
+            if value > peak { peak = value }
+            sum += sample * sample
+        }
+    }
+}
+
 final class CaptureEngine {
     var onPCM: ((UInt8, Double, Int, [Float]) -> Void)?
-    var onLevels: ((Float, Float) -> Void)?
+    /// Microphone level is nil when this recording is not capturing the mic,
+    /// so a system-only session is not reported as a silent microphone.
+    var onLevels: ((Float, Float?) -> Void)?
     var onWarning: ((String) -> Void)?
     var onDeviceChange: (() -> Void)?
-    /// Called once per recording when a track has delivered only exact zeros
-    /// for `silenceWindow` seconds. System audio is reported only if some
-    /// output device is actually playing, because a quiet Mac is also zeros.
+    /// Fired once a track has delivered only zeros. The menu also watches
+    /// levels, so a missed callback still surfaces.
     var onSilent: ((PrivacyPane) -> Void)?
     private let silenceWindow: Double = 2.5
     private var heard: [Int: Double] = [:]
@@ -109,21 +117,203 @@ final class CaptureEngine {
     private var aggregateID = noObject
     private var procID: AudioDeviceIOProcID?
     private var format = AudioStreamBasicDescription()
-    private var micEngine: AVAudioEngine?
+    private var dropChannels = 0
+    private var tapChannels = 2
+    private var loggedSystemLayout = false
+
+    private var micDevice = noObject
+    private var micProc: AudioDeviceIOProcID?
+    private var microphoneOpen = false
+    private var micFormat = AudioStreamBasicDescription()
+
+    private(set) var openedOutputUID: String?
+    private(set) var openedInputUID: String?
     private var running = false
     private var watchingDevices = false
     private var systemDB: Float = -120
     private var micDB: Float = -120
+    private var systemMeter = StreamMeter()
+    private var micMeter = StreamMeter()
     private var lastLevel = Date.distantPast
+    private var loggedFirst: Set<Int> = []
+    private var firstPeak: [Int: Float] = [:]
+    private var firstSeconds: [Int: Double] = [:]
     private let levelLock = NSLock()
 
+    /// Starts whichever side it can. A failure of the tap does not stop the
+    /// microphone, and a failure of the microphone does not stop the tap.
     func start(appPID: pid_t?, appName: String?, mic: Bool) throws {
         stop()
-        let description: CATapDescription
-        if let appPID {
-            guard let objectID = audioObjectID(for: appPID) else {
-                throw CaptureError.noProcess(appName ?? "That app")
+        running = true
+        openedOutputUID = AudioHAL.defaultOutput().flatMap(AudioHAL.uid)
+        openedInputUID = AudioHAL.defaultInput().flatMap(AudioHAL.uid)
+        if let output = AudioHAL.defaultOutput(), let input = AudioHAL.defaultInput(), output == input {
+            CaptureLog.write("default input and output are the same device; mic IOProc and the tap clock share it")
+        }
+        if let output = AudioHAL.defaultOutput() {
+            CaptureLog.write("default output \(AudioHAL.describe(output)) display=\(AudioHAL.isDisplayOutput(output))")
+        } else {
+            CaptureLog.write("default output missing")
+        }
+        if let input = AudioHAL.defaultInput() {
+            CaptureLog.write("default input \(AudioHAL.describe(input))")
+        } else {
+            CaptureLog.write("default input missing")
+        }
+
+        var problems: [String] = []
+        if mic {
+            do {
+                try startMicrophone()
+            } catch {
+                problems.append("Microphone: \(error.localizedDescription)")
+                CaptureLog.write("mic failed: \(error.localizedDescription)")
             }
+        }
+        do {
+            try startSystem(appPID: appPID, appName: appName)
+        } catch {
+            problems.append("System audio: \(error.localizedDescription)")
+            CaptureLog.write("system tap failed: \(error.localizedDescription)")
+            teardownSystem()
+        }
+        if micProc == nil && procID == nil {
+            running = false
+            throw CaptureError.io(problems.joined(separator: " "))
+        }
+        if !problems.isEmpty {
+            let message = problems.joined(separator: " ")
+            DispatchQueue.main.async { [weak self] in self?.onWarning?(message) }
+        }
+        CaptureLog.write("capture running mic=\(micProc != nil) system=\(procID != nil)")
+    }
+
+    func stop() {
+        running = false
+        levelLock.lock()
+        heard = [:]
+        peaks = [:]
+        reported = []
+        loggedFirst = []
+        firstPeak = [:]
+        firstSeconds = [:]
+        systemMeter = StreamMeter()
+        micMeter = StreamMeter()
+        levelLock.unlock()
+        teardownMicrophone()
+        teardownSystem()
+        systemDB = -120
+        micDB = -120
+        loggedSystemLayout = false
+    }
+
+    /// Restart when the default input or output actually changes. Creating the
+    /// private aggregate must not count: headphones unplugging changes the
+    /// default output UID, and that does.
+    func watchDevices() {
+        guard !watchingDevices else { return }
+        watchingDevices = true
+        observe(kAudioHardwarePropertyDefaultOutputDevice)
+        observe(kAudioHardwarePropertyDefaultInputDevice)
+    }
+
+    func takeMeters() -> (system: StreamMeter, mic: StreamMeter) {
+        levelLock.lock()
+        let snapshot = (systemMeter, micMeter)
+        systemMeter = StreamMeter()
+        micMeter = StreamMeter()
+        levelLock.unlock()
+        return snapshot
+    }
+
+    deinit { stop() }
+
+    private func observe(_ selector: AudioObjectPropertySelector) {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        AudioObjectAddPropertyListenerBlock(systemObject, &address, DispatchQueue.main) { [weak self] _, _ in
+            guard let self, self.running else { return }
+            let output = AudioHAL.defaultOutput().flatMap(AudioHAL.uid)
+            let input = AudioHAL.defaultInput().flatMap(AudioHAL.uid)
+            let outputChanged = self.openedOutputUID != nil && output != self.openedOutputUID
+            let inputChanged = self.openedInputUID != nil && input != self.openedInputUID
+            guard outputChanged || inputChanged else { return }
+            CaptureLog.write("default device changed output \(self.openedOutputUID ?? "-") -> \(output ?? "-") input \(self.openedInputUID ?? "-") -> \(input ?? "-")")
+            self.onDeviceChange?()
+        }
+    }
+
+    private func startSystem(appPID: pid_t?, appName: String?) throws {
+        if let appPID, audioObjectID(for: appPID) == nil {
+            throw CaptureError.noProcess(appName ?? "That app")
+        }
+        let output = AudioHAL.defaultOutput()
+        let outputUID = output.flatMap(AudioHAL.uid)
+        let display = output.map(AudioHAL.isDisplayOutput) ?? false
+        let (description, tap) = try createTap(appPID: appPID, appName: appName, outputUID: outputUID, display: display)
+        tapID = tap
+        let tapASBD = try tapFormat(tap)
+        CaptureLog.write("tap format \(AudioHAL.describe(tapASBD))")
+        guard tapASBD.mSampleRate > 0, tapASBD.mChannelsPerFrame > 0 else { throw CaptureError.format }
+        tapChannels = Int(tapASBD.mChannelsPerFrame)
+        format = tapASBD
+
+        try createAggregate(tapUUID: description.uuid.uuidString, clockUID: outputUID)
+        if let aggregateFormat = AudioHAL.streamFormat(aggregateID, scope: kAudioDevicePropertyScopeInput) {
+            CaptureLog.write("aggregate input format \(AudioHAL.describe(aggregateFormat))")
+            format = aggregateFormat
+            let aggregateChannels = Int(aggregateFormat.mChannelsPerFrame)
+            dropChannels = aggregateChannels > tapChannels ? aggregateChannels - tapChannels : 0
+        }
+        CaptureLog.write("reading tap channels=\(tapChannels) dropping leading channels=\(dropChannels)")
+        try installProc()
+        let startStatus = AudioDeviceStart(aggregateID, procID)
+        guard startStatus == noErr else {
+            throw CaptureError.io("AudioDeviceStart \(statusText(startStatus))")
+        }
+        CaptureLog.write("system tap started \(statusText(startStatus))")
+        if let after = AudioHAL.streamFormat(aggregateID, scope: kAudioDevicePropertyScopeInput) {
+            format = after
+            let aggregateChannels = Int(after.mChannelsPerFrame)
+            dropChannels = aggregateChannels > tapChannels ? aggregateChannels - tapChannels : 0
+            CaptureLog.write("aggregate input format after start \(AudioHAL.describe(after)) drop=\(dropChannels)")
+        }
+    }
+
+    private func createTap(appPID: pid_t?, appName: String?, outputUID: String?, display: Bool) throws -> (CATapDescription, AudioObjectID) {
+        // An app tap stays a process mixdown. A display output with no chosen
+        // app is tapped on that device, because a global stereo tap returns
+        // zeros for some HDMI and DisplayPort monitors.
+        if appPID == nil, display, let outputUID {
+            let description = CATapDescription(processes: [AudioObjectID](), deviceUID: outputUID, stream: 0)
+            description.name = "listn"
+            description.isPrivate = true
+            description.isExclusive = true
+            description.muteBehavior = .unmuted
+            var tap = noObject
+            let status = AudioHardwareCreateProcessTap(description, &tap)
+            CaptureLog.write("display-output device tap \(statusText(status)) uid=\(outputUID)")
+            if status == noErr, tap != noObject {
+                return (description, tap)
+            }
+            CaptureLog.write("device tap failed; falling back to a global stereo tap")
+        }
+        let description = globalTap(appPID: appPID, appName: appName)
+        var tap = noObject
+        let status = AudioHardwareCreateProcessTap(description, &tap)
+        CaptureLog.write("global tap \(statusText(status))")
+        guard status == noErr, tap != noObject else {
+            throw CaptureError.tap(statusText(status))
+        }
+        return (description, tap)
+    }
+
+    private func globalTap(appPID: pid_t?, appName: String?) -> CATapDescription {
+        _ = appName
+        let description: CATapDescription
+        if let appPID, let objectID = audioObjectID(for: appPID) {
             description = CATapDescription(stereoMixdownOfProcesses: [objectID])
         } else {
             var excluded: [AudioObjectID] = []
@@ -135,93 +325,39 @@ final class CaptureEngine {
         description.name = "listn"
         description.isPrivate = true
         description.isExclusive = false
-        // .unmuted keeps the meeting audible. .mutedWhenTapped would silence it.
         description.muteBehavior = .unmuted
+        return description
+    }
 
-        var newTap = noObject
-        let tapStatus = AudioHardwareCreateProcessTap(description, &newTap)
-        guard tapStatus == noErr, newTap != noObject else {
-            throw CaptureError.tap(statusText(tapStatus))
-        }
-        tapID = newTap
-
-        do {
-            try createAggregate(tapUUID: description.uuid.uuidString)
-            try installProc()
-            running = true
-            let startStatus = AudioDeviceStart(aggregateID, procID)
-            guard startStatus == noErr else {
-                throw CaptureError.io("AudioDeviceStart \(statusText(startStatus))")
+    private func createAggregate(tapUUID: String, clockUID: String?) throws {
+        if let clockUID {
+            let status = installAggregate(tapUUID: tapUUID, clockUID: clockUID)
+            if status == noErr {
+                CaptureLog.write("aggregate clocked to \(clockUID) \(statusText(status)) id=\(aggregateID)")
+                return
             }
-            if mic {
-                do {
-                    try startMicrophone()
-                } catch {
-                    onWarning?("Microphone not captured: \(error.localizedDescription). System audio is still recording.")
-                }
+            CaptureLog.write("clocked aggregate failed \(statusText(status)); retrying tap-only")
+            if aggregateID != noObject {
+                AudioHardwareDestroyAggregateDevice(aggregateID)
+                aggregateID = noObject
             }
-        } catch {
-            stop()
-            throw error
         }
+        let status = installAggregate(tapUUID: tapUUID, clockUID: nil)
+        guard status == noErr, aggregateID != noObject else {
+            throw CaptureError.aggregate(statusText(status))
+        }
+        CaptureLog.write("aggregate tap-only \(statusText(status)) id=\(aggregateID)")
     }
 
-    func stop() {
-        running = false
-        levelLock.lock()
-        heard = [:]
-        peaks = [:]
-        reported = []
-        levelLock.unlock()
-        if let micEngine {
-            micEngine.inputNode.removeTap(onBus: 0)
-            micEngine.stop()
-            self.micEngine = nil
-        }
-        if let procID {
-            AudioDeviceStop(aggregateID, procID)
-            AudioDeviceDestroyIOProcID(aggregateID, procID)
-            self.procID = nil
-        }
-        if aggregateID != noObject {
-            AudioHardwareDestroyAggregateDevice(aggregateID)
-            aggregateID = noObject
-        }
-        if tapID != noObject {
-            AudioHardwareDestroyProcessTap(tapID)
-            tapID = noObject
-        }
-        systemDB = -120
-        micDB = -120
-    }
-
-    /// Restart the tap if the default device list changes while a recording is up.
-    /// Core Audio delivers this on the main queue. The menu bar owns the restart.
-    func watchDevices() {
-        guard !watchingDevices else { return }
-        watchingDevices = true
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDevices,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        AudioObjectAddPropertyListenerBlock(systemObject, &address, DispatchQueue.main) { [weak self] _, _ in
-            guard let self, self.running else { return }
-            self.onDeviceChange?()
-        }
-    }
-
-    deinit { stop() }
-
-    private func createAggregate(tapUUID: String) throws {
-        // Tap auto-start is off. When it is on, AudioDeviceStart blocks until
-        // some tapped app produces sound, which looks like a hung menu.
-        let description: [String: Any] = [
+    private func installAggregate(tapUUID: String, clockUID: String?) -> OSStatus {
+        var description: [String: Any] = [
             kAudioAggregateDeviceNameKey: "listn",
             kAudioAggregateDeviceUIDKey: UUID().uuidString,
             kAudioAggregateDeviceIsPrivateKey: NSNumber(value: 1),
             kAudioAggregateDeviceIsStackedKey: NSNumber(value: 0),
+            // Off: when it is on, AudioDeviceStart waits until some app plays,
+            // which looks like a hung menu. The clock device keeps the IO proc running.
             kAudioAggregateDeviceTapAutoStartKey: NSNumber(value: 0),
-            kAudioAggregateDeviceSubDeviceListKey: [] as [[String: Any]],
             kAudioAggregateDeviceTapListKey: [
                 [
                     kAudioSubTapUIDKey: tapUUID,
@@ -229,22 +365,32 @@ final class CaptureEngine {
                 ],
             ],
         ]
+        if let clockUID {
+            description[kAudioAggregateDeviceMainSubDeviceKey] = clockUID
+            description[kAudioAggregateDeviceClockDeviceKey] = clockUID
+            description[kAudioAggregateDeviceSubDeviceListKey] = [
+                [
+                    kAudioSubDeviceUIDKey: clockUID,
+                    // The clock itself is not drift-compensated.
+                    kAudioSubDeviceDriftCompensationKey: NSNumber(value: 0),
+                ],
+            ]
+        } else {
+            description[kAudioAggregateDeviceSubDeviceListKey] = [] as [[String: Any]]
+        }
         var aggregate = noObject
         let status = AudioHardwareCreateAggregateDevice(description as CFDictionary, &aggregate)
-        guard status == noErr, aggregate != noObject else {
-            throw CaptureError.aggregate(statusText(status))
+        if status == noErr, aggregate != noObject {
+            aggregateID = aggregate
         }
-        aggregateID = aggregate
-        format = try tapFormat(tapID)
-        guard format.mSampleRate > 0, format.mChannelsPerFrame > 0 else {
-            throw CaptureError.format
-        }
+        return status
     }
 
     private func installProc() throws {
+        let capturedFormat = format
         var proc: AudioDeviceIOProcID?
         let status = AudioDeviceCreateIOProcIDWithBlock(&proc, aggregateID, nil) { [weak self] _, inputData, _, _, _ in
-            self?.consumeSystem(inputData)
+            self?.consumeSystem(inputData, format: capturedFormat)
         }
         guard status == noErr, let proc else {
             throw CaptureError.io("AudioDeviceCreateIOProcID \(statusText(status))")
@@ -253,68 +399,78 @@ final class CaptureEngine {
     }
 
     private func startMicrophone() throws {
-        let status = AVCaptureDevice.authorizationStatus(for: .audio)
-        if status == .notDetermined {
-            let semaphore = DispatchSemaphore(value: 0)
-            let granted = Locked(false)
-            AVCaptureDevice.requestAccess(for: .audio) { ok in
-                granted.value = ok
-                semaphore.signal()
-            }
-            semaphore.wait()
-            if !granted.value {
-                throw CaptureError.io("microphone permission denied")
-            }
-        } else if status == .denied || status == .restricted {
-            throw CaptureError.io("microphone permission denied. Allow listn under System Settings → Privacy & Security → Microphone")
+        guard let device = AudioHAL.defaultInput() else {
+            throw CaptureError.io("no default input device")
         }
-
-        let engine = AVAudioEngine()
-        let input = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
+        guard let deviceFormat = AudioHAL.streamFormat(device, scope: kAudioDevicePropertyScopeInput) else {
             throw CaptureError.format
         }
-        input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
-            self?.consumeMicrophone(buffer)
+        guard deviceFormat.mSampleRate > 0, deviceFormat.mChannelsPerFrame > 0 else {
+            throw CaptureError.format
         }
-        engine.prepare()
-        try engine.start()
-        micEngine = engine
+        micDevice = device
+        micFormat = deviceFormat
+        CaptureLog.write("mic IOProc \(AudioHAL.describe(device)) format \(AudioHAL.describe(deviceFormat))")
+        let captured = deviceFormat
+        var proc: AudioDeviceIOProcID?
+        let created = AudioDeviceCreateIOProcIDWithBlock(&proc, device, nil) { [weak self] _, inputData, _, _, _ in
+            self?.consumeMicrophone(inputData, format: captured)
+        }
+        guard created == noErr, let proc else {
+            micDevice = noObject
+            throw CaptureError.io("mic IOProc \(statusText(created))")
+        }
+        micProc = proc
+        let started = AudioDeviceStart(device, proc)
+        guard started == noErr else {
+            AudioDeviceDestroyIOProcID(device, proc)
+            micProc = nil
+            micDevice = noObject
+            throw CaptureError.io("mic AudioDeviceStart \(statusText(started))")
+        }
+        microphoneOpen = true
+        CaptureLog.write("mic started \(statusText(started))")
     }
 
-    private func consumeSystem(_ list: UnsafePointer<AudioBufferList>) {
+    private func consumeSystem(_ list: UnsafePointer<AudioBufferList>, format captured: AudioStreamBasicDescription) {
         guard running else { return }
-        let channels = Int(format.mChannelsPerFrame)
-        guard channels > 0 else { return }
-        let flags = format.mFormatFlags
-        guard flags & AudioFormatFlags(kAudioFormatFlagIsFloat) != 0 else { return }
-        let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: list))
-        guard !buffers.isEmpty else { return }
-        let nonInterleaved = flags & AudioFormatFlags(kAudioFormatFlagIsNonInterleaved) != 0
-        let samples: [Float]
-        if nonInterleaved || buffers.count >= channels {
-            let frames = Int(buffers[0].mDataByteSize) / MemoryLayout<Float>.size
-            guard frames > 0 else { return }
-            var interleaved = [Float](repeating: 0, count: frames * channels)
-            for channel in 0..<min(channels, buffers.count) {
-                guard let data = buffers[channel].mData else { continue }
-                let source = data.assumingMemoryBound(to: Float.self)
-                let count = min(frames, Int(buffers[channel].mDataByteSize) / MemoryLayout<Float>.size)
-                for index in 0..<count {
-                    interleaved[index * channels + channel] = source[index]
-                }
-            }
-            samples = interleaved
-        } else {
-            guard let data = buffers[0].mData else { return }
-            let count = Int(buffers[0].mDataByteSize) / MemoryLayout<Float>.size
-            guard count > 0 else { return }
-            samples = Array(UnsafeBufferPointer(start: data.assumingMemoryBound(to: Float.self), count: count))
+        let active = format.mSampleRate > 0 ? format : captured
+        // The tap is appended after the clock device's input buffers. On an
+        // HDMI output those leading buffers are often absent; when they exist
+        // they are silence and must not be what we record.
+        var drop = dropChannels
+        let listed = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: list))
+        let nonInterleaved = active.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
+        if nonInterleaved {
+            drop = listed.count > tapChannels ? listed.count - tapChannels : 0
         }
-        noteLevel(track: 0, samples)
-        watchSilence(track: 0, samples, seconds: Double(samples.count / channels) / format.mSampleRate)
-        onPCM?(0, format.mSampleRate, channels, samples)
+        if !loggedSystemLayout {
+            loggedSystemLayout = true
+            let report = AudioHAL.bufferReport(list)
+            let take = tapChannels
+            let dropped = drop
+            DispatchQueue.global(qos: .utility).async {
+                CaptureLog.write("system first buffers drop=\(dropped) take=\(take) \(report)")
+            }
+        }
+        let samples = AudioHAL.readFloat(list, format: active, dropChannels: drop, takeChannels: tapChannels)
+        deliver(track: 0, samples: samples, rate: active.mSampleRate, channels: max(1, tapChannels))
+    }
+
+    private func consumeMicrophone(_ list: UnsafePointer<AudioBufferList>, format: AudioStreamBasicDescription) {
+        guard running else { return }
+        let channels = max(1, Int(format.mChannelsPerFrame))
+        let samples = AudioHAL.readFloat(list, format: format, dropChannels: 0, takeChannels: channels)
+        deliver(track: 1, samples: samples, rate: format.mSampleRate, channels: channels)
+    }
+
+    private func deliver(track: Int, samples: [Float], rate: Double, channels: Int) {
+        guard !samples.isEmpty, rate > 0 else { return }
+        noteLevel(track: track, samples)
+        let seconds = Double(samples.count / max(1, channels)) / rate
+        watchSilence(track: track, samples, seconds: seconds)
+        noteFirstSecond(track: track, samples: samples, seconds: seconds)
+        onPCM?(UInt8(track), rate, channels, samples)
     }
 
     private func watchSilence(track: Int, _ samples: [Float], seconds: Double) {
@@ -332,39 +488,80 @@ final class CaptureEngine {
         peaks[track] = max(peaks[track] ?? 0, peak)
         let due = heard[track, default: 0] >= silenceWindow && (peaks[track] ?? 0) <= 1e-5
         if due { reported.insert(track) }
+        let heardSeconds = heard[track] ?? 0
+        let peakNow = peaks[track] ?? 0
         levelLock.unlock()
         guard due else { return }
-        if track == 0 && !outputIsPlaying() { return }
+        let name = track == 0 ? "system" : "mic"
+        DispatchQueue.global(qos: .utility).async {
+            CaptureLog.write(String(format: "watchdog %@ peak=%.6g heard=%.2fs", name, peakNow, heardSeconds))
+        }
         onSilent?(track == 0 ? .audioCapture : .microphone)
     }
 
-    private func consumeMicrophone(_ buffer: AVAudioPCMBuffer) {
-        guard running, let channels = buffer.floatChannelData else { return }
-        let frameCount = Int(buffer.frameLength)
-        let channelCount = Int(buffer.format.channelCount)
-        guard frameCount > 0, channelCount > 0 else { return }
-        var interleaved = [Float](repeating: 0, count: frameCount * channelCount)
-        for channel in 0..<channelCount {
-            let source = channels[channel]
-            for index in 0..<frameCount {
-                interleaved[index * channelCount + channel] = source[index]
-            }
+    private func noteFirstSecond(track: Int, samples: [Float], seconds: Double) {
+        var peak: Float = 0
+        for sample in samples {
+            peak = max(peak, abs(sample))
         }
-        noteLevel(track: 1, interleaved)
-        watchSilence(track: 1, interleaved, seconds: Double(frameCount) / buffer.format.sampleRate)
-        onPCM?(1, buffer.format.sampleRate, channelCount, interleaved)
+        levelLock.lock()
+        firstPeak[track] = max(firstPeak[track] ?? 0, peak)
+        firstSeconds[track, default: 0] += seconds
+        let ready = (firstSeconds[track] ?? 0) >= 1 && !loggedFirst.contains(track)
+        if ready { loggedFirst.insert(track) }
+        let peakNow = firstPeak[track] ?? 0
+        let secs = firstSeconds[track] ?? 0
+        levelLock.unlock()
+        guard ready else { return }
+        let name = track == 0 ? "system" : "mic"
+        DispatchQueue.global(qos: .utility).async {
+            CaptureLog.write(String(format: "first second %@ peak=%.6g after %.2fs", name, peakNow, secs))
+        }
     }
 
     private func noteLevel(track: Int, _ samples: [Float]) {
         let db = rmsDB(samples)
         levelLock.lock()
-        if track == 0 { systemDB = db } else { micDB = db }
+        if track == 0 {
+            systemDB = db
+            systemMeter.add(samples)
+        } else {
+            micDB = db
+            micMeter.add(samples)
+        }
         let system = systemDB
         let mic = micDB
         let due = Date().timeIntervalSince(lastLevel) >= 0.1
         if due { lastLevel = Date() }
+        let micLevel: Float? = microphoneOpen ? mic : nil
         levelLock.unlock()
-        if due { onLevels?(system, mic) }
+        if due { onLevels?(system, micLevel) }
+    }
+
+    private func teardownMicrophone() {
+        if let micProc {
+            AudioDeviceStop(micDevice, micProc)
+            AudioDeviceDestroyIOProcID(micDevice, micProc)
+            self.micProc = nil
+        }
+        micDevice = noObject
+        microphoneOpen = false
+    }
+
+    private func teardownSystem() {
+        if let procID {
+            AudioDeviceStop(aggregateID, procID)
+            AudioDeviceDestroyIOProcID(aggregateID, procID)
+            self.procID = nil
+        }
+        if aggregateID != noObject {
+            AudioHardwareDestroyAggregateDevice(aggregateID)
+            aggregateID = noObject
+        }
+        if tapID != noObject {
+            AudioHardwareDestroyProcessTap(tapID)
+            tapID = noObject
+        }
     }
 }
 
@@ -375,21 +572,6 @@ private func rmsDB(_ samples: [Float]) -> Float {
     let mean = sum / Float(samples.count)
     if mean < 1e-12 { return -120 }
     return 20 * log10(sqrt(mean))
-}
-
-private func statusText(_ status: OSStatus) -> String {
-    let code = UInt32(bitPattern: status)
-    let bytes = [
-        UInt8((code >> 24) & 0xff),
-        UInt8((code >> 16) & 0xff),
-        UInt8((code >> 8) & 0xff),
-        UInt8(code & 0xff),
-    ]
-    if bytes.allSatisfy({ $0 >= 32 && $0 < 127 }) {
-        let text = String(bytes: bytes, encoding: .ascii) ?? ""
-        return "'\(text)' (\(status))"
-    }
-    return "OSStatus \(status)"
 }
 
 private func tapFormat(_ tap: AudioObjectID) throws -> AudioStreamBasicDescription {
@@ -415,30 +597,4 @@ private func audioObjectIDs(_ object: AudioObjectID, _ selector: AudioObjectProp
     var ids = [AudioObjectID](repeating: 0, count: count)
     guard AudioObjectGetPropertyData(object, &address, 0, nil, &size, &ids) == noErr else { return [] }
     return ids
-}
-
-/// True when the default output device is running for some process, i.e.
-/// something is playing. Then a tap that hears only zeros is being withheld.
-func outputIsPlaying() -> Bool {
-    var address = AudioObjectPropertyAddress(
-        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain)
-    var device = noObject
-    var size = UInt32(MemoryLayout<AudioObjectID>.size)
-    guard AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, &device) == noErr, device != noObject else {
-        return false
-    }
-    return (readUInt32(device, kAudioDevicePropertyDeviceIsRunningSomewhere) ?? 0) != 0
-}
-
-private func readUInt32(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> UInt32? {
-    var address = AudioObjectPropertyAddress(
-        mSelector: selector,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain)
-    var value: UInt32 = 0
-    var size = UInt32(MemoryLayout<UInt32>.size)
-    guard AudioObjectGetPropertyData(object, &address, 0, nil, &size, &value) == noErr else { return nil }
-    return value
 }

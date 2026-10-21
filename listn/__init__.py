@@ -2,6 +2,6 @@
 
 from listn.config import disable_network_telemetry
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 disable_network_telemetry()
