@@ -28,6 +28,46 @@ enum AudioHAL {
         defaultDevice(kAudioHardwarePropertyDefaultOutputDevice)
     }
 
+    static func devices() -> [AudioObjectID] {
+        audioObjectIDs(systemObject, kAudioHardwarePropertyDevices)
+    }
+
+    static func isBluetooth(_ device: AudioObjectID) -> Bool {
+        let kind = transport(device)
+        return kind == "Bluetooth" || kind == "Bluetooth LE"
+    }
+
+    /// The Mac's own microphone, whatever the system default input is.
+    static func builtInInput() -> AudioObjectID? {
+        let inputs = devices().filter { device in
+            channelCount(device, scope: kAudioDevicePropertyScopeInput) > 0 && transport(device) == "built-in"
+        }
+        let named = inputs.first { device in
+            (name(device) ?? "").localizedCaseInsensitiveContains("microphone")
+        }
+        return named ?? inputs.first
+    }
+
+    static func stringProperty(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String? {
+        string(object, selector)
+    }
+
+    static func tapFormat(_ tap: AudioObjectID) -> AudioStreamBasicDescription? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioTapPropertyFormat,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var format = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        guard AudioObjectGetPropertyData(tap, &address, 0, nil, &size, &format) == noErr else { return nil }
+        return format
+    }
+
+    /// kAudioDevicePropertyDeviceIsRunningSomewhere: some process is doing IO on it.
+    static func isRunningSomewhere(_ device: AudioObjectID) -> Bool? {
+        readUInt32(device, kAudioDevicePropertyDeviceIsRunningSomewhere).map { $0 != 0 }
+    }
+
     static func uid(_ device: AudioObjectID) -> String? {
         string(device, kAudioDevicePropertyDeviceUID)
     }
@@ -201,6 +241,19 @@ func readUInt32(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector
     var size = UInt32(MemoryLayout<UInt32>.size)
     guard AudioObjectGetPropertyData(object, &address, 0, nil, &size, &value) == noErr else { return nil }
     return value
+}
+
+func audioObjectIDs(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> [AudioObjectID] {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(object, &address, 0, nil, &size) == noErr, size > 0 else { return [] }
+    let count = Int(size) / MemoryLayout<AudioObjectID>.size
+    var ids = [AudioObjectID](repeating: 0, count: count)
+    guard AudioObjectGetPropertyData(object, &address, 0, nil, &size, &ids) == noErr else { return [] }
+    return Array(ids.prefix(Int(size) / MemoryLayout<AudioObjectID>.size))
 }
 
 func statusText(_ status: OSStatus) -> String {
