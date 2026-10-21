@@ -1,6 +1,11 @@
 import CoreAudio
 import Foundation
 
+/// The SDK imports these as different integer types across versions. One
+/// internal value so every file compares them the same way.
+let systemObject = AudioObjectID(kAudioObjectSystemObject)
+let noObject = AudioObjectID(kAudioObjectUnknown)
+
 /// Core Audio device queries shared by capture and the self-test.
 enum AudioHAL {
     static func defaultDevice(_ selector: AudioObjectPropertySelector) -> AudioObjectID? {

@@ -32,14 +32,17 @@ final class SelfTestDelegate: NSObject, NSApplicationDelegate {
     init(seconds: Double) { self.seconds = seconds }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Copy the property out before the closures. A capture list of
+        // `[seconds]` is a use of `self` and Swift 5 rejects it.
+        let duration = self.seconds
         CaptureLog.beginSelfTest()
         CaptureLog.write("selftest process pid=\(ProcessInfo.processInfo.processIdentifier)")
         Permissions.requestMicrophone { granted in
             CaptureLog.write("AVCaptureDevice microphone granted=\(granted) status=\(String(describing: Permissions.microphone()))")
             Permissions.requestSystemAudio { systemGranted in
                 CaptureLog.write("TCC system audio granted=\(systemGranted) status=\(String(describing: Permissions.systemAudio()))")
-                DispatchQueue.global(qos: .userInitiated).async { [seconds] in
-                    let code = CaptureSelfTest.run(seconds: seconds)
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let code = CaptureSelfTest.run(seconds: duration)
                     DispatchQueue.main.async {
                         exit(code)
                     }

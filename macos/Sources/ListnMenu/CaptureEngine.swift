@@ -11,9 +11,6 @@ import Foundation
 // It does not use AVAudioEngine and it does not share the tap aggregate, so
 // a silent tap cannot zero the mic (or the other way around).
 
-private let systemObject = AudioObjectID(kAudioObjectSystemObject)
-private let noObject = AudioObjectID(kAudioObjectUnknown)
-
 struct AudioApp {
     var objectID: AudioObjectID
     var pid: pid_t
