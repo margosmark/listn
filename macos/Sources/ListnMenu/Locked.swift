@@ -21,4 +21,10 @@ final class Locked<Value>: @unchecked Sendable {
             lock.unlock()
         }
     }
+
+    func withValue<T>(_ body: (inout Value) -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(&stored)
+    }
 }

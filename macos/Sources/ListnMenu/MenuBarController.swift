@@ -41,6 +41,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let pauseItem = NSMenuItem(title: "Pause", action: #selector(togglePause), keyEquivalent: "")
     private let sourceItem = NSMenuItem(title: "Source: All system audio", action: nil, keyEquivalent: "")
     private let micItem = NSMenuItem(title: "Microphone", action: #selector(toggleMic), keyEquivalent: "")
+    private let headsetItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let builtInMicItem = NSMenuItem(title: "Use built-in microphone", action: #selector(toggleBuiltInMic), keyEquivalent: "")
     private let levelItem = NSMenuItem(title: "Level  ▯▯▯▯▯▯▯▯", action: nil, keyEquivalent: "")
     private let transcriptHeader = NSMenuItem(title: "Latest transcript", action: nil, keyEquivalent: "")
     private var lineItems: [NSMenuItem] = []
@@ -90,9 +92,13 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         statusItem.button?.image = image
         statusItem.button?.toolTip = "listn"
 
-        for item in [startItem, pauseItem, micItem, libraryItem, meetingItem, bookmarkItem, captionsItem, loginItem, quitItem, privacyItem, silenceItem] {
+        for item in [startItem, pauseItem, micItem, builtInMicItem, libraryItem, meetingItem, bookmarkItem, captionsItem, loginItem, quitItem, privacyItem, silenceItem] {
             item.target = self
         }
+        headsetItem.isEnabled = false
+        headsetItem.isHidden = true
+        builtInMicItem.isHidden = true
+        builtInMicItem.toolTip = "Record the Mac's microphone and leave the headset in high-quality playback. The system input setting is not changed."
         silenceItem.isHidden = true
         privacyItem.isHidden = true
         meetingItem.isHidden = true
@@ -118,6 +124,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(pauseItem)
         menu.addItem(sourceItem)
         menu.addItem(micItem)
+        menu.addItem(headsetItem)
+        menu.addItem(builtInMicItem)
         menu.addItem(levelItem)
         menu.addItem(.separator())
         menu.addItem(transcriptHeader)
@@ -173,6 +181,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         if menu === self.menu {
             rebuildSourceMenu()
             refreshPrefs()
+            refreshMicRoute()
         }
     }
 
@@ -240,14 +249,16 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     /// The level line is what shows up in the menu while a recording is silent.
     /// The capture callback also signals silence; this path does not depend on
     /// it, because that signal was not reaching the menu.
-    private func observeSilence(system: Float, mic: Float?) {
+    private func observeSilence(system: Float, mic: Float?, playing: [String]?) {
         let now = Date()
         func due(_ since: inout Date?, silent: Bool) -> Bool {
             if !silent { since = nil; return false }
             if since == nil { since = now }
             return now.timeIntervalSince(since ?? now) >= 2.5
         }
-        let systemDue = due(&systemSilentSince, silent: system <= -119)
+        // Zeros from the system tap only mean something while an app plays.
+        let somethingPlaying = playing.map { !$0.isEmpty } ?? true
+        let systemDue = due(&systemSilentSince, silent: system <= -119 && somethingPlaying)
         let micDue: Bool
         if let mic {
             micDue = due(&micSilentSince, silent: mic <= -119)
@@ -266,8 +277,42 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         var parts: [String] = []
         if micDue { parts.append("the microphone") }
         if systemDue { parts.append("system audio") }
-        let message = "listn is recording, but \(parts.joined(separator: " and ")) returned silence (every sample is zero). See ~/Library/Application Support/listn/capture.log. Open Privacy Settings if access was reset."
+        var during = ""
+        if systemDue, let playing, !playing.isEmpty {
+            during = " while \(playing.prefix(3).joined(separator: ", ")) played"
+        }
+        let message = "listn is recording, but \(parts.joined(separator: " and ")) returned silence\(during) (every sample is zero). See ~/Library/Application Support/listn/capture.log. Open Privacy Settings if access was reset."
         showPrivacy(micDue ? .microphone : .audioCapture, message: message)
+    }
+
+    /// A Bluetooth headset switches to call mode (mono, 16 kHz, for playback
+    /// too) while its microphone is open. Say so, and offer the Mac's mic.
+    private func refreshMicRoute() {
+        let useBuiltIn = UserDefaults.standard.bool(forKey: Prefs.useBuiltInMic)
+        let input = AudioHAL.defaultInput()
+        let headset = input.map(AudioHAL.isBluetooth) ?? false
+        let builtIn = AudioHAL.builtInInput()
+        let micUsed = micOn && !isLegacy
+        builtInMicItem.state = useBuiltIn ? .on : .off
+        builtInMicItem.isHidden = builtIn == nil || (!headset && !useBuiltIn)
+        builtInMicItem.isEnabled = micUsed
+        if headset && micUsed && (!useBuiltIn || builtIn == nil) {
+            let name = input.flatMap(AudioHAL.name) ?? "the headset"
+            headsetItem.title = "⚠︎ Using its mic puts \(name) in low-quality call mode"
+            headsetItem.isHidden = false
+        } else {
+            headsetItem.isHidden = true
+        }
+    }
+
+    @objc private func toggleBuiltInMic(_ sender: Any?) {
+        let next = !UserDefaults.standard.bool(forKey: Prefs.useBuiltInMic)
+        UserDefaults.standard.set(next, forKey: Prefs.useBuiltInMic)
+        CaptureLog.write("use built-in microphone \(next ? "on" : "off")")
+        refresh()
+        if phase == .recording && micOn && !isLegacy {
+            restartTap(reason: next ? "Switched to the built-in microphone." : "Switched to the default microphone.")
+        }
     }
 
     private func showPrivacy(_ pane: PrivacyPane, message: String? = nil) {
@@ -322,6 +367,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         guard phase == .idle, !isLegacy else { return }
         micOn.toggle()
         micItem.state = micOn ? .on : .off
+        refreshMicRoute()
     }
 
     @objc private func chooseSystem(_ sender: Any?) {
@@ -516,12 +562,16 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         capture.onPCM = { [weak self] track, rate, channels, samples in
             self?.ipc.sendAudio(track: track, rate: rate, channels: channels, samples: samples)
         }
-        capture.onLevels = { [weak self] system, mic in
+        capture.onLevels = { [weak self] report in
             DispatchQueue.main.async {
                 guard let self, self.localLevels else { return }
-                self.observeSilence(system: system, mic: mic)
-                var title = "Level  " + meter(max(system, mic ?? system))
-                if self.privacyPane != nil { title += "  — capture is silence" }
+                self.observeSilence(system: report.system, mic: report.mic, playing: report.playing)
+                var title = "Level  " + meter(max(report.system, report.mic ?? report.system))
+                if self.privacyPane != nil {
+                    title += "  — capture is silence"
+                } else if let playing = report.playing, playing.isEmpty, report.system <= -119 {
+                    title += "  — no app is playing"
+                }
                 self.levelItem.title = title
             }
         }
@@ -532,7 +582,16 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             }
         }
         capture.onSilent = { [weak self] pane in
-            DispatchQueue.main.async { self?.showPrivacy(pane) }
+            let playing = self?.capture.playingNames()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard pane == .audioCapture, let playing, !playing.isEmpty else {
+                    self.showPrivacy(pane)
+                    return
+                }
+                let names = playing.prefix(3).joined(separator: ", ")
+                self.showPrivacy(pane, message: "listn is recording, but system audio returned silence while \(names) played (every sample is zero). listn is trying other capture methods. See ~/Library/Application Support/listn/capture.log.")
+            }
         }
         capture.onDeviceChange = { [weak self] in
             self?.restartTap(reason: "The audio device changed. Restarting the tap.")
@@ -857,6 +916,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         micItem.state = micOn ? .on : .off
         micItem.isEnabled = phase == .idle && !isLegacy
         micItem.title = isLegacy ? "Microphone (use the legacy device)" : "Microphone"
+        refreshMicRoute()
         let busy = phase != .idle
         sourceItem.isEnabled = !busy
         if let errorText, !errorText.isEmpty {
