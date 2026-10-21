@@ -45,8 +45,11 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let transcriptHeader = NSMenuItem(title: "Latest transcript", action: nil, keyEquivalent: "")
     private var lineItems: [NSMenuItem] = []
     private let errorItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let silenceItem = NSMenuItem(title: "", action: #selector(openPrivacy), keyEquivalent: "")
     private let privacyItem = NSMenuItem(title: "Open Privacy Settings…", action: #selector(openPrivacy), keyEquivalent: "")
     private var privacyPane: PrivacyPane?
+    private var systemSilentSince: Date?
+    private var micSilentSince: Date?
     private let libraryItem = NSMenuItem(title: "Open library", action: #selector(openLibrary), keyEquivalent: "")
     private let meetingItem = NSMenuItem(title: "Record this meeting", action: #selector(recordOfferedMeeting), keyEquivalent: "")
     private let bookmarkItem = NSMenuItem(title: "Bookmark this moment", action: #selector(bookmarkMoment), keyEquivalent: "")
@@ -87,9 +90,11 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         statusItem.button?.image = image
         statusItem.button?.toolTip = "listn"
 
-        for item in [startItem, pauseItem, micItem, libraryItem, meetingItem, bookmarkItem, captionsItem, loginItem, quitItem, privacyItem] {
+        for item in [startItem, pauseItem, micItem, libraryItem, meetingItem, bookmarkItem, captionsItem, loginItem, quitItem, privacyItem, silenceItem] {
             item.target = self
         }
+        silenceItem.isHidden = true
+        privacyItem.isHidden = true
         meetingItem.isHidden = true
         bookmarkItem.keyEquivalent = "b"
         bookmarkItem.keyEquivalentModifierMask = [.control, .option]
@@ -107,6 +112,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
 
         menu.delegate = self
+        menu.addItem(silenceItem)
+        menu.addItem(privacyItem)
         menu.addItem(startItem)
         menu.addItem(pauseItem)
         menu.addItem(sourceItem)
@@ -117,7 +124,6 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         lineItems.forEach { menu.addItem($0) }
         menu.addItem(.separator())
         menu.addItem(errorItem)
-        menu.addItem(privacyItem)
         menu.addItem(meetingItem)
         menu.addItem(bookmarkItem)
         menu.addItem(captionsItem)
@@ -179,6 +185,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         phase = .starting
         errorText = nil
         privacyPane = nil
+        systemSilentSince = nil
+        micSilentSince = nil
+        statusItem.button?.title = ""
         lines = []
         calendarApplied = pendingCalendar != nil
         refresh()
@@ -228,9 +237,47 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
     }
 
+    /// The level line is what shows up in the menu while a recording is silent.
+    /// The capture callback also signals silence; this path does not depend on
+    /// it, because that signal was not reaching the menu.
+    private func observeSilence(system: Float, mic: Float?) {
+        let now = Date()
+        func due(_ since: inout Date?, silent: Bool) -> Bool {
+            if !silent { since = nil; return false }
+            if since == nil { since = now }
+            return now.timeIntervalSince(since ?? now) >= 2.5
+        }
+        let systemDue = due(&systemSilentSince, silent: system <= -119)
+        let micDue: Bool
+        if let mic {
+            micDue = due(&micSilentSince, silent: mic <= -119)
+        } else {
+            micSilentSince = nil
+            micDue = false
+        }
+        guard systemDue || micDue else {
+            if privacyPane != nil, errorText?.contains("returned silence") == true {
+                privacyPane = nil
+                errorText = nil
+                refresh()
+            }
+            return
+        }
+        var parts: [String] = []
+        if micDue { parts.append("the microphone") }
+        if systemDue { parts.append("system audio") }
+        let message = "listn is recording, but \(parts.joined(separator: " and ")) returned silence (every sample is zero). See ~/Library/Application Support/listn/capture.log. Open Privacy Settings if access was reset."
+        showPrivacy(micDue ? .microphone : .audioCapture, message: message)
+    }
+
     private func showPrivacy(_ pane: PrivacyPane, message: String? = nil) {
+        let text = message ?? pane.message
+        if privacyPane == pane, errorText == text { return }
         privacyPane = pane
-        errorText = message ?? pane.message
+        errorText = text
+        silenceItem.title = String(text.prefix(300))
+        statusItem.button?.title = " No audio"
+        CaptureLog.write("warning shown: \(text)")
         refresh()
     }
 
@@ -472,7 +519,10 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         capture.onLevels = { [weak self] system, mic in
             DispatchQueue.main.async {
                 guard let self, self.localLevels else { return }
-                self.levelItem.title = "Level  " + meter(max(system, mic))
+                self.observeSilence(system: system, mic: mic)
+                var title = "Level  " + meter(max(system, mic ?? system))
+                if self.privacyPane != nil { title += "  — capture is silence" }
+                self.levelItem.title = title
             }
         }
         capture.onWarning = { [weak self] message in
@@ -815,6 +865,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         } else {
             errorItem.isHidden = true
         }
+        silenceItem.isHidden = privacyPane == nil
         privacyItem.isHidden = privacyPane == nil
         libraryItem.title = engineWarmup ? "Starting…" : "Open library"
         libraryItem.isEnabled = !engineWarmup
@@ -835,15 +886,32 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         pauseItem.isEnabled = phase == .recording
         bookmarkItem.isEnabled = phase == .recording && !paused
         captionsItem.state = captions.isVisible ? .on : .off
-        let symbol = phase == .recording || phase == .finishing ? "record.circle" : "waveform"
+        let symbol: String
+        if privacyPane != nil {
+            symbol = "exclamationmark.triangle.fill"
+        } else if phase == .recording || phase == .finishing {
+            symbol = "record.circle"
+        } else {
+            symbol = "waveform"
+        }
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "listn")
         image?.isTemplate = true
         statusItem.button?.image = image
-        if phase == .recording {
+        if privacyPane != nil {
+            statusItem.length = NSStatusItem.variableLength
+            statusItem.button?.title = " No audio"
+            statusItem.button?.toolTip = errorText ?? "listn is receiving silence. See capture.log."
+        } else if phase == .recording {
+            statusItem.length = NSStatusItem.squareLength
+            statusItem.button?.title = ""
             statusItem.button?.toolTip = "listn — recording"
         } else if engineWarmup {
+            statusItem.length = NSStatusItem.squareLength
+            statusItem.button?.title = ""
             statusItem.button?.toolTip = "listn — starting"
         } else {
+            statusItem.length = NSStatusItem.squareLength
+            statusItem.button?.title = ""
             statusItem.button?.toolTip = "listn"
         }
         refreshLines()

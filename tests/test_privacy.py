@@ -37,9 +37,9 @@ def _events_until(client, kind, timeout=10):
 
 def test_silence_message_points_at_the_right_pane():
     message, pane = silence_message("mic")
-    assert pane == "microphone" and "Microphone" in message
+    assert pane == "microphone" and "Microphone" in message and "capture.log" in message
     message, pane = silence_message("system")
-    assert pane == "audio-capture" and "System Audio Recording" in message
+    assert pane == "audio-capture" and "System Audio Recording" in message and "capture.log" in message
     assert all(url.startswith("x-apple.systempreferences:") for url in PANES.values())
 
 
