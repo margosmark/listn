@@ -254,3 +254,11 @@ dialog::backdrop { background: rgba(10, 12, 20, .45); }
   .local-badge { display: none; }
   .two { grid-template-columns: 1fr; }
 }
+.badge.warn { background: var(--warn-soft); color: var(--warn); }
+.speaker-progress { display: grid; grid-template-columns: 1fr auto; gap: 6px 10px; align-items: center; }
+.speaker-progress .progress { grid-column: 1; }
+.speaker-progress .btn { grid-row: 1 / span 2; grid-column: 2; }
+.voices { display: flex; flex-direction: column; gap: 4px; }
+.voice { display: flex; align-items: center; gap: 8px; }
+.voice > span { font-weight: 600; }
+.voice .btn { margin-left: auto; }

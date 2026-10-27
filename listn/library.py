@@ -62,6 +62,11 @@ class SessionMeta:
     audio_removed: bool = False
     silent: bool = False
     warning: str | None = None
+    # Speaker labels after the transcript: queued | running | done | skipped | error | cancelled
+    speaker_state: str | None = None
+    speaker_note: str | None = None
+    speaker_model: str | None = None
+    speaker_matches: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -287,6 +292,11 @@ class Library:
             if meta.status in ("recording", "transcribing") and not _pid_alive(meta.owner_pid):
                 meta.status = "error"
                 meta.error = "listn stopped before this session finished. The audio recorded so far is kept; use Retranscribe."
+                self.save_meta(meta)
+                count += 1
+            elif meta.speaker_state in ("queued", "running") and not _pid_alive(meta.owner_pid):
+                meta.speaker_state = "error"
+                meta.speaker_note = "listn stopped before speakers were labelled. Use Label speakers to try again."
                 self.save_meta(meta)
                 count += 1
         return count

@@ -211,8 +211,8 @@ def assemble(venv: Path, project: Path, dest: Path, compile_bytecode: bool = Tru
     size = directory_bytes(dest)
     (dest / "SIZE.txt").write_text(
         f"{format_size(size)}\n"
-        "The app's Python environment only. Whisper and the notes model stay in "
-        "~/.cache/huggingface and are not included.\n"
+        "The app's Python environment only. Whisper, the notes model and the pyannote "
+        "speaker models stay in ~/.cache/huggingface and are not included.\n"
     )
     return {"bytes": size, "label": format_size(size), "launcher": str(launcher), "macho": machos,
             "interpreter": str(interpreter)}

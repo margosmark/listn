@@ -22,13 +22,19 @@ from listn.llm import DEFAULT_LLM
 
 MODELS = ["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"]
 BACKENDS = ["auto", "faster-whisper", "mlx", "openai-whisper"]
+SETTINGS_VERSION = 2
+SPEAKER_THRESHOLD = 0.55
+SPEAKER_THRESHOLD_MIN = 0.3
+SPEAKER_THRESHOLD_MAX = 0.9
 
 
 def disable_network_telemetry() -> None:
     """Turn off usage reporting in third-party libraries we load."""
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
     os.environ.setdefault("DO_NOT_TRACK", "1")
-    os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "0")
+    # pyannote 4 reports usage to otel.pyannote.ai unless this is "0" before it is imported.
+    os.environ["PYANNOTE_METRICS_ENABLED"] = "0"
+    os.environ["OTEL_SDK_DISABLED"] = "true"
 
 
 def apple_silicon() -> bool:
@@ -80,7 +86,8 @@ class Settings:
     backend: str = "auto"
     chunk_seconds: float = 6.0
     save_audio: bool = True
-    diarize_after: bool = False
+    # None follows the token: on when one is set (or the model is cached).
+    diarize_after: bool | None = None
     hf_token: str | None = None
     llm_model: str = DEFAULT_LLM
     summarize_after: bool = True
@@ -90,10 +97,14 @@ class Settings:
     vocabulary: list = field(default_factory=list)
     vad_chunks: bool = True
     match_speakers: bool = True
-    speaker_threshold: float = 0.72
+    # Cosine similarity of WeSpeaker ResNet34 embeddings (see listn/speakers.py).
+    speaker_threshold: float = SPEAKER_THRESHOLD
+    # Only used by the spectrum fallback when pyannote is not installed.
+    spectrum_threshold: float = 0.72
     audio_retention_days: int = 0
     min_free_gb: float = 2.0
     battery_saver: bool = True
+    settings_version: int = SETTINGS_VERSION
 
     @classmethod
     def path(cls) -> Path:
@@ -105,8 +116,10 @@ class Settings:
             raw = json.loads(cls.path().read_text())
         except (OSError, ValueError):
             return cls()
+        if not isinstance(raw, dict):
+            return cls()
         known = {f.name for f in fields(cls)}
-        settings = cls(**{k: v for k, v in raw.items() if k in known})
+        settings = cls(**{k: v for k, v in migrate(raw).items() if k in known})
         return settings.validated()
 
     def validated(self) -> "Settings":
@@ -131,10 +144,16 @@ class Settings:
         self.vocabulary = clean_vocabulary(self.vocabulary)
         self.vad_chunks = bool(self.vad_chunks)
         self.match_speakers = bool(self.match_speakers)
+        self.diarize_after = None if self.diarize_after is None else bool(self.diarize_after)
         try:
-            self.speaker_threshold = min(0.95, max(0.4, float(self.speaker_threshold)))
+            self.speaker_threshold = min(SPEAKER_THRESHOLD_MAX, max(SPEAKER_THRESHOLD_MIN, float(self.speaker_threshold)))
         except (TypeError, ValueError):
-            self.speaker_threshold = 0.72
+            self.speaker_threshold = SPEAKER_THRESHOLD
+        try:
+            self.spectrum_threshold = min(0.95, max(0.4, float(self.spectrum_threshold)))
+        except (TypeError, ValueError):
+            self.spectrum_threshold = 0.72
+        self.settings_version = SETTINGS_VERSION
         try:
             self.audio_retention_days = min(3650, max(0, int(self.audio_retention_days)))
         except (TypeError, ValueError):
@@ -156,7 +175,38 @@ class Settings:
     def resolved_hf_token(self) -> str | None:
         return self.hf_token or os.environ.get("HF_TOKEN") or None
 
+    def speakers_after(self) -> bool:
+        """Label speakers when a recording ends. Auto means: a token is set or the model is cached."""
+        if self.diarize_after is not None:
+            return bool(self.diarize_after)
+        from listn import diarize
+
+        if not diarize.installed():
+            return False
+        return bool(self.resolved_hf_token()) or diarize.cached_pipeline() is not None
+
     def public(self) -> dict:
         data = asdict(self)
         data["hf_token"] = bool(self.resolved_hf_token())
+        data["diarize_after_auto"] = self.diarize_after is None
+        data["diarize_after"] = self.speakers_after()
         return data
+
+
+def migrate(raw: dict) -> dict:
+    """Bring a settings file from an older listn up to date."""
+    raw = dict(raw)
+    try:
+        version = int(raw.get("settings_version") or 1)
+    except (TypeError, ValueError):
+        version = 1
+    if version < 2:
+        # 0.4 saved diarize_after=false for everyone; it now follows the token.
+        if raw.get("diarize_after") is not True:
+            raw["diarize_after"] = None
+        # The old threshold was on the spectrum scale, which means nothing for WeSpeaker.
+        if "speaker_threshold" in raw:
+            raw["spectrum_threshold"] = raw.pop("speaker_threshold")
+        raw["speaker_threshold"] = SPEAKER_THRESHOLD
+    raw["settings_version"] = SETTINGS_VERSION
+    return raw

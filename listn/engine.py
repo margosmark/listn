@@ -21,6 +21,7 @@ import time
 import traceback
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -85,12 +86,15 @@ class EventBus:
 
 class LiveSession:
     def __init__(self, library: Library, bus: EventBus, settings: Settings, title: str | None = None,
-                 sd=None, transcriber_factory: Callable | None = None):
+                 sd=None, transcriber_factory: Callable | None = None,
+                 on_finished: Callable[["LiveSession"], bool] | None = None):
         self.library = library
         self.bus = bus
         self.settings = settings
         self.sd = sd
         self._factory = transcriber_factory or get_transcriber
+        self._on_finished = on_finished
+        self._book = None
         self.meta: SessionMeta = library.create(
             title or time.strftime("Recording %b %d, %H:%M"), "live",
             model=settings.model, backend=resolve_backend(settings.backend), language=settings.language,
@@ -428,9 +432,7 @@ class LiveSession:
             track, start, chunk = item
             speaker = TRACK_SPEAKER.get(track)
             if speaker == "Others" and self.settings.match_speakers:
-                from listn.speakers import SpeakerBook
-
-                matched, _score = SpeakerBook().match(chunk, self.settings.speaker_threshold)
+                matched = self._match_known(chunk)
                 if matched:
                     speaker = matched
                     self.meta.speakers = dict(self.meta.speakers or {})
@@ -457,6 +459,26 @@ class LiveSession:
                     self.segments.sort(key=lambda s: (s.start, s.speaker or ""))
                     self.library.save_segments(self.meta.id, self.segments)
                 self._emit("live.segments", segments=[s.to_dict() for s in new])
+
+    def _match_known(self, chunk: np.ndarray) -> str | None:
+        """Name a whole live chunk after a known voice. Never downloads during a call."""
+        from listn.speakers import SpeakerBook, threshold_for, voice_embedder
+
+        try:
+            if self._book is None:
+                book = SpeakerBook()
+                if not book.profiles():
+                    self._book = False
+                    return None
+                book.embedder = voice_embedder(allow_download=False)
+                self._book = book
+            if self._book is False or chunk.size < int(self._book.embedder.min_seconds * TARGET_RATE):
+                return None
+            matched, _score = self._book.match(chunk, threshold_for(self._book.embedder, self.settings))
+            return matched
+        except Exception as exc:
+            log.debug("Live voice matching skipped: %s", exc)
+            return None
 
     def pause(self) -> bool:
         if self._stop.is_set() or self.paused or self.state in ("done", "error", "finishing"):
@@ -567,10 +589,6 @@ class LiveSession:
             out.close()
         self.meta.audio_file = "audio.wav"
 
-    def _diarize_saved(self, path: Path, segments: list[Segment]) -> tuple[list[Segment], dict]:
-        audio = decode_file(path)
-        return diarize.diarize_segments(audio, segments, self.settings.resolved_hf_token())
-
     def _finish(self) -> None:
         for t in self._threads:
             t.join()
@@ -581,28 +599,6 @@ class LiveSession:
         else:
             self.meta.duration = round(self._samples / TARGET_RATE, 2)
         self.library.save_segments(self.meta.id, self.segments)
-        if self.settings.diarize_after and self.segments:
-            self.state = "diarizing"
-            self._emit("live.status", message="Identifying speakers...", state=self.state)
-            try:
-                if self.mode == "ingest":
-                    system = self.library.session_path(self.meta.id) / "audio-system.wav"
-                    others = [s for s in self.segments if s.speaker != "Me"]
-                    me = [s for s in self.segments if s.speaker == "Me"]
-                    if system.exists() and others:
-                        labelled, names = self._diarize_saved(system, others)
-                        self.segments = sorted(me + labelled, key=lambda s: (s.start, s.speaker or ""))
-                        self.meta.speakers = {"Me": "Me", **names}
-                        self.meta.diarized = True
-                        self.library.save_segments(self.meta.id, self.segments)
-                elif self._writer is not None:
-                    labelled, names = self._diarize_saved(self._writer.path, self.segments)
-                    self.segments = labelled
-                    self.meta.speakers = names
-                    self.meta.diarized = True
-                    self.library.save_segments(self.meta.id, self.segments)
-            except Exception as exc:
-                self._emit("live.error", message=f"Speaker labels skipped: {exc}")
         from listn.privacy import SILENT_SESSION
 
         spoken = [s for s in self.segments if s.text != "[paused]"]
@@ -621,11 +617,17 @@ class LiveSession:
         from listn.retention import apply_retention
         from listn.summary import schedule_notes
 
+        speakers_queued = False
+        if spoken and not silent and self._on_finished is not None:
+            try:
+                speakers_queued = bool(self._on_finished(self))
+            except Exception:
+                log.exception("Could not queue speaker labels")
         try:
             apply_retention(self.library, self.settings.audio_retention_days)
         except OSError:
             log.exception("Retention pass failed")
-        if spoken:
+        if spoken and not speakers_queued:
             schedule_notes(self.library, self.meta.id, self.settings, self.bus)
 
     def _fail(self, message: str) -> None:
@@ -638,6 +640,8 @@ class LiveSession:
 
 
 class FileJob:
+    kind = "transcribe"
+
     def __init__(self, meta: SessionMeta, audio_path: Path, model: str, backend: str,
                  language: str | None, diarize_speakers: bool):
         self.meta = meta
@@ -648,12 +652,29 @@ class FileJob:
         self.diarize = diarize_speakers
         self.progress = 0.0
         self.stage = "queued"
+        self.detail: str | None = None
         self.cancelled = False
         self.hf_token: str | None = None
+        self.match_speakers = True
+        self.speaker_threshold: float | None = None
+        self.spectrum_threshold: float | None = None
 
     def to_dict(self) -> dict:
         return {"id": self.meta.id, "title": self.meta.title, "progress": round(self.progress, 3),
-                "stage": self.stage, "model": self.model}
+                "stage": self.stage, "model": self.model, "kind": self.kind, "detail": self.detail}
+
+
+class SpeakerJob(FileJob):
+    """Label speakers on a saved session without transcribing it again."""
+
+    kind = "speakers"
+
+    def __init__(self, meta: SessionMeta, audio_path: Path | None, notes_after: bool = False):
+        super().__init__(meta, audio_path, "pyannote", "local", None, True)
+        self.notes_after = notes_after
+
+
+SPEAKER_STAGE = "speakers"
 
 
 class Engine:
@@ -694,7 +715,7 @@ class Engine:
                 raise RuntimeError("A recording is already running.")
             tuned = self._tuned(settings, on_battery, battery_percent)
             session = LiveSession(self.library, self.bus, tuned, title, sd=self.sd,
-                                  transcriber_factory=self._factory)
+                                  transcriber_factory=self._factory, on_finished=self._live_finished)
             session.start(attendees)
             self.live = session
             return session
@@ -707,7 +728,7 @@ class Engine:
                 raise RuntimeError("A recording is already running.")
             tuned = self._tuned(settings, on_battery, battery_percent)
             session = LiveSession(self.library, self.bus, tuned, title, sd=self.sd,
-                                  transcriber_factory=self._factory)
+                                  transcriber_factory=self._factory, on_finished=self._live_finished)
             session.start_ingest(source, attendees)
             self.live = session
             return session
@@ -756,11 +777,72 @@ class Engine:
                                        status="transcribing")
             audio_path = self.library.import_audio(meta, Path(src), move=move)
         job = FileJob(meta, audio_path, settings.model, settings.backend, settings.language, diarize_speakers)
-        job.hf_token = settings.resolved_hf_token()
+        self._speaker_settings(job, settings)
+        if diarize_speakers:
+            self.library.update(meta.id, speaker_state="queued", speaker_note=None)
         self.jobs[meta.id] = job
         self._job_queue.put(job)
         self.bus.publish({"type": "job.update", "job": job.to_dict()})
         return job
+
+    @staticmethod
+    def _speaker_settings(job: FileJob, settings: Settings) -> None:
+        job.hf_token = settings.resolved_hf_token()
+        job.match_speakers = bool(settings.match_speakers)
+        job.speaker_threshold = settings.speaker_threshold
+        job.spectrum_threshold = settings.spectrum_threshold
+
+    def speaker_source(self, session_id: str) -> tuple[Path | None, bool]:
+        """The audio to diarize and whether it is the Others track of a two-track recording."""
+        root = self.library.session_path(session_id)
+        system = root / "audio-system.wav"
+        if system.exists():
+            return system, True
+        if (root / "audio-mic.wav").exists():
+            return None, True
+        return self.library.audio_path(self.library.get(session_id)), False
+
+    def enqueue_speakers(self, session_id: str, settings: Settings, notes_after: bool = False) -> SpeakerJob:
+        """Queue speaker labels for a saved session (after a recording, or from the library/CLI)."""
+        meta = self.library.get(session_id)
+        if session_id in self.jobs:
+            raise RuntimeError("This session is busy.")
+        if self.live_active() and self.live.meta.id == session_id:
+            raise RuntimeError("This session is still recording.")
+        path, _two_track = self.speaker_source(session_id)
+        if path is None:
+            raise FileNotFoundError("This session has no saved audio of the other people to label.")
+        job = SpeakerJob(meta, path, notes_after=notes_after)
+        self._speaker_settings(job, settings)
+        job.detail = "Queued"
+        self.library.update(session_id, speaker_state="queued", speaker_note=None)
+        self.jobs[session_id] = job
+        self._job_queue.put(job)
+        self.bus.publish({"type": "job.update", "job": job.to_dict()})
+        return job
+
+    def _live_finished(self, session: LiveSession) -> bool:
+        """Queue speaker labels for a finished recording. True when a job was queued."""
+        settings = session.settings
+        if not settings.speakers_after():
+            return False
+        ready = diarize.readiness(settings.resolved_hf_token())
+        if not ready["ready"]:
+            self.library.update(session.meta.id, speaker_state="skipped", speaker_note=ready["message"])
+            self.bus.publish({"type": "speakers.skipped", "session": session.meta.id, "message": ready["message"]})
+            return False
+        path, _two_track = self.speaker_source(session.meta.id)
+        if path is None:
+            return False
+        lines = [s for s in session.segments if s.speaker != "Me" and s.text != "[paused]"]
+        if not lines:
+            return False
+        try:
+            self.enqueue_speakers(session.meta.id, settings, notes_after=True)
+        except (RuntimeError, FileNotFoundError, KeyError) as exc:
+            log.info("Speaker labels not queued: %s", exc)
+            return False
+        return True
 
     def cancel_job(self, session_id: str) -> bool:
         job = self.jobs.get(session_id)
@@ -791,13 +873,95 @@ class Engine:
                     time.sleep(0.5)
                     if job.cancelled:
                         raise Cancelled()
-                self._run_job(job)
+                if job.kind == "speakers":
+                    self._run_speaker_job(job)
+                else:
+                    self._run_job(job)
                 self._finish_job(job)
-            except Cancelled:
+            except (Cancelled, diarize.Cancelled):
                 self._finish_job(job, error="Cancelled.")
             except Exception as exc:
                 log.debug(traceback.format_exc())
-                self._finish_job(job, error=str(exc) or exc.__class__.__name__)
+                from listn.hub import redact
+
+                self._finish_job(job, error=redact(str(exc) or exc.__class__.__name__, job.hf_token))
+
+    def _identify(self, job: FileJob):
+        """Callback for diarize_segments: name diarized speakers after known voices."""
+        from listn.speakers import SpeakerBook, load_neural_embedder, threshold_for
+
+        def identify(audio: np.ndarray, turns, labels: list[str]) -> dict:
+            book = SpeakerBook()
+            if not book.profiles():
+                return {}
+            book.embedder = load_neural_embedder(job.hf_token, allow_download=True)
+            book.reenroll(self.library)
+            probes = {}
+            for label in labels:
+                clip = diarize.speaker_audio(audio, turns, label)
+                if clip.size >= int(book.embedder.min_seconds * TARGET_RATE):
+                    probes[label] = book.embedder.embed(clip)
+            limits = SimpleNamespace(speaker_threshold=job.speaker_threshold or Settings.speaker_threshold,
+                                     spectrum_threshold=job.spectrum_threshold or Settings.spectrum_threshold)
+            return book.identify(probes, threshold_for(book.embedder, limits))
+
+        return identify
+
+    def _label_speakers(self, job: FileJob, audio: np.ndarray | None, base: float = 0.0, span: float = 1.0) -> None:
+        """Diarize the session's Others audio and relabel its lines. Me is never touched."""
+        sid = job.meta.id
+        path, two_track = self.speaker_source(sid)
+        if path is None:
+            raise FileNotFoundError("This session has no saved audio of the other people to label.")
+        if two_track or audio is None:
+            audio = decode_file(path)
+        segments = self.library.segments(sid)
+        if two_track:
+            target = [s for s in segments if s.speaker != "Me" and s.text != "[paused]"]
+        else:
+            target = [s for s in segments if s.text != "[paused]"]
+        chosen = {id(s) for s in target}
+        keep = [s for s in segments if id(s) not in chosen]
+        if not target:
+            self.library.update(sid, speaker_state="skipped", speaker_note="No lines from other people to label.")
+            return
+        self.library.update(sid, speaker_state="running", speaker_note=None)
+
+        def detail(message: str) -> None:
+            job.detail = message.rstrip(".")
+            self._job_update(job, SPEAKER_STAGE)
+
+        def progress(fraction: float) -> None:
+            self._job_update(job, SPEAKER_STAGE, base + span * fraction)
+
+        result = diarize.diarize_segments(
+            audio, target, job.hf_token, status=detail, progress=progress,
+            cancelled=lambda: job.cancelled, default="Others" if two_track else None,
+            identify=self._identify(job) if job.match_speakers else None)
+        labelled = sorted(keep + result.segments, key=lambda s: (s.start, s.speaker or ""))
+        names = {"Me": "Me"} if two_track else {}
+        names.update(result.names)
+        if any(s.speaker == "Others" for s in labelled):
+            names["Others"] = "Others"
+        known = sorted({m["name"] for m in result.matches.values() if m.get("name")})
+        count = len(result.names)
+        note = f"{count} speaker{'s' if count != 1 else ''} on the {'Others track' if two_track else 'recording'}"
+        if known:
+            note += f"; recognised {', '.join(known)}"
+        self.library.save_segments(sid, labelled)
+        self.library.update(sid, diarized=True, speakers=names, speaker_state="done", speaker_note=note + ".",
+                            speaker_model=result.model_id, speaker_matches=result.matches)
+
+    def _run_speaker_job(self, job: SpeakerJob) -> None:
+        self._job_update(job, SPEAKER_STAGE, 0.0)
+        job.detail = "Reading audio"
+        self._job_update(job, SPEAKER_STAGE, 0.02)
+        try:
+            self._label_speakers(job, None, base=0.02, span=0.98)
+        except (Cancelled, diarize.Cancelled):
+            raise
+        except Exception as exc:
+            raise RuntimeError(self._speaker_failed(job, exc)) from exc
 
     def _run_job(self, job: FileJob) -> None:
         self._job_update(job, "decoding", 0.0)
@@ -815,18 +979,51 @@ class Engine:
         segments = [Segment(round(s.start, 2), round(s.end, 2), s.text) for s in raw]
         self.library.save_segments(job.meta.id, segments)
         if job.diarize and segments:
-            self._job_update(job, "speakers", 0.9)
-            labelled, names = diarize.diarize_segments(audio, segments, job.hf_token)
-            self.library.save_segments(job.meta.id, labelled)
-            self.library.update(job.meta.id, diarized=True, speakers=names)
+            self._job_update(job, SPEAKER_STAGE, 0.85)
+            try:
+                self._label_speakers(job, audio, base=0.85, span=0.15)
+            except (Cancelled, diarize.Cancelled):
+                raise
+            except Exception as exc:
+                self._speaker_failed(job, exc)
+
+    def _speaker_failed(self, job: FileJob, exc: Exception) -> str:
+        from listn.hub import redact
+
+        message = redact(str(exc) or exc.__class__.__name__, job.hf_token)
+        state = "skipped" if isinstance(exc, (diarize.DiarizationUnavailable, FileNotFoundError)) else "error"
+        note = message if state == "skipped" else f"Speaker labels failed: {message}"
+        log.info("Speaker labels for %s: %s", job.meta.id, note)
+        self.library.update(job.meta.id, speaker_state=state, speaker_note=note)
+        return note
 
     def _finish_job(self, job: FileJob, error: str | None = None) -> None:
+        from listn.summary import schedule_notes
+
         job.stage = "error" if error else "done"
         job.progress = job.progress if error else 1.0
+        if job.kind == "speakers":
+            # The transcript stays usable whatever happens to the speaker labels.
+            if error == "Cancelled.":
+                meta = self.library.update(job.meta.id, speaker_state="cancelled", speaker_note="Speaker labelling was cancelled.")
+            elif error:
+                meta = self.library.get(job.meta.id)
+                if meta.speaker_state not in ("skipped", "error"):
+                    self._speaker_failed(job, RuntimeError(error))
+                meta = self.library.get(job.meta.id)
+            else:
+                meta = self.library.get(job.meta.id)
+            self.jobs.pop(job.meta.id, None)
+            self.bus.publish({"type": "job.done", "job": job.to_dict(), "meta": meta.to_dict(), "error": error})
+            if job.notes_after:
+                schedule_notes(self.library, job.meta.id, Settings.load(), self.bus)
+            return
+        if error and job.diarize:
+            current = self.library.get(job.meta.id)
+            if current.speaker_state in ("queued", "running"):
+                self.library.update(job.meta.id, speaker_state=None)
         meta = self.library.update(job.meta.id, status="error" if error else "done", error=error)
         self.jobs.pop(job.meta.id, None)
         self.bus.publish({"type": "job.done", "job": job.to_dict(), "meta": meta.to_dict(), "error": error})
         if not error:
-            from listn.summary import schedule_notes
-
             schedule_notes(self.library, job.meta.id, Settings.load(), self.bus)

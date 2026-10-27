@@ -102,6 +102,11 @@ class SpeakerCorrectIn(BaseModel):
     name: str
 
 
+class SpeakerNameIn(BaseModel):
+    label: str
+    name: str
+
+
 def _host_ok(host_header: str) -> bool:
     host = host_header.strip().lower()
     if host.startswith("["):
@@ -192,7 +197,8 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
             "backends": BACKENDS,
             "backend_available": available_backends(),
             "resolved_backend": resolve_backend(app.state.settings.backend),
-            "diarization_available": diarize.available(),
+            "diarization_available": diarize.installed(),
+            "diarization": diarize.readiness(app.state.settings.resolved_hf_token()),
             "data_dir": str(data_dir()),
             "live": e.live.status() if e.live else None,
             "live_active": e.live_active(),
@@ -316,21 +322,49 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
         index = SearchIndex(eng().library)
         return {"results": index.sessions_for(q), "hits": index.search(q)}
 
+    def voice_book():
+        """A SpeakerBook on WeSpeaker when its weights are cached, else the spectrum fallback."""
+        from listn.speakers import SpeakerBook, voice_embedder
+
+        return SpeakerBook(embedder=voice_embedder(allow_download=False))
+
     @app.get("/api/speakers")
     def speakers():
+        from listn.speakers import loaded_embedder
+
+        book = voice_book()
+        settings = app.state.settings
+        neural = book.embedder.neural
+        return {"speakers": book.describe(), "method": book.embedder.key, "method_label": book.embedder.label,
+                "neural": neural, "loaded": loaded_embedder() is not None,
+                "threshold": settings.speaker_threshold if neural else settings.spectrum_threshold,
+                "margin": book.embedder.margin}
+
+    @app.post("/api/speakers/reenroll")
+    def reenroll_speakers():
+        book = voice_book()
+        if not book.embedder.neural:
+            raise HTTPException(400, "The voice model isn't on this Mac yet. Label speakers in one session first; "
+                                     "that downloads it once.")
+        return book.reenroll(eng().library)
+
+    @app.delete("/api/speakers/{name}")
+    def delete_speaker(name: str):
         from listn.speakers import SpeakerBook
 
-        return {"speakers": SpeakerBook().list(), "threshold": app.state.settings.speaker_threshold}
+        if not SpeakerBook().delete(name):
+            raise HTTPException(404, "No voice with that name.")
+        return {"ok": True}
 
     @app.post("/api/speakers/correct")
     def correct_speaker(body: SpeakerCorrectIn):
-        from listn.speakers import SpeakerBook, correct_segment
+        from listn.speakers import correct_segment
 
         name = " ".join(body.name.split())
         if not name:
             raise HTTPException(400, "Type the person's name.")
         try:
-            return correct_segment(eng().library, SpeakerBook(), body.session_id, body.start, name)
+            return correct_segment(eng().library, voice_book(), body.session_id, body.start, name)
         except FileNotFoundError as exc:
             raise HTTPException(400, str(exc))
         except ValueError as exc:
@@ -340,8 +374,6 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
 
     @app.post("/api/speakers/enroll")
     async def enroll_speaker(name: str = Form(""), file: UploadFile = File(...)):
-        from listn.speakers import SpeakerBook
-
         label = " ".join(name.split())
         if not label:
             raise HTTPException(400, "Type the person's name.")
@@ -359,7 +391,7 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
         finally:
             shutil.rmtree(tmp.parent, ignore_errors=True)
         try:
-            return SpeakerBook().enroll(label, audio)
+            return voice_book().enroll(label, audio)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
 
@@ -431,6 +463,32 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
             raise HTTPException(409, "This session is busy.")
         settings = Settings(**{**app.state.settings.__dict__})
         return e.enqueue_file(audio, meta.title, settings, body.diarize, existing=meta).to_dict()
+
+    @app.post("/api/sessions/{session_id}/diarize")
+    def label_speakers(session_id: str):
+        e = eng()
+        _meta(session_id)
+        if not diarize.installed():
+            raise HTTPException(400, diarize.INSTALL_HINT)
+        settings = Settings(**{**app.state.settings.__dict__})
+        try:
+            return e.enqueue_speakers(session_id, settings).to_dict()
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc))
+        except FileNotFoundError as exc:
+            raise HTTPException(400, str(exc))
+
+    @app.post("/api/sessions/{session_id}/speakers/name")
+    def name_session_speaker(session_id: str, body: SpeakerNameIn):
+        from listn.speakers import name_speaker
+
+        _meta(session_id)
+        try:
+            return name_speaker(eng().library, voice_book(), session_id, body.label, body.name)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except FileNotFoundError as exc:
+            raise HTTPException(400, str(exc))
 
     @app.get("/api/sessions/{session_id}/export")
     def export_session(session_id: str, format: str = "txt"):
