@@ -17,8 +17,10 @@ You need Python 3.10–3.13, Swift 6 (the Command Line Tools are enough; a full 
 ```bash
 brew install uv
 cd listn
-uv sync --extra mlx          # Apple Silicon GPU backend; this is the one to install
+uv sync --extra mlx --extra llm --extra diarize   # GPU Whisper, notes model, speaker labels
 ```
+
+`--extra diarize` adds pyannote.audio 4 for telling the people on the Others track apart (see [Speaker labels](#speaker-labels)). Leave it out and everything else works; Others just stays one speaker.
 
 `uv sync` without `--extra mlx` still runs, on the CPU, but live transcription of two tracks will lag. See [Models](#models-and-backends).
 
@@ -106,6 +108,8 @@ uv run listn live            # legacy input device in the terminal
 uv run listn transcribe call.m4a --format srt
 uv run listn list "budget"
 uv run listn export <session-id> --format md
+uv run listn diarize <session-id>   # split Others into Speaker 1, 2, … (again)
+uv run listn speakers               # known voices; --reenroll, --check
 uv run listn path
 ```
 
@@ -161,30 +165,48 @@ Live chunks are a bit less accurate than a whole file. For an important meeting,
 
 The menu bar sends two PCM streams over the socket. Track 0 is system audio (or the one app you picked) and is labelled **Others**. Track 1 is the microphone and is labelled **Me**. Each track is resampled, saved, and transcribed on its own, so the labels do not depend on a diarization model. That is the reliable split for a call.
 
-If you turn on speaker labels, pyannote runs only on the system track after you stop, and Me is left alone. Rename either name in the library.
+After you stop, pyannote splits the system track into Speaker 1, Speaker 2, … and Me is left alone (see [Speaker labels](#speaker-labels)). Rename any of them in the library.
 
 ScreenCaptureKit is not used. It can capture app audio, but the permission is screen recording and the API is built around video. Process taps are the audio API for this, they have been in macOS since 14.2, and 26.7 has them.
 
 The tap is private and **unmuted**, so the meeting keeps playing through your speakers. Nothing is muted and nothing is exclusive.
 
-## Known speakers
+## Speaker labels
 
-Voices on the Others track can be matched to people you have already named. The embedding is 64 log-magnitude bands of a short clip, mean-centred and normalised. Nothing is downloaded. Profiles live in `speakers/<name>.json` (up to 24 clips each). A match has to clear the threshold in Settings (default 0.72). **Me** is never enrolled; that track is already you.
+With a Hugging Face token in Settings, listn labels who said what on the **Others** track when a recording finishes. The **Me** track is never touched; it is already you.
 
-Teach a voice in either of two ways:
+- The model is [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) on pyannote.audio 4. If it will not load, listn falls back to [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1). It runs on the Apple GPU (MPS) when it can and on the CPU otherwise. A one-hour call takes a few minutes; the library shows the progress and you can cancel it.
+- Each Others line gets the speaker who talks most during it. A line with nobody detected stays **Others**.
+- *Split Others into speakers after stopping* in Settings is on by default once a token is saved or the model is already downloaded. Turn it off there.
+- **Label speakers** on a saved session (or `listn diarize <id>`) runs it again, for example on recordings from before 0.5.
 
-- In a saved session, type a name in **This is…** on an Others line. That clip is added to the profile and the line is renamed.
-- In Settings, save a short WAV of one person talking.
+Setup, once:
 
-The next meeting compares each Others chunk with those profiles and labels the line when it is confident. Correcting a wrong name adds the new clip, so the profile gets better. Turn matching off with *Match known voices on the Others track*.
+1. Install the extra: `uv sync --extra mlx --extra llm --extra diarize`. The Mac app built by `build-app.sh` includes it.
+2. Accept the terms on [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1). For the 3.1 fallback, also accept [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) and [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0).
+3. Create a read token at <https://huggingface.co/settings/tokens> and paste it in Settings (or `export HF_TOKEN=...`).
+
+The token is only used for that first download (about 33 MB into `~/.cache/huggingface`). After that the model loads from the cache with `HF_HUB_OFFLINE` set, even if you delete the token. The token is never written to logs, notes or error messages. pyannote's usage metrics (`PYANNOTE_METRICS_ENABLED`) are switched off before it is imported. Audio and transcripts never leave the Mac.
+
+Without the extra, the token, or the download, recordings still finish with Me / Others. Settings and the session page say what is missing, and `listn speakers --check` prints the same thing.
+
+## Known voices
+
+Named speakers are recognised in later meetings. listn keeps a voice print per person, made with the WeSpeaker ResNet34 speaker-embedding model that community-1 uses (the 256-number embedding pyannote compares voices with). Profiles live in `speakers/<name>.json`, and the clips they were made from are in `speakers/clips/<name>/`. Both stay on the Mac.
+
+- **Naming a speaker enrols them.** In a session, click a speaker chip (Speaker 1, …) and type the name. That renames the speaker, then up to 3 of their longest lines are added to the profile. The next meeting labels them automatically.
+- Typing a name in **This is…** on one line also adds that clip.
+- In Settings, **Known voices** lists the profiles, lets you forget one, and can re-learn all of them.
+
+**Threshold: 0.55 cosine similarity, plus a 0.08 lead over the runner-up.** Calibrated on 40 LibriSpeech speakers with the real model. Two different people score a median of 0.08 (99th percentile about 0.4, worst 0.58); the same person scores a median of 0.82 on 15-second clean samples, and at 0.55 only 0.06% of different-person pairs pass. Over a call-quality line every score drops and strangers drift closer to each other, so a match must also beat the second-best profile by 0.08. With 3 clips per person taken from that same kind of line, this named all 20 known speakers correctly and gave a name to none of 20 strangers (15-second samples; 16 of 20 on 4-second samples, still with no stranger named). A clean recording enrolled in Settings and matched over a call line does worse (16 of 20, one stranger named), so prefer naming people from a meeting. The old spectrum fingerprint at its 0.72 threshold accepted 87% of different-speaker pairs. Raise the slider (0.3–0.9) if strangers get named, lower it if known people are missed. Each person is claimed by at most one speaker per meeting.
+
+When pyannote is not installed, listn falls back to the old 64-band spectrum fingerprint (threshold 0.72, `spectrum_threshold` in settings) for live matching, so 0.4 profiles keep working.
+
+Upgrading from 0.4: profiles are re-learned with the new model from their saved clips, or from lines already named after that person in the library. A profile with neither is marked *needs re-learning*; name that person once in a session to fix it. The vectors from each method are stored separately and never compared with each other.
+
+During a live recording, Others chunks are matched as they arrive. Turn that off with *Match known voices on the Others track*.
 
 The menu bar can show a floating captions window (**Live captions**). It stays above other windows, including full-screen spaces, and does not take keyboard focus. It is off until you turn it on.
-
-## Speaker labels (optional, for more than Me / Others)
-
-1. `uv sync --extra diarize`
-2. Accept the terms for [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) and [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0), and create a read token at <https://huggingface.co/settings/tokens>.
-3. Paste the token in Settings, or `export HF_TOKEN=...`. It is only needed for the first download.
 
 ## Privacy, pause, and a self-contained app
 
@@ -196,9 +218,9 @@ The menu bar can show a floating captions window (**Live captions**). It stays a
 
 **Disk.** Recording will not start when the data volume has less than 2 GB free (change `min_free_gb` in settings). If space runs out during a long meeting, listn stops and keeps what it already wrote.
 
-**Icon and packaging.** `macos/scripts/build-app.sh` builds `Listn.app` with the Command Line Tools and by default copies a private Python environment into `Contents/Resources/python`. The base interpreter is found by resolving `.venv/bin/python` through its symlinks (uv's `cpython-3.13-…` folder is a symlink to the patch release). Its `bin` and `lib` go to `python/prefix`, the venv's packages go into `prefix/lib/python3.X/site-packages`, and `listn` is copied in so nothing points back at the checkout. Bytecode is compiled at build time, and the launcher sets `PYTHONDONTWRITEBYTECODE` so nothing is written into the signed bundle at run time. Every Mach-O file is signed, then the app, then the whole bundle is verified. `LISTN_STANDALONE=0` points at `.venv/bin/listn` instead. The script prints `du -sh` and writes `Contents/Resources/SIZE.txt` before signing.
+**Icon and packaging.** `macos/scripts/build-app.sh` builds `Listn.app` with the Command Line Tools and by default copies a private Python environment into `Contents/Resources/python`. The base interpreter is found by resolving `.venv/bin/python` through its symlinks (uv's `cpython-3.13-…` folder is a symlink to the patch release). Its `bin` and `lib` go to `python/prefix`, the venv's packages go into `prefix/lib/python3.X/site-packages`, and `listn` is copied in so nothing points back at the checkout. Bytecode is compiled at build time, and the launcher sets `PYTHONDONTWRITEBYTECODE` so nothing is written into the signed bundle at run time. Every Mach-O file is signed, then the app, then the whole bundle is verified. `LISTN_STANDALONE=0` points at `.venv/bin/listn` instead. The diarize extra is required for the standalone app: the script stops if `.venv` lacks pyannote.audio, and after bundling runs `listn speakers --check` from the bundled Python (an import check only, no model and no network). `LISTN_WITHOUT_SPEAKERS=1` builds without it. The script prints `du -sh` and writes `Contents/Resources/SIZE.txt` before signing.
 
-What that size is: the Swift app plus the interpreter and the installed wheels. Without the MLX extra that is often a few hundred MB. With `uv sync --extra mlx --extra llm` it is commonly 1–3 GB, because the MLX wheels are large. Whisper `large-v3-turbo` (about 1.6 GB) and Qwen2.5-7B-Instruct 4-bit (about 4.3 GB) stay in `~/.cache/huggingface` and are not inside the app. This Linux checkout cannot produce the signed Mac bundle, so confirm the number on the Mac with the script.
+What that size is: the Swift app plus the interpreter and the installed wheels. Without the MLX extra that is often a few hundred MB. With `uv sync --extra mlx --extra llm` it is commonly 1–3 GB, because the MLX wheels are large. The diarize extra adds about 65 MB of wheels, roughly 230 MB installed (pandas, scikit-learn, matplotlib, torchaudio, lightning and pyannote; torch itself is already there for mlx-whisper). Whisper `large-v3-turbo` (about 1.6 GB) and Qwen2.5-7B-Instruct 4-bit (about 4.3 GB) stay in `~/.cache/huggingface` and are not inside the app. This Linux checkout cannot produce the signed Mac bundle, so confirm the number on the Mac with the script.
 
 A dropped input device is reopened. The menu bar also restarts the process tap when the audio device list changes, and reconnects the capture socket if the engine process disappears.
 
@@ -216,7 +238,8 @@ sessions/<id>/transcript.json
 sessions/<id>/audio.wav             # mix for playback
 sessions/<id>/audio-system.wav      # Others
 sessions/<id>/audio-mic.wav         # Me
-speakers/<name>.json            # voice profile, no model download
+speakers/<name>.json            # voice prints, one per method
+speakers/clips/<name>/*.wav     # the clips they were made from
 ```
 
 Legacy and file recordings are a single `audio.wav` (or the imported file). Recordings are 16 kHz 16-bit WAV. Turn off *Keep the audio recording* in the web UI if you only want text. Models are cached in `~/.cache/huggingface`.
@@ -243,9 +266,9 @@ listn/
   devices.py      device discovery; BlackHole guidance is legacy-only
   audio.py        mixing, resampling, chunking, WAV
   transcriber.py  faster-whisper / MLX / openai-whisper
-  diarize.py      optional pyannote, whole recording
+  diarize.py      pyannote 4 speaker labels, community-1 then 3.1
   library.py      sessions, search, export
-  speakers.py     local voice profiles
+  speakers.py     voice prints (WeSpeaker, spectrum fallback)
   retention.py    delete old audio, keep text
   power.py        battery model choice and free-space check
   bundle.py       copy Python into the .app

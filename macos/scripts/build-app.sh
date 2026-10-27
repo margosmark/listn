@@ -54,19 +54,35 @@ fi
 # The default app carries its own interpreter and site-packages, so opening
 # it needs neither this checkout nor uv. Model files stay in ~/.cache/huggingface.
 # LISTN_STANDALONE=0 points at .venv/bin/listn instead.
+#
+# Speaker labels (pyannote.audio 4 + torch, the "diarize" extra) are part of
+# the app. LISTN_WITHOUT_SPEAKERS=1 builds without them; the app then says
+# so in Settings and keeps Me / Others only.
+SYNC_HINT="uv sync --extra mlx --extra llm --extra diarize"
 if [[ "${LISTN_STANDALONE:-1}" == "1" ]]; then
   PY="$ROOT/.venv/bin/python"
-  [[ -x "$PY" ]] || fail "No $PY. Run: uv sync --extra mlx --extra llm (or set LISTN_STANDALONE=0)."
+  [[ -x "$PY" ]] || fail "No $PY. Run: $SYNC_HINT (or set LISTN_STANDALONE=0)."
+  if [[ "${LISTN_WITHOUT_SPEAKERS:-0}" != "1" ]]; then
+    "$PY" -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('pyannote.audio') and importlib.util.find_spec('torch') else 1)" \
+      || fail "The diarize extra is not installed in .venv. Run: $SYNC_HINT (or set LISTN_WITHOUT_SPEAKERS=1)."
+  fi
   echo "Bundling Python into the app (models are not copied)"
   PYDEST="$NEW/Contents/Resources/python"
   "$PY" -m listn.bundle --venv "$ROOT/.venv" --project "$ROOT" --dest "$PYDEST" || fail "Bundling Python failed."
   "$PYDEST/bin/listn" --version >/dev/null || fail "The bundled engine does not start."
+  if [[ "${LISTN_WITHOUT_SPEAKERS:-0}" != "1" ]]; then
+    # Imports pyannote and torch from the bundle. No model is loaded and nothing is downloaded.
+    "$PYDEST/bin/listn" speakers --check >/dev/null || fail "pyannote.audio does not import from the bundled Python."
+    echo "Speaker labels: pyannote.audio and torch are bundled"
+  fi
   printf '%s\n' "python/bin/listn" > "$NEW/Contents/Resources/engine.path"
   echo "Signing $(wc -l < "$PYDEST/macho.txt" | tr -d ' ') Mach-O files inside the bundled Python"
   ( cd "$PYDEST" && tr '\n' '\0' < macho.txt | xargs -0 -n 64 codesign --force --sign "$IDENTITY" --timestamp=none ) \
     || fail "Signing the bundled Python failed."
 else
   ENGINE="$ROOT/.venv/bin/listn"
+  "$ROOT/.venv/bin/python" -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('pyannote.audio') else 1)" 2>/dev/null \
+    || echo "Note: .venv has no diarize extra, so speaker labels are off. Run: $SYNC_HINT" >&2
   if [[ -x "$ENGINE" ]]; then
     printf '%s\n' "$ENGINE" > "$NEW/Contents/Resources/engine.path"
     echo "Engine: $ENGINE"

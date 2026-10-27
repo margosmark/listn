@@ -128,7 +128,7 @@ function renderSettings() {
   if (document.activeElement !== $("#retention-days")) {
     $("#retention-days").value = s.audio_retention_days ?? 0;
   }
-  const threshold = Number(s.speaker_threshold ?? 0.72);
+  const threshold = Number(s.speaker_threshold ?? 0.55);
   $("#speaker-threshold").value = threshold;
   $("#speaker-threshold-label").textContent = threshold.toFixed(2);
   if (document.activeElement !== $("#vocabulary")) {
@@ -137,16 +137,59 @@ function renderSettings() {
   if (document.activeElement !== $("#llm-model")) $("#llm-model").value = s.llm_model || "";
   $("#chunk").value = s.chunk_seconds;
   $("#chunk-label").textContent = `${s.chunk_seconds}s`;
-  $("#hf-token-state").textContent = s.hf_token ? "A token is saved (or HF_TOKEN is set)." : "Not set. Only needed the first time you label speakers.";
+  $("#hf-token-state").textContent = s.hf_token
+    ? "A token is saved (or HF_TOKEN is set). It is sent only to Hugging Face, for the one-time model download."
+    : "Not set. Only needed for the first speaker-model download.";
   $("#data-dir").textContent = st.data_dir;
-  const diarHint = !st.diarization_available
-    ? "Needs the optional diarization extra: pip install 'listn[diarize]'."
-    : (!s.hf_token ? "First use downloads the pyannote model; add a Hugging Face token in Settings." : "");
+  const diar = st.diarization || { installed: st.diarization_available, ready: false, message: "" };
+  $("#speaker-model-state").textContent = diar.message || "";
+  let diarHint = diar.message || "";
+  if (diar.installed && diar.ready) {
+    diarHint = s.diarize_after
+      ? `After you stop, Others is split into Speaker 1, Speaker 2… Me stays Me. ${diar.cached || diar.loaded ? "The model loads offline." : diar.message}`
+      : "Speaker labels are off. You can still label a saved session from the library.";
+    if (s.diarize_after_auto) diarHint += " (Automatic: on while a token is set or the model is cached.)";
+  }
   $("#diarize-hint").textContent = diarHint;
-  $("#file-diarize-hint").textContent = diarHint;
-  $("#diarize-after").disabled = !st.diarization_available;
-  $("#file-diarize").disabled = !st.diarization_available;
+  $("#file-diarize-hint").textContent = diar.installed ? (diar.ready ? "" : diar.message) : diar.message;
+  $("#diarize-after").disabled = !diar.installed;
+  $("#file-diarize").disabled = !diar.installed || !diar.ready;
+  if (!$("#file-diarize").dataset.touched) $("#file-diarize").checked = !!(s.diarize_after && diar.ready);
 }
+
+async function loadVoices() {
+  const box = $("#voices");
+  try {
+    const data = await api("GET", "/api/speakers");
+    $("#speaker-threshold-hint").textContent = data.neural
+      ? `Cosine similarity of ${data.method_label} voice prints. 0.55 is calibrated; a name also needs a ${data.margin.toFixed(2)} lead over the next voice. Higher means fewer wrong names.`
+      : "The voice model isn't loaded yet, so matching uses the rough spectrum fallback (threshold 0.72). It switches over after the first speaker labelling.";
+    $("#reenroll-btn").disabled = !data.neural;
+    if (!data.speakers.length) {
+      box.replaceChildren(el("small", { class: "muted", text: "None yet. Name a speaker in a saved session and listn will recognise them next time." }));
+      return;
+    }
+    box.replaceChildren(...data.speakers.map(p => el("div", { class: "voice" },
+      el("span", { text: p.name }),
+      el("small", { class: "muted", text: `${p.clips} sample${p.clips === 1 ? "" : "s"}` }),
+      p.needs_reenroll ? el("small", { class: "badge warn", text: p.saved_clips ? "re-learn" : "name again in a meeting" }) : null,
+      el("button", { type: "button", class: "btn ghost small", text: "Forget", onclick: async () => {
+        if (!confirm(`Forget ${p.name}'s voice and its saved clips?`)) return;
+        try { await api("DELETE", `/api/speakers/${encodeURIComponent(p.name)}`); loadVoices(); }
+        catch (err) { toast(err.message, "error"); }
+      } }))));
+  } catch (err) { box.replaceChildren(el("small", { class: "muted", text: err.message })); }
+}
+$("#reenroll-btn").addEventListener("click", async () => {
+  try {
+    const r = await api("POST", "/api/speakers/reenroll");
+    toast(r.needs_reenroll.length
+      ? `Re-learned ${r.reenrolled.length}. Name ${r.needs_reenroll.join(", ")} again in a meeting.`
+      : `Re-learned ${r.reenrolled.length} voice${r.reenrolled.length === 1 ? "" : "s"}.`);
+    loadVoices();
+  } catch (err) { toast(err.message, "error"); }
+});
+$("#file-diarize").addEventListener("change", e => { e.target.dataset.touched = "1"; });
 
 async function saveSetting(key, value) {
   try {
@@ -187,7 +230,7 @@ $("#hf-token").addEventListener("change", e => {
   e.target.value = "";
   saveSetting("hf_token", v || null);
 });
-$("#settings-btn").addEventListener("click", () => $("#settings-dialog").showModal());
+$("#settings-btn").addEventListener("click", () => { loadVoices(); $("#settings-dialog").showModal(); });
 $("#vocabulary").addEventListener("change", e => {
   const words = e.target.value.split("\n").map(s => s.trim()).filter(Boolean);
   saveSetting("vocabulary", words);
@@ -377,8 +420,10 @@ function renderJobs() {
   const box = $("#jobs");
   if (!state.jobs.size) { box.replaceChildren(el("p", { class: "muted empty-small", text: "No files in progress." })); return; }
   box.replaceChildren(...[...state.jobs.values()].map(j => {
-    const indeterminate = ["queued", "waiting", "decoding", "loading-model", "speakers"].includes(j.stage) || !STAGES[j.stage];
-    const label = STAGES[j.stage] || j.stage;
+    const speakerStep = j.stage === "speakers";
+    const indeterminate = ["queued", "waiting", "decoding", "loading-model"].includes(j.stage)
+      || (speakerStep && !(j.progress > 0.03)) || !STAGES[j.stage];
+    const label = speakerStep && j.detail ? j.detail : (j.kind === "speakers" && j.stage === "queued" ? "Queued for speaker labels" : (STAGES[j.stage] || j.stage));
     const done = j.stage === "done", failed = j.stage === "error";
     return el("div", { class: "job" },
       el("div", { class: "job-top" },
@@ -389,7 +434,7 @@ function renderJobs() {
       el("div", { class: `progress ${indeterminate && !done && !failed ? "indeterminate" : ""}` },
         el("div", { style: `width:${Math.round((j.progress || 0) * 100)}%` })),
       el("span", { class: failed ? "small-text" : "muted small-text", style: failed ? "color:var(--danger)" : null,
-        text: failed ? (j.error || "Failed") : done ? "Done" : `${label}${j.stage === "transcribing" ? ` · ${Math.round(j.progress * 100)}%` : ""}` }));
+        text: failed ? (j.error || "Failed") : done ? "Done" : `${label}${j.stage === "transcribing" || (speakerStep && j.progress > 0.03) ? ` · ${Math.round(j.progress * 100)}%` : ""}` }));
   }));
 }
 
@@ -466,8 +511,14 @@ async function openSession(id, seekAt) {
   } });
   const busy = meta.status === "transcribing" || meta.status === "recording";
   const retrans = has_audio ? el("button", { class: "btn ghost small", text: "Retranscribe", disabled: busy, onclick: () => retranscribe(id, false) }) : null;
-  const speakersBtn = has_audio && state.status.diarization_available
-    ? el("button", { class: "btn ghost small", text: meta.diarized ? "Relabel speakers" : "Label speakers", disabled: busy, onclick: () => retranscribe(id, true) }) : null;
+  const diar = state.status.diarization || {};
+  const speakerJob = state.jobs.get(id);
+  const labelling = ["queued", "running"].includes(meta.speaker_state) && speakerJob && !["done", "error"].includes(speakerJob.stage);
+  const speakersBtn = has_audio && diar.installed
+    ? el("button", { class: "btn ghost small", text: meta.diarized ? "Label speakers again" : "Label speakers",
+      disabled: busy || labelling || !diar.ready, title: diar.ready ? "Split Others into Speaker 1, Speaker 2… (Me stays Me)" : diar.message,
+      onclick: () => labelSpeakers(id) }) : null;
+  const speakerLine = speakerStatus(meta, speakerJob, diar, has_audio);
   const reveal = el("button", { class: "btn ghost small", text: "Show in Finder", onclick: async () => {
     const r = await api("POST", `/api/sessions/${id}/reveal`);
     if (!r.ok) toast(r.path);
@@ -490,19 +541,26 @@ async function openSession(id, seekAt) {
     meta.warning ? el("div", { class: "note warn", text: meta.warning }) : null,
     meta.audio_removed ? el("div", { class: "note", text: "The audio was deleted by the retention rule. The transcript and notes are still here." }) : null,
     audio,
+    speakerLine,
     el("div", { class: "detail-actions" }, exportMenu, copyBtn, retrans, speakersBtn, el("span", { class: "sep" }), reveal, del));
 
-  const speakerIds = [...new Set(segments.map(s => s.speaker).filter(Boolean))];
+  const speakerIds = [...new Set(segments.map(s => s.speaker).filter(Boolean))].filter(sid => sid !== "Me");
   if (speakerIds.length) {
     const names = { ...meta.speakers };
     head.append(el("div", { class: "speakers" }, ...speakerIds.map(sid => {
-      const inp = el("input", { type: "text", value: names[sid] || sid });
+      const inp = el("input", { type: "text", value: names[sid] || sid, maxlength: "60" });
+      const match = (meta.speaker_matches || {})[sid];
       inp.addEventListener("change", async () => {
-        names[sid] = inp.value.trim() || sid;
-        await api("PATCH", `/api/sessions/${id}`, { speakers: names });
-        openSession(id);
+        const person = inp.value.trim();
+        if (!person || person === (names[sid] || sid)) return;
+        try {
+          const r = await api("POST", `/api/sessions/${id}/speakers/name`, { label: sid, name: person });
+          toast(r.profile ? `${person} will be recognised in future meetings` : (r.note || `Renamed to ${person}`));
+          openSession(id);
+        } catch (err) { toast(err.message, "error"); }
       });
-      return el("label", {}, "Rename", inp);
+      return el("label", { title: match && match.name ? `Recognised by voice (score ${match.score})` : null },
+        sid === "Others" ? "Rename Others" : "Who is this?", inp);
     })));
   }
 
@@ -620,6 +678,56 @@ function renderNotes(id, notes, busy) {
   return box;
 }
 
+const SPEAKER_STATES = {
+  queued: "Speaker labels are queued.",
+  running: "Identifying speakers…",
+  cancelled: "Speaker labelling was cancelled.",
+};
+
+function speakerStatus(meta, job, diar, hasAudio) {
+  const active = job && job.kind === "speakers" || (job && job.stage === "speakers");
+  if (active && !["done", "error"].includes(job.stage)) {
+    const box = el("div", { class: "note speaker-progress", id: "speaker-progress" },
+      el("span", { class: "speaker-progress-text" }),
+      el("div", { class: "progress" }, el("div", {})),
+      el("button", { class: "btn ghost small", text: "Cancel", onclick: () => api("POST", `/api/jobs/${meta.id}/cancel`).catch(e => toast(e.message, "error")) }));
+    paintSpeakerProgress(box, job);
+    return box;
+  }
+  const text = meta.speaker_note || SPEAKER_STATES[meta.speaker_state];
+  if (text) return el("div", { class: `note ${["error", "skipped"].includes(meta.speaker_state) ? "warn" : ""}`, text });
+  if (hasAudio && diar.installed && !diar.ready && !meta.diarized) return el("div", { class: "note", text: diar.message });
+  return null;
+}
+
+async function labelSpeakers(id) {
+  try {
+    const job = await api("POST", `/api/sessions/${id}/diarize`);
+    state.jobs.set(job.id, job);
+    renderJobs();
+    toast("Identifying speakers on the Others track…");
+    openSession(id);
+  } catch (err) { toast(err.message, "error"); }
+}
+
+function paintSpeakerProgress(box, job) {
+  const pct = Math.round((job.progress || 0) * 100);
+  box.querySelector(".speaker-progress-text").textContent = `${job.detail || "Identifying speakers"}${pct > 3 ? ` · ${pct}%` : ""}`;
+  const bar = box.querySelector(".progress");
+  bar.classList.toggle("indeterminate", pct <= 3);
+  bar.firstElementChild.style.width = `${pct}%`;
+}
+
+function refreshSpeakerProgress(job) {
+  if (state.selected !== job.id) return;
+  const box = $("#speaker-progress");
+  if (box) paintSpeakerProgress(box, job);
+  else if (state.speakerViewFor !== job.id) {
+    state.speakerViewFor = job.id;
+    openSession(job.id);
+  }
+}
+
 async function retranscribe(id, diarize) {
   try {
     const job = await api("POST", `/api/sessions/${id}/retranscribe`, { diarize });
@@ -671,11 +779,23 @@ function connectEvents() {
       case "summary.ready":
         if (state.selected === ev.session) openSession(ev.session);
         break;
-      case "job.update": state.jobs.set(ev.job.id, { ...state.jobs.get(ev.job.id), ...ev.job }); renderJobs(); break;
+      case "job.update":
+        state.jobs.set(ev.job.id, { ...state.jobs.get(ev.job.id), ...ev.job });
+        renderJobs();
+        if (ev.job.stage === "speakers") refreshSpeakerProgress(ev.job);
+        break;
+      case "speakers.skipped":
+        toast(ev.message, "error");
+        if (state.selected === ev.session) openSession(ev.session);
+        break;
       case "job.done":
         state.jobs.set(ev.job.id, { ...ev.job, stage: ev.error ? "error" : "done", error: ev.error });
         renderJobs();
-        if (ev.error && ev.error !== "Cancelled.") toast(`${ev.job.title}: ${ev.error}`, "error");
+        if (ev.job.kind === "speakers") {
+          if (ev.error && ev.error !== "Cancelled.") toast(`${ev.job.title}: ${ev.error}`, "error");
+          else if (!ev.error) toast(`${ev.job.title}: ${ev.meta.speaker_note || "speakers labelled"}`);
+        }
+        else if (ev.error && ev.error !== "Cancelled.") toast(`${ev.job.title}: ${ev.error}`, "error");
         else if (!ev.error) toast(`${ev.job.title} is ready`);
         if ($("#view-library").classList.contains("active")) loadSessions();
         if (state.selected === ev.job.id) openSession(ev.job.id);

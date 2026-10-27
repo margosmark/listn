@@ -125,6 +125,8 @@ def cmd_live(args) -> int:
                 return 1
         elif kind == "live.stopped":
             break
+    if session.meta.id in engine.jobs:
+        _follow_speaker_job(engine, q, session.meta.id)
     meta = engine.library.get(session.meta.id)
     print(f"\nSaved session {meta.id} ({fmt_clock(meta.duration)}) in {engine.library.root / meta.id}")
     if args.output:
@@ -179,6 +181,106 @@ def cmd_transcribe(args) -> int:
             sys.stdout.write(text)
         print(f"Saved to library as {meta.id}", file=sys.stderr)
     return status
+
+
+def _follow_speaker_job(engine, q, session_id: str) -> str | None:
+    """Print speaker-labelling progress until the job ends. Returns its error, if any."""
+    last = None
+    while True:
+        try:
+            event = q.get(timeout=1.0)
+        except Exception:
+            if session_id not in engine.jobs:
+                return None
+            continue
+        if event.get("job", {}).get("id") != session_id:
+            continue
+        if event["type"] == "job.update":
+            job = event["job"]
+            line = f"Speakers: {job.get('detail') or job['stage']} {int(job['progress'] * 100)}%"
+            if line != last:
+                last = line
+                print(f"\r{line}   ", end="", file=sys.stderr, flush=True)
+        elif event["type"] == "job.done":
+            print(file=sys.stderr)
+            return event["error"]
+
+
+def cmd_diarize(args) -> int:
+    from listn import diarize
+    from listn.engine import Engine
+
+    settings = _settings_from(args)
+    if not diarize.installed():
+        print(diarize.INSTALL_HINT, file=sys.stderr)
+        return 3
+    engine = Engine()
+    q = engine.bus.subscribe()
+    try:
+        engine.enqueue_speakers(args.id, settings)
+    except KeyError:
+        print(f"No session '{args.id}'. Run `listn list`.", file=sys.stderr)
+        return 1
+    except (RuntimeError, FileNotFoundError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    error = _follow_speaker_job(engine, q, args.id)
+    meta = engine.library.get(args.id)
+    if error:
+        print(meta.speaker_note or error, file=sys.stderr)
+        return 1 if meta.speaker_state == "error" else 3
+    print(meta.speaker_note or "Speakers labelled.")
+    for label, shown in (meta.speakers or {}).items():
+        if label in ("Me", "Others"):
+            continue
+        found = (meta.speaker_matches or {}).get(label) or {}
+        score = f"  (voice match {found['score']:.2f})" if found.get("name") and found.get("score") is not None else ""
+        print(f"  {shown}{score}")
+    return 0
+
+
+def cmd_speakers(args) -> int:
+    import json
+
+    from listn import diarize
+    from listn.speakers import SpeakerBook, voice_embedder
+
+    settings = Settings.load()
+    if args.check:
+        report = diarize.readiness(settings.resolved_hf_token())
+        if report["installed"]:
+            try:
+                diarize.telemetry_off()
+                import pyannote.audio
+                import torch
+
+                report["pyannote"] = pyannote.audio.__version__
+                report["torch"] = torch.__version__
+                report["device"] = diarize.pick_device().type
+            except Exception as exc:
+                report["import_error"] = str(exc)
+        report.pop("terms", None)
+        print(json.dumps(report, indent=2))
+        if not report["installed"]:
+            return 3
+        return 1 if "import_error" in report else 0
+    book = SpeakerBook(embedder=voice_embedder(settings.resolved_hf_token(), allow_download=args.reenroll))
+    if args.reenroll:
+        if not book.embedder.neural:
+            print("The voice model could not be loaded, so profiles stay on the spectrum fallback.", file=sys.stderr)
+            return 3
+        result = book.reenroll(Library())
+        print(f"Re-learned: {', '.join(result['reenrolled']) or 'none'}")
+        if result["needs_reenroll"]:
+            print(f"Name these again in a meeting: {', '.join(result['needs_reenroll'])}")
+    profiles = book.describe()
+    print(f"Voice method: {book.embedder.label}")
+    if not profiles:
+        print("No known voices yet. Name a speaker in the library to add one.")
+    for p in profiles:
+        flag = "  needs re-enrolment" if p["needs_reenroll"] else ""
+        print(f"  {p['name']:<30} {p['clips']} sample{'s' if p['clips'] != 1 else ''}{flag}")
+    return 0
 
 
 def cmd_list(args) -> int:
@@ -290,6 +392,16 @@ def build_parser() -> argparse.ArgumentParser:
     sm = sub.add_parser("summarize", help="Write a local summary, decisions, and action items")
     sm.add_argument("id")
     sm.set_defaults(func=cmd_summarize)
+
+    di = sub.add_parser("diarize", help="Label speakers on a saved session again (Others track only)")
+    di.add_argument("id")
+    di.add_argument("--hf-token", help="Hugging Face token for the one-time model download (or set HF_TOKEN)")
+    di.set_defaults(func=cmd_diarize)
+
+    sp = sub.add_parser("speakers", help="List known voices")
+    sp.add_argument("--reenroll", action="store_true", help="Re-learn profiles with the current voice model")
+    sp.add_argument("--check", action="store_true", help="Check the speaker model install without downloading")
+    sp.set_defaults(func=cmd_speakers)
     return p
 
 
