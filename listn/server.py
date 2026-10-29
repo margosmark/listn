@@ -86,6 +86,7 @@ class NotesIn(BaseModel):
     summary: str = ""
     decisions: list[str] = []
     actions: list[dict] = []
+    key_points: list[str] | None = None
 
 
 class PrivacyIn(BaseModel):
@@ -448,7 +449,8 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
         _meta(session_id)
         from listn.summary import edited_notes
 
-        notes = edited_notes(body.summary, body.decisions, body.actions, eng().library.notes(session_id))
+        notes = edited_notes(body.summary, body.decisions, body.actions, eng().library.notes(session_id),
+                             key_points=body.key_points)
         eng().library.save_notes(session_id, notes)
         return notes
 
