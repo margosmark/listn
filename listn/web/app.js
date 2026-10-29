@@ -195,6 +195,11 @@ async function saveSetting(key, value) {
   try {
     state.settings = await api("PUT", "/api/settings", { [key]: value });
     state.status = await api("GET", "/api/status");
+    if (state.status.platform === "linux") {
+      $("#capture-help").textContent = "This page records one selected input only. Separate microphone and system tracks, KDE tray controls, and per-app capture are not implemented. A PipeWire monitor may be available depending on your audio setup.";
+      ["#offer-meetings", "#auto-record", "#launch-at-login"].forEach(id => { $(id).closest("label").hidden = true; });
+      $("#privacy-open").hidden = true;
+    }
     renderSettings();
   } catch (err) { toast(err.message, "error"); }
 }
@@ -855,6 +860,11 @@ function connectEvents() {
 async function boot() {
   try {
     state.status = await api("GET", "/api/status");
+    if (state.status.platform === "linux") {
+      $("#capture-help").textContent = "This page records one selected input only. Separate microphone and system tracks, KDE tray controls, and per-app capture are not implemented. A PipeWire monitor may be available depending on your audio setup.";
+      ["#offer-meetings", "#auto-record", "#launch-at-login"].forEach(id => { $(id).closest("label").hidden = true; });
+      $("#privacy-open").hidden = true;
+    }
   } catch (err) {
     toast(`listn server unreachable: ${err.message}`, "error");
     return;

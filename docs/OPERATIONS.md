@@ -20,6 +20,6 @@ For local experiments, `LISTN_DATA_DIR` overrides the default storage directory.
 
 ## Linux / KDE status
 
-There is **no supported Linux/KDE installation or capture workflow yet**. The Python CLI entry point and Linux data-directory selection can start independently of the macOS UI, but real file transcription and desktop audio capture must be tested with installed dependencies and actual hardware. The current macOS management script is not a Linux installer.
+The README documents the initial Linux Python CLI and local web workflow. Synthetic speech has been transcribed on Linux with faster-whisper CPU; CachyOS/KDE and physical devices have not been tested. The live input path is single-input only and does not provide separate system and microphone tracks. The current macOS management script is not a Linux installer.
 
 Before implementing Linux capture, establish the target Plasma session, PipeWire/PulseAudio setup, input/output devices and GPU on the intended machine. Verify real microphone and playback samples separately, changing default devices, silence/failure reporting, pause/resume and private storage; record the test environment and actual results. Tests must not rely on real user recordings.

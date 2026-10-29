@@ -37,7 +37,8 @@ def test_unknown_device_is_device_error():
         open_input("Zoom Audio", lambda *a: None, sd=FakeSD(MAC_DEVICES))
 
 
-def test_measure_levels_ok_and_silent():
+def test_measure_levels_ok_and_silent(monkeypatch):
+    monkeypatch.setattr("sys.platform", "darwin")
     sd = FakeSD(MAC_DEVICES)
     report = measure_levels("BlackHole", seconds=0.3, sd=sd)
     assert report["verdict"] == "ok"
