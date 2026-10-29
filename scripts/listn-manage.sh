@@ -256,6 +256,32 @@ quit_app() {
       fi
     fi
   fi
+  stop_engine
+}
+
+engine_pids() {
+  pgrep -f "$APP_NAME/Contents/Resources/python.* -m listn ui" 2>/dev/null || true
+}
+
+# The menu bar app starts the engine but an engine can outlive it, and a new
+# app attaches to whatever engine is already listening. Stop it so the next
+# launch runs the code that was just installed.
+stop_engine() {
+  local pids; pids="$(engine_pids)"
+  [[ -n "$pids" ]] || return 0
+  say "Stopping the listn engine"
+  # shellcheck disable=SC2086
+  run kill $pids || true
+  if [[ "$DRY_RUN" != "1" ]]; then
+    local _
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      [[ -n "$(engine_pids)" ]] || return 0
+      sleep 0.5
+    done
+    warn "The engine did not stop in 5 seconds; forcing it"
+    # shellcheck disable=SC2046
+    kill -9 $(engine_pids) 2>/dev/null || true
+  fi
 }
 
 reset_permissions() {
@@ -339,7 +365,7 @@ cmd_start() {
 
 cmd_stop() {
   require_macos
-  if app_running; then quit_app; ok "Stopped"; else ok "listn is not running"; fi
+  if app_running || [[ -n "$(engine_pids)" ]]; then quit_app; ok "Stopped"; else ok "listn is not running"; fi
 }
 
 cmd_restart() { cmd_stop; cmd_start; }
