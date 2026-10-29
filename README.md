@@ -10,7 +10,111 @@ The menu bar app does not transcribe. It feeds audio to the Python engine, which
 
 ---
 
+## Contents
+
+- [Quick start](#quick-start)
+- [Managing listn](#managing-listn): install, update, start and stop, status, logs, permissions, signing, uninstall
+- [Install (macOS)](#install-macos) (the manual steps the script runs)
+- [Menu bar app](#menu-bar-app)
+- [Web UI and CLI](#web-ui-and-cli)
+- [Models and backends](#models-and-backends)
+- [Notes](#notes) and [Ask your meetings](#ask-your-meetings)
+- [How capture is split](#how-capture-is-split)
+- [Speaker labels](#speaker-labels) and [Known voices](#known-voices)
+- [Privacy, pause, and a self-contained app](#privacy-pause-and-a-self-contained-app)
+- [Where your data lives](#where-your-data-lives) and [Backup](#backup)
+- [Development](#development)
+- [On a Mac, before you trust it](#on-a-mac-before-you-trust-it)
+- [Troubleshooting](#troubleshooting)
+
+## Quick start
+
+On an Apple Silicon Mac with macOS 14.2 or later:
+
+```bash
+xcode-select --install          # Command Line Tools (Swift, codesign), if you don't have them
+brew install uv                 # https://brew.sh first, if you don't have Homebrew
+git clone git@github.com:margosmark/listn.git
+cd listn
+scripts/listn-manage.sh first-run
+```
+
+`first-run` checks the prerequisites, installs the Python environment, runs the tests, builds `Listn.app`, copies it to `/Applications` and opens it. Click the waveform icon in the menu bar, start a recording, and allow **Microphone** and **System Audio Recording** when macOS asks.
+
+For speaker labels, also do the one-time [Hugging Face setup](#speaker-labels): accept the model terms, make a read token, and paste it in Settings.
+
+## Managing listn
+
+Everything goes through `scripts/listn-manage.sh` (or the same names with `make`, for example `make install`). Run it with no arguments for the full list. Every command can be run again safely, and `--dry-run` prints what it would do without changing anything.
+
+| Task | Command |
+|---|---|
+| Check prerequisites | `scripts/listn-manage.sh doctor` |
+| Install or refresh the Python environment | `scripts/listn-manage.sh setup` (add `--extras mlx,llm` to leave out speaker labels, or `--extras none` for the minimum) |
+| Run the tests | `scripts/listn-manage.sh test` |
+| Build `macos/Listn.app` only | `scripts/listn-manage.sh build` |
+| Build and install into `/Applications` | `scripts/listn-manage.sh install` |
+| Pull the latest code and reinstall | `scripts/listn-manage.sh update` |
+| Start, quit, restart the app | `scripts/listn-manage.sh start`, `stop`, `restart` |
+| See what's installed and running | `scripts/listn-manage.sh status` |
+| Follow a log | `scripts/listn-manage.sh logs` (engine), `logs capture`, `logs selftest` |
+| Make macOS ask for permissions again | `scripts/listn-manage.sh reset-permissions` |
+| Keep permissions across rebuilds | `scripts/listn-manage.sh signing-cert` (once) |
+| Remove the app | `scripts/listn-manage.sh uninstall` |
+
+### Install and update
+
+`install` builds with `macos/scripts/build-app.sh`, verifies the signature, quits the running app, replaces `/Applications/Listn.app` with `ditto`, and opens the new one. `install --no-build` installs the app you already built without rebuilding it.
+
+`update` refuses to run with uncommitted changes, then does `git pull --ff-only`, `setup`, `test`, and `install`. Pass `--skip-tests` to save a minute.
+
+The installed app is self-contained: it carries its own Python and packages, so it keeps working if you move or delete the checkout. Models stay in `~/.cache/huggingface` and are not part of the app.
+
+### Status
+
+`status` prints the checkout version and commit, the installed and built app versions, who signed the app and whether the signature is valid, whether the menu bar app and the engine (`http://127.0.0.1:8765/api/status`) are running, the speaker-label check (`listn speakers --check`: pyannote installed, token present, model downloaded), the size of the data folder and model cache, and how many sessions you have.
+
+### Permissions and signing
+
+macOS ties the Microphone and System Audio Recording grants to the app's signature. By default the app is ad-hoc signed, and every rebuild has a new signature, so after an install the old grants no longer match and recordings can come back silent. Because of that, `install` resets both grants whenever the build is ad-hoc signed, and macOS asks again on your next recording. Allow both.
+
+To stop that, create a signing certificate once:
+
+```bash
+scripts/listn-manage.sh signing-cert
+scripts/listn-manage.sh install --reset-permissions
+```
+
+`signing-cert` makes a self-signed code-signing certificate called `listn local` in your login keychain (macOS may ask for your password to trust it). It never leaves the Mac. From then on `build` and `install` sign with it automatically, the grants survive rebuilds, and `install` stops resetting them. The `--reset-permissions` on the first install is needed once, because the signature changed from ad-hoc. To sign with something else, set `LISTN_SIGN_IDENTITY`. To go back to ad-hoc, delete the certificate in Keychain Access.
+
+If you ever need macOS to ask again (you clicked Don't Allow, or recordings are silent), run `scripts/listn-manage.sh reset-permissions` and start a recording. You can also check by hand under System Settings, Privacy & Security, in **Microphone** and in **Screen & System Audio Recording**.
+
+### Uninstall
+
+```bash
+scripts/listn-manage.sh uninstall                    # quits and removes the app, keeps your data
+scripts/listn-manage.sh uninstall --purge-data       # also deletes recordings, transcripts, voice prints (asks first)
+scripts/listn-manage.sh uninstall --purge-models     # also deletes ~/.cache/huggingface (asks first)
+```
+
+`uninstall` also clears the permission grants. Your recordings are only deleted with `--purge-data`, and only after you type `y` (or pass `--yes`). The Hugging Face cache can hold models other tools use, so `--purge-models` deletes the whole folder only after asking. The checkout itself is never touched.
+
+### Where to change things
+
+| What | Where |
+|---|---|
+| Install location | `LISTN_INSTALL_DIR` (default `/Applications`) |
+| Data folder | `LISTN_DATA_DIR` (default `~/Library/Application Support/listn`) |
+| Signing identity | `LISTN_SIGN_IDENTITY` (default `listn local` if it exists, else ad-hoc) |
+| Build without speaker labels | `LISTN_WITHOUT_SPEAKERS=1 scripts/listn-manage.sh install` |
+| App points at the checkout's `.venv` instead of bundling Python | `LISTN_STANDALONE=0 scripts/listn-manage.sh install` |
+| Hugging Face token, models, thresholds, retention | Settings in the web UI (**Open library**, then Settings) |
+
+---
+
 ## Install (macOS)
+
+`scripts/listn-manage.sh first-run` does all of this. These are the manual steps.
 
 You need Python 3.10–3.13, Swift 6 (the Command Line Tools are enough; a full Xcode install is not), and [Homebrew](https://brew.sh). This was written for Apple Silicon. An M5 Pro with 48 GB is plenty for the default live model.
 
@@ -246,6 +350,17 @@ Legacy and file recordings are a single `audio.wav` (or the imported file). Reco
 
 The socket path has to fit in a Unix socket address (104 bytes on macOS, including the terminating NUL). The default path does. If `LISTN_DATA_DIR` is so deep that `capture.sock` would not fit, the engine listens on `$TMPDIR/listn-<uid>/capture.sock` when that is short enough, otherwise `/tmp/listn-<uid>/capture.sock`. That directory is mode 0700 and the socket is mode 0600. `server.json` stays in the data folder and records the real socket path.
 
+## Backup
+
+Everything personal is in the data folder: recordings, transcripts, notes, settings (including your Hugging Face token) and voice prints. Quit listn first, then copy it:
+
+```bash
+scripts/listn-manage.sh stop
+ditto "$HOME/Library/Application Support/listn" ~/listn-backup-$(date +%Y%m%d)
+```
+
+To restore, quit listn, put the folder back at the same path, and start it again. Time Machine also covers this folder. Models do not need backing up; they download again. Keep backups private: they hold your meetings.
+
 ## Development
 
 ```bash
@@ -316,6 +431,11 @@ This repo's tests do not open a process tap. On the Mac, check:
 - **The meter stays silent.** Confirm the meeting is actually playing, and that you did not pick a single app that is quiet. Tap auto-start is off so recording begins immediately; silence until someone speaks is normal.
 - **Legacy transcript is empty.** That path still needs BlackHole (or an aggregate) routed in Audio MIDI Setup. The menu-bar tap does not.
 - **Live lags.** Install the MLX extra, use `large-v3-turbo` rather than `large-v3`, or raise the chunk length in Settings.
+- **Not sure what state things are in.** Run `scripts/listn-manage.sh status`. It shows the installed version, whether the app and engine are running, the signature, and the speaker-label check.
+- **Recordings went silent right after an update.** The rebuild changed the ad-hoc signature. Run `scripts/listn-manage.sh reset-permissions`, record again and allow both prompts, or set up `signing-cert` so it stops happening.
+- **No speaker labels.** Run `scripts/listn-manage.sh status` and read the speaker-label lines. Usually the token is missing in Settings, or the model terms on Hugging Face were not accepted for the account the token belongs to.
+- **FFmpeg / `libavutil` errors from torchcodec during speaker labelling.** Harmless: the labels still come out, because listn hands pyannote the audio itself rather than having torchcodec decode the file.
+- **`update` says you have uncommitted changes.** Commit or `git stash` them, then run it again.
 - **Port 8765 is taken.** Quit the other listn (`engine.log` will say so). The menu bar will not attach to a pre-0.3 server that has no capture socket.
 
 MIT License.
