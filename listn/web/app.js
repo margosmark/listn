@@ -698,10 +698,27 @@ function renderNotes(id, notes, busy, audio) {
           toast("Notes saved");
         } catch (err) { toast(err.message, "error"); }
       } }),
-      el("button", { class: "btn ghost small", text: notes ? "Regenerate" : "Summarize", disabled: busy, onclick: async () => {
+      el("button", { class: "btn ghost small", text: notes ? "Regenerate" : "Summarize", disabled: busy, onclick: async (ev) => {
         if (notes?.edited && !confirm("Replace your edited notes with new ones from the transcript?")) return;
-        try { await api("POST", `/api/sessions/${id}/summary`); openSession(id); }
-        catch (err) { toast(err.message, "error"); }
+        const btn = ev.currentTarget;
+        const label = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = "Writing notes…";
+        box.classList.add("notes-busy");
+        toast("Writing notes with the local model. This can take up to a minute or two on a long meeting.");
+        const started = Date.now();
+        try {
+          const result = await api("POST", `/api/sessions/${id}/summary`);
+          const secs = Math.round((Date.now() - started) / 1000);
+          const n = (result && result.actions) ? result.actions.length : 0;
+          toast(`Notes updated in ${secs}s (${n} action item${n === 1 ? "" : "s"})`);
+          openSession(id);
+        } catch (err) {
+          toast(err.message, "error");
+          btn.disabled = false;
+          btn.textContent = label;
+          box.classList.remove("notes-busy");
+        }
       } })),
   );
   return box;
