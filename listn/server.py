@@ -193,6 +193,7 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
         e = eng()
         return {
             "version": __version__,
+            "platform": sys.platform,
             "settings": app.state.settings.public(),
             "models": MODELS,
             "backends": BACKENDS,

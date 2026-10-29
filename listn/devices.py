@@ -10,6 +10,8 @@ logic can be tested without audio hardware.
 
 from __future__ import annotations
 
+import sys
+
 from dataclasses import asdict, dataclass
 
 LOOPBACK_HINTS = ("blackhole", "loopback", "soundflower", "vb-cable", "aggregate")
@@ -167,6 +169,16 @@ def candidate_stream_configs(device: Device) -> list[tuple[int, float]]:
 
 def setup_guidance(devices: list[Device], output_name: str | None) -> list[dict]:
     """Human-readable checks about whether system-audio capture will work."""
+    if sys.platform.startswith("linux"):
+        inputs = [d for d in devices if d.inputs > 0]
+        return [{
+            "level": "warn" if inputs else "error",
+            "title": "Single-input capture" if inputs else "No input devices found",
+            "detail": ("The Live page records one input, not separate microphone and system tracks. "
+                       "Select a microphone or an exposed PipeWire monitor input and test its level; "
+                       "availability depends on PortAudio and your audio configuration. "
+                       "Separate-track capture and a KDE tray are not implemented."),
+        }]
     notes: list[dict] = []
     inputs = [d for d in devices if d.inputs > 0]
     has_blackhole = any(d.kind == "blackhole" for d in devices)

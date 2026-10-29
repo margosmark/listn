@@ -19,7 +19,7 @@
     <button role="tab" data-view="library" class="tab">Library</button>
   </nav>
   <div class="topbar-right">
-    <span class="local-badge" title="The server only listens on 127.0.0.1. Audio and transcripts never leave this Mac.">
+    <span class="local-badge" title="The server only listens on 127.0.0.1. Audio and transcripts stay on this computer.">
       <span class="dot"></span>Local only
     </span>
     <button class="icon-btn" id="settings-btn" aria-label="Settings" title="Settings">
@@ -111,7 +111,7 @@
           <div class="empty" id="live-empty">
             <svg viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"/><path d="M19 11a7 7 0 0 1-14 0M12 18v3"/></svg>
             <p>Press <strong>Start</strong> and the transcript will appear here as people speak.</p>
-            <p class="muted">Everyday capture is the menu bar app: system audio and your microphone, labelled Me and Others, with no BlackHole. This page records the input device selected on the left.</p>
+            <p class="muted" id="capture-help">Everyday capture is the menu bar app: system audio and your microphone, labelled Me and Others, with no BlackHole. This page records the input device selected on the left.</p>
           </div>
         </div>
         <div class="stage-foot">

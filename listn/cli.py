@@ -351,7 +351,7 @@ def cmd_summarize(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="listn", description="Local-only system audio transcription for macOS.")
+    p = argparse.ArgumentParser(prog="listn", description="Local-only audio transcription.")
     p.add_argument("--version", action="version", version=f"listn {__version__}")
     p.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     sub = p.add_subparsers(dest="command")
@@ -361,12 +361,12 @@ def build_parser() -> argparse.ArgumentParser:
     ui.add_argument("--no-browser", action="store_true", help="Don't open a browser tab")
     ui.set_defaults(func=cmd_ui)
 
-    dv = sub.add_parser("devices", help="List input devices and check BlackHole setup")
+    dv = sub.add_parser("devices", help="List input devices and setup guidance")
     dv.add_argument("--test", nargs="?", const="", metavar="DEVICE", help="Measure input level for 2 seconds")
     dv.set_defaults(func=cmd_devices)
 
     lv = sub.add_parser("live", help="Record and transcribe live in the terminal")
-    lv.add_argument("--device", help="Device name, part of a name, or index (default: BlackHole if present)")
+    lv.add_argument("--device", help="Device name, part of a name, or index (default: automatic)")
     lv.add_argument("--title")
     lv.add_argument("--chunk", type=float, metavar="SEC", help="Seconds per transcription chunk (2-30)")
     lv.add_argument("--no-audio", action="store_true", help="Don't keep the WAV recording")
