@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import queue
+import sys
 import time
 from dataclasses import dataclass
 
@@ -105,6 +106,10 @@ def measure_levels(selector, seconds: float = 2.0, sd=None) -> dict:
     else:
         verdict = "ok"
         advice = "Signal detected."
+    if sys.platform.startswith("linux") and verdict == "silent":
+        advice = "No signal. Check the selected input and its level in your audio settings; for a monitor input, play audio first."
+    elif sys.platform.startswith("linux") and verdict == "quiet":
+        advice = "Signal is faint. Check the selected input level in your audio settings."
     return {
         "device": opened.device.to_dict(),
         "channels": opened.channels,

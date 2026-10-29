@@ -1,6 +1,6 @@
 # listn
 
-**For contributors and agents:** [Agent guidance](AGENTS.md) · [Architecture](docs/ARCHITECTURE.md) · [Operations](docs/OPERATIONS.md) · [Decisions and Linux/KDE roadmap](docs/DECISIONS.md). Linux/KDE support is proposed, not yet implemented.
+**For contributors and agents:** [Agent guidance](AGENTS.md) · [Architecture](docs/ARCHITECTURE.md) · [Operations](docs/OPERATIONS.md) · [Decisions and Linux/KDE roadmap](docs/DECISIONS.md). Linux has a bounded Python CLI and local web workflow; separate-track Linux capture and KDE integration are not implemented.
 
 Private, local-only transcripts of what you hear on your Mac, and of audio files, using Whisper on the machine itself.
 
@@ -28,6 +28,38 @@ The menu bar app does not transcribe. It feeds audio to the Python engine, which
 - [Development](#development)
 - [On a Mac, before you trust it](#on-a-mac-before-you-trust-it)
 - [Troubleshooting](#troubleshooting)
+
+## Linux (CachyOS / KDE): bounded Python workflow
+
+The existing Python engine and local web library can run on Linux. This is an
+initial file-transcription workflow, not macOS feature parity. It has been
+exercised on Linux with synthetic speech, not on CachyOS or physical audio
+hardware. Install Python 3.10–3.13, `uv`, and the PortAudio system library
+(on Arch/CachyOS, package `portaudio`), then:
+
+```sh
+uv sync --group dev
+uv run pytest
+uv run listn transcribe /path/to/audio.wav --model tiny --backend faster-whisper
+uv run listn ui --no-browser
+# Open http://127.0.0.1:8765 on this machine
+```
+
+The first use of a Whisper model downloads weights from Hugging Face; after it
+is cached, inference is local. `tiny` is a small starting point, not necessarily
+accurate; choose a larger model as needed. The Files tab supports uploads and
+the Library tab browsing/export. The server is loopback-only. Data lives in
+`$XDG_DATA_HOME/listn` or `~/.local/share/listn` (override `LISTN_DATA_DIR`).
+
+Live/`listn live` records **one** PortAudio input, not independent microphone
+and system tracks. A PipeWire/PulseAudio monitor may be selectable if exposed
+by PortAudio; routing, permissions, device changes and audio quality need
+verification on the target desktop. Do not interpret its labels as reliable
+speaker identity. There is no Linux separate-track recorder, per-app capture,
+KDE tray, meeting detection or launch-at-login integration. Do not use the
+macOS management script on Linux. GPU acceleration is unverified; MLX-based
+notes are unavailable and the existing extractive fallback is used. See
+[operations](docs/OPERATIONS.md) for validation steps.
 
 ## Quick start
 

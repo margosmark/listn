@@ -11,7 +11,7 @@
 
 ## Proposed next phase — KDE Plasma / CachyOS
 
-Mark requested Linux desktop support focused on KDE, and raised the idea of a dashboard. **No implementation or platform parity is claimed.**
+Mark requested Linux desktop support focused on KDE, and raised the idea of a dashboard. The initial Python file and local web workflow is documented and exercised on Linux with synthetic audio; desktop capture parity is not claimed.
 
 1. Establish a reproducible Linux development and test path for file transcription and the existing web interface.
 2. Prototype microphone and system-output capture as separate tracks using the target desktop's audio stack. Verify permissions, device changes, silence, failure and pause handling on real hardware.

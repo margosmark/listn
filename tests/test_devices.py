@@ -67,25 +67,29 @@ def _titles(notes):
     return [n["title"] for n in notes]
 
 
-def test_guidance_missing_blackhole():
+def test_guidance_missing_blackhole(monkeypatch):
+    monkeypatch.setattr("sys.platform", "darwin")
     raw = [dev("MacBook Pro Microphone", 1), dev("MacBook Pro Speakers", 0, 2)]
     notes = devmod.setup_guidance(build(raw), "MacBook Pro Speakers")
     assert "No BlackHole needed" in _titles(notes)
     assert notes[0]["level"] == "ok"
 
 
-def test_guidance_missing_multi_output():
+def test_guidance_missing_multi_output(monkeypatch):
+    monkeypatch.setattr("sys.platform", "darwin")
     raw = [dev("MacBook Pro Microphone", 1), dev("BlackHole 2ch", 2, 2)]
     notes = devmod.setup_guidance(build(raw), "BlackHole 2ch")
     assert "No Multi-Output Device found" in _titles(notes)
 
 
-def test_guidance_output_not_routed():
+def test_guidance_output_not_routed(monkeypatch):
+    monkeypatch.setattr("sys.platform", "darwin")
     notes = devmod.setup_guidance(build(), "MacBook Pro Speakers")
     assert any("System output is" in t for t in _titles(notes))
 
 
-def test_guidance_ready():
+def test_guidance_ready(monkeypatch):
+    monkeypatch.setattr("sys.platform", "darwin")
     notes = devmod.setup_guidance(build(), "Multi-Output Device")
     assert [n["level"] for n in notes] == ["ok"]
 

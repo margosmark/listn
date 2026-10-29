@@ -54,7 +54,8 @@ def test_index_and_static(client):
     assert client.get("/static/app.js").status_code == 200
 
 
-def test_status_and_devices(client):
+def test_status_and_devices(client, monkeypatch):
+    monkeypatch.setattr("sys.platform", "darwin")
     st = client.get("/api/status").json()
     assert "small" in st["models"] and st["live"] is None
     devices = client.get("/api/devices").json()

@@ -22,8 +22,8 @@ The menu-bar capture application is macOS-specific and uses Core Audio. Its audi
 
 The web server is restricted to loopback, rejects non-loopback Host headers and checks origin for state-changing requests. The ingest socket is private to the user (0600 socket, 0700 data directory; an alternate short socket path is possible). These are security boundaries, not a substitute for a full multi-user authentication system. Data defaults to `~/Library/Application Support/listn` on macOS and `$XDG_DATA_HOME/listn` or `~/.local/share/listn` elsewhere; `LISTN_DATA_DIR` overrides it.
 
-## Proposed Linux / KDE direction — not implemented
+## Linux / KDE direction
 
-Start with CachyOS/Arch and KDE Plasma. Evaluate PipeWire capture for microphone and system output on distinct tracks and a KDE tray controller. Reuse the existing engine, local library and web UI where practical; evaluate whether the existing IPC contract is appropriate rather than presuming it is complete for Linux. A dashboard can extend the existing web UI for recording state, devices, transcripts and diagnostics; its design and scope are not yet approved.
+The Python file and web workflow has an initial Linux path, tested with synthetic speech; CachyOS/KDE hardware remains unverified. Start with CachyOS/Arch and KDE Plasma. Evaluate PipeWire capture for microphone and system output on distinct tracks and a KDE tray controller. Reuse the existing engine, local library and web UI where practical; evaluate whether the existing IPC contract is appropriate rather than presuming it is complete for Linux. A dashboard can extend the existing web UI for recording state, devices, transcripts and diagnostics; its design and scope are not yet approved.
 
 Linux system/per-app capture, tray integration, GPU acceleration and live transcription performance are **unverified**. `faster-whisper` is a core dependency; MLX extras target Apple Silicon. The local generative notes backend currently uses MLX; without it the existing extractive fallback applies. Avoid claiming Linux generative parity until a real local backend is built and tested.
