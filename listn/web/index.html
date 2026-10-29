@@ -225,7 +225,7 @@
     <label class="field">
       <span>Notes model <em class="muted">(MLX, downloaded once)</em></span>
       <input type="text" id="llm-model" data-setting="llm_model" spellcheck="false">
-      <small class="muted">Default is Qwen2.5-7B-Instruct 4-bit, about 4.3 GB. It runs after Whisper, so both fit in 48 GB. Without MLX, notes are extracted from the transcript instead.</small>
+      <small class="muted">Default is mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit (about 17 GB, fast because only 3B parameters are active). On a Mac with less memory use mlx-community/Qwen2.5-7B-Instruct-4bit (4.3 GB). The model unloads a few minutes after the notes are written. Without MLX, notes are extracted from the transcript instead.</small>
     </label>
     <label class="field">
       <span>Delete audio after <input type="number" id="retention-days" min="0" max="3650" step="1" data-setting="audio_retention_days"> days</span>

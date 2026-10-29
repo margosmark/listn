@@ -143,3 +143,13 @@ def fake_factory():
 
     factory.instances = instances
     return factory
+
+
+@pytest.fixture(autouse=True)
+def no_local_llm(monkeypatch):
+    """Never load a real MLX model in tests; tests pass a fake ``complete``."""
+    import listn.ask
+    import listn.summary
+
+    monkeypatch.setattr(listn.summary, "mlx_lm_available", lambda: False)
+    monkeypatch.setattr(listn.ask, "mlx_lm_available", lambda: False)

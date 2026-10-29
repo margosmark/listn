@@ -223,6 +223,12 @@ audio { width: 100%; height: 36px; }
 .notes h3 { margin: 0; font-size: 13px; }
 .notes-head { display: flex; justify-content: space-between; align-items: baseline; }
 .notes label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.notes-refs { font-size: 12px; color: var(--muted); }
+.notes-refs summary { cursor: pointer; }
+.notes-ref { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; color: var(--text); }
+.notes-ref .ts { font: 12px var(--mono); color: var(--muted); background: none; border: 0; padding: 0; min-width: 44px; text-align: left; }
+.notes-ref .ts.seek { cursor: pointer; color: var(--accent); }
+.notes-ref .tag { font-size: 11px; color: var(--muted); min-width: 56px; }
 .notes textarea { width: 100%; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px; resize: vertical; }
 .export-menu { position: relative; }
 .export-menu .menu { position: absolute; top: calc(100% + 4px); left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.12); padding: 4px; z-index: 10; min-width: 190px; }

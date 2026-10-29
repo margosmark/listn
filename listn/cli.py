@@ -334,12 +334,19 @@ def cmd_summarize(args) -> int:
     except KeyError:
         print(f"No session '{args.id}'.", file=sys.stderr)
         return 1
-    notes = write_notes(lib, args.id, Settings.load())
+    notes = write_notes(lib, args.id, Settings.load(), force=bool(getattr(args, "force", False)))
+    if notes.get("edited") and not getattr(args, "force", False):
+        print("(These notes were edited by hand; pass --force to regenerate.)", file=sys.stderr)
     print(notes["summary"])
+    for point in notes.get("key_points") or []:
+        print(f"Point: {point['text']}")
     for decision in notes["decisions"]:
         print(f"Decision: {decision}")
     for action in notes["actions"]:
-        print(f"Action ({action['owner']}): {action['text']}")
+        due = f" (due {action['due']})" if action.get("due") else ""
+        print(f"Action ({action['owner']}): {action['text']}{due}")
+    for question in notes.get("open_questions") or []:
+        print(f"Open: {question['text']}")
     return 0
 
 
@@ -391,6 +398,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sm = sub.add_parser("summarize", help="Write a local summary, decisions, and action items")
     sm.add_argument("id")
+    sm.add_argument("--force", action="store_true", help="Regenerate even if the notes were edited by hand")
     sm.set_defaults(func=cmd_summarize)
 
     di = sub.add_parser("diarize", help="Label speakers on a saved session again (Others track only)")

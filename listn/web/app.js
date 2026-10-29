@@ -534,7 +534,7 @@ async function openSession(id, seekAt) {
   } });
 
   const notes = data.notes;
-  const notesBox = renderNotes(id, notes, busy);
+  const notesBox = renderNotes(id, notes, busy, audio);
   const head = el("div", { class: "detail-head" }, title, metaLine, notesBox,
     meta.error ? el("div", { class: "error-box" }, meta.error,
       meta.silent ? el("button", { class: "btn secondary small", text: "Open Privacy Settings", onclick: () => openPrivacy("microphone") }) : null) : null,
@@ -641,20 +641,47 @@ $("#ask-form").addEventListener("submit", async event => {
   }
 });
 
-function renderNotes(id, notes, busy) {
+function renderNotes(id, notes, busy, audio) {
   const box = el("div", { class: "notes" });
   const summary = el("textarea", { class: "notes-summary", rows: "4", placeholder: "Summary" });
   summary.value = notes?.summary || "";
+  const points = el("textarea", { class: "notes-list", rows: "3", placeholder: "One key point per line" });
+  points.value = (notes?.key_points || []).map(p => p.text).join("\n");
   const decisions = el("textarea", { class: "notes-list", rows: "3", placeholder: "One decision per line" });
   decisions.value = (notes?.decisions || []).join("\n");
   const actions = el("textarea", { class: "notes-list", rows: "3", placeholder: "Owner: action" });
   actions.value = (notes?.actions || []).map(a => `${a.owner}: ${a.text}`).join("\n");
   const how = notes ? (notes.edited ? "edited" : (notes.backend || "")) : "";
+  const model = notes?.model && !notes.edited ? notes.model.split("/").pop() : "";
+
+  // Where each item was said, linked to the audio.
+  const seekable = (t) => {
+    if (t == null) return el("span", { class: "ts", text: "--:--" });
+    const ts = el(audio ? "button" : "span", { class: `ts ${audio ? "seek" : ""}`, text: clock(t), title: audio ? "Play from here" : null });
+    if (audio) ts.addEventListener("click", () => { audio.currentTime = t; audio.play(); });
+    return ts;
+  };
+  const refs = [];
+  for (const a of notes?.actions || []) {
+    if (a.start == null && !a.due) continue;
+    refs.push({ t: a.start, kind: "Action", text: `${a.owner}: ${a.text}${a.due ? ` (due ${a.due})` : ""}` });
+  }
+  for (const d of notes?.decision_items || []) if (d.start != null) refs.push({ t: d.start, kind: "Decision", text: d.text });
+  for (const q of notes?.open_questions || []) refs.push({ t: q.start, kind: "Open", text: q.text });
+  for (const p of notes?.key_points || []) if (p.start != null) refs.push({ t: p.start, kind: "Point", text: p.text });
+  refs.sort((a, b) => (a.t ?? 1e9) - (b.t ?? 1e9));
+  const refList = refs.length ? el("details", { class: "notes-refs" },
+    el("summary", { text: `In the recording (${refs.length})` }),
+    ...refs.map(r => el("div", { class: "notes-ref" }, seekable(r.t), el("span", { class: "tag", text: r.kind }), el("span", { text: r.text })))) : null;
+
   box.append(
-    el("div", { class: "notes-head" }, el("h3", { text: "Notes" }), how ? el("span", { class: "muted small-text", text: how }) : null),
+    el("div", { class: "notes-head" }, el("h3", { text: "Notes" }),
+      how ? el("span", { class: "muted small-text", text: model ? `${how} · ${model}` : how }) : null),
     el("label", {}, "Summary", summary),
+    el("label", {}, "Key points", points),
     el("label", {}, "Decisions", decisions),
     el("label", {}, "Action items", actions),
+    refList,
     el("div", { class: "detail-actions" },
       el("button", { class: "btn ghost small", text: "Save notes", onclick: async () => {
         const parsed = actions.value.split("\n").map(line => line.trim()).filter(Boolean).map(line => {
@@ -664,6 +691,7 @@ function renderNotes(id, notes, busy) {
         try {
           await api("PUT", `/api/sessions/${id}/summary`, {
             summary: summary.value,
+            key_points: points.value.split("\n").map(s => s.trim()).filter(Boolean),
             decisions: decisions.value.split("\n").map(s => s.trim()).filter(Boolean),
             actions: parsed,
           });
@@ -671,6 +699,7 @@ function renderNotes(id, notes, busy) {
         } catch (err) { toast(err.message, "error"); }
       } }),
       el("button", { class: "btn ghost small", text: notes ? "Regenerate" : "Summarize", disabled: busy, onclick: async () => {
+        if (notes?.edited && !confirm("Replace your edited notes with new ones from the transcript?")) return;
         try { await api("POST", `/api/sessions/${id}/summary`); openSession(id); }
         catch (err) { toast(err.message, "error"); }
       } })),
