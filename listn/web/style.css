@@ -268,3 +268,5 @@ dialog::backdrop { background: rgba(10, 12, 20, .45); }
 .voice { display: flex; align-items: center; gap: 8px; }
 .voice > span { font-weight: 600; }
 .voice .btn { margin-left: auto; }
+
+.notes-busy { opacity: 0.6; transition: opacity 0.2s; }
