@@ -1,5 +1,7 @@
 # listn
 
+**For contributors and agents:** [Agent guidance](AGENTS.md) · [Architecture](docs/ARCHITECTURE.md) · [Operations](docs/OPERATIONS.md) · [Decisions and Linux/KDE roadmap](docs/DECISIONS.md). Linux/KDE support is proposed, not yet implemented.
+
 Private, local-only transcripts of what you hear on your Mac, and of audio files, using Whisper on the machine itself.
 
 The everyday controls are a **menu bar app**. It captures system audio with a Core Audio process tap (macOS 14.2 or later) and, at the same time, your microphone. Those stay on separate tracks, so your own speech is labelled **Me** and everyone else **Others**. You can record every app or just one (Zoom, Teams, a browser). BlackHole is not required.
