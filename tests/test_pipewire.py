@@ -255,6 +255,94 @@ def test_node_present_identity_checks():
     assert pw._node_present(CannedRunner(stdout="{broken", rc=0), watched) is True
 
 
+def collision_dump(node_id, node_name, node_serial):
+    """``pw-dump <id>`` JSON where an unrelated object comes first.
+
+    Reproduced on PipeWire 1.4.2 (issue #4): the first element is a
+    Metadata object whose ``object.serial`` equals the queried id, while
+    the real node sits second with a different serial (ids and serials are
+    independent counters, so this collision recurs).
+    """
+    return json.dumps([
+        {"id": 30, "type": "PipeWire:Interface:Metadata", "version": 3,
+         "permissions": ["r", "w", "x"],
+         "props": {"metadata.name": "settings", "object.serial": node_id}},
+        {"id": node_id, "type": "PipeWire:Interface:Node", "version": 3,
+         "permissions": ["r", "x", "m"],
+         "info": {"props": {"media.class": "Audio/Sink", "node.name": node_name,
+                            "object.serial": node_serial}}},
+    ])
+
+
+def collision_payloads():
+    return {32: collision_dump(32, "sys.tone", 34),
+            34: collision_dump(34, "mic.tone", 36)}
+
+
+def test_node_present_ignores_leading_object_with_matching_serial():
+    """Regression for issue #4: select by id, not by position.
+
+    ``payload[0]`` here is a Metadata object with ``object.serial == 32``
+    while the watched node is ``id 32, serial 34``. Reading positionally
+    compared serial 32 against 34 and reported the healthy node as gone,
+    which made ``TwoTrackRecorder.start()`` refuse to start.
+    """
+    watched = node(32, "test.system", "Audio/Sink", serial=34)
+    payload = json.loads(collision_dump(32, "test.system", 34))
+    # the fixture must actually reproduce the collision
+    assert payload[0]["id"] != watched.id
+    assert payload[0]["props"]["object.serial"] == watched.id
+    assert payload[0]["props"]["object.serial"] != watched.serial
+    runner = CannedRunner(stdout=json.dumps(payload), rc=0)
+    assert pw._node_present(runner, watched) is True
+    assert runner.calls == [["pw-dump", "32"]]
+
+
+def test_node_present_false_when_no_element_carries_the_id():
+    """No element with the queried id means the node is gone (issue #4)."""
+    watched = node(32, "test.system", "Audio/Sink", serial=34)
+    only_other_objects = json.dumps([
+        {"id": 30, "type": "PipeWire:Interface:Metadata",
+         "props": {"metadata.name": "settings", "object.serial": 32}},
+        "not-an-object",
+        {"id": 33, "type": "PipeWire:Interface:Node",
+         "info": {"props": {"node.name": "someone-else", "object.serial": 33}}},
+        {"type": "PipeWire:Interface:Node",  # no id at all
+         "info": {"props": {"node.name": "test.system", "object.serial": 34}}},
+    ])
+    assert pw._node_present(CannedRunner(stdout=only_other_objects, rc=0), watched) is False
+    # a non-list payload with content never identifies the node either
+    assert pw._node_present(CannedRunner(stdout='{"id": 32}', rc=0), watched) is False
+    # still gone when the dump is empty
+    assert pw._node_present(CannedRunner(stdout="", rc=0), watched) is False
+
+
+def test_recorder_start_accepts_present_nodes_despite_serial_collision(fake_pw):
+    """End-to-end for issue #4: start() must not refuse a healthy node."""
+    targets = pw.Targets(
+        system=pw.TrackTarget("system", TRACK_SYSTEM,
+                              node(32, "sys.tone", "Audio/Sink", serial=34), "default"),
+        mic=pw.TrackTarget("mic", TRACK_MIC,
+                           node(34, "mic.tone", "Audio/Source", serial=36), "default"),
+    )
+    payloads = collision_payloads()
+
+    class PerIdDumpRunner(CannedRunner):
+        def run(self, argv, timeout=None):
+            self.calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, payloads[int(argv[1])], "")
+
+    recorder = pw.TwoTrackRecorder(fake_pw["out"] / "collision", targets,
+                                   runner=PerIdDumpRunner(),
+                                   pw_record=fake_pw["script"], node_watch_interval=0.05)
+    recorder.start()  # the bug: CaptureError "already gone" was raised here
+    time.sleep(0.3)
+    report = recorder.stop()
+    assert report["ok"] is True, report
+    assert report["tracks"]["system"]["verdict"] == "ok"
+    assert report["tracks"]["mic"]["verdict"] == "ok"
+
+
 def test_select_targets_uses_session_defaults():
     targets = pw.select_targets(graph())
     assert targets.system.selection == targets.mic.selection == "default"

@@ -767,6 +767,13 @@ def _node_present(runner, node: Node) -> bool:
     ``pw-dump <id>`` prints nothing and exits 0 for a vanished id
     (PipeWire 1.4.2), and ids are recycled, so the serial and name are
     re-checked to catch a reused id.
+
+    ``pw-dump <id>`` may return more than the queried object, and the
+    first element is not reliably that object: on PipeWire 1.4.2 it can
+    be a Metadata entry whose ``object.serial`` merely equals the queried
+    id (node ids and object serials are independent counters, so the
+    collision recurs). The element is therefore selected by ``id`` and
+    only then compared; when no element carries the id the node is gone.
     """
     try:
         proc = runner.run(["pw-dump", str(node.id)], timeout=5.0)
@@ -780,9 +787,24 @@ def _node_present(runner, node: Node) -> bool:
         payload = json.loads(proc.stdout)
     except json.JSONDecodeError:
         return True
-    if not isinstance(payload, list) or not payload:
+    if not isinstance(payload, list):
         return False
-    props = payload[0].get("props") or (payload[0].get("info") or {}).get("props") or {}
+    target = None
+    for obj in payload:
+        if not isinstance(obj, dict):
+            continue
+        obj_id = obj.get("id")
+        if obj_id is None:
+            continue
+        try:
+            if int(obj_id) == int(node.id):
+                target = obj
+                break
+        except (TypeError, ValueError):
+            continue
+    if target is None:
+        return False  # nothing in the dump carries this id: the node is gone
+    props = target.get("props") or (target.get("info") or {}).get("props") or {}
     serial = props.get("object.serial")
     if serial is not None and node.serial is not None and int(serial) != int(node.serial):
         return False

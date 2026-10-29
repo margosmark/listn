@@ -101,6 +101,15 @@ Measured against a headless PipeWire 1.4.2 + WirePlumber 0.5.8 daemon:
    WAV headers manually so an unfinalized file is reported, not crashed on.
 6. **Sink-monitor capture works by targeting the sink node itself** (no
    separate `.monitor` node exists in native `pw-dump` output).
+7. **`pw-dump <id>` can return more than the queried object.** Measured on a
+   bare headless 1.4.2 daemon (no WirePlumber): with node ids and object
+   serials drifted apart, `pw-dump 40` returned two objects — a node with
+   `id=37, object.serial=40` first, then the requested `id=40` node — so an
+   object whose `object.serial` merely equals the queried id can lead the
+   dump. Reading `payload[0]` compares that stranger's serial and reports a
+   healthy node as gone (issue #4), which blocks `start()` outright. The
+   probe therefore selects the element whose `id` equals the node's id and
+   only then checks serial/name; no element with that id means gone.
 
 ## Hardware limitations of this verification
 
