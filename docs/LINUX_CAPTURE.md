@@ -272,11 +272,85 @@ Measured against a headless PipeWire 1.4.2 + WirePlumber 0.5.8 daemon:
   output from actual applications, Bluetooth headsets, and KDE-specific
   integration (portal permissions, session defaults on a desktop, and the
   tray as rendered by a running plasmashell panel) are **untested**.
-- To validate on the target machine, run the commands above on CachyOS/KDE
-  with real devices: check both verdicts are `ok` while speaking and playing
-  audio, unplug the microphone mid-recording (expect `mic: failed … target
-  node disappeared`), and confirm `pw-dump`/`pw-record` come from the
-  distribution's PipeWire packages.
+- To validate on the target machine, run
+  [the one-command hardware check](#verify-real-hardware-in-one-command)
+  below on CachyOS/KDE with real devices: it drives exactly the checks this
+  list describes (both verdicts `ok` while speaking and playing audio, pause
+  evidence, unplug mid-recording expecting `mic: failed … target node
+  disappeared`, replug recovery) and prints a paste-ready report.
+
+## Verify real hardware in one command
+
+`scripts/linux_hardware_check.sh` turns the validation above into a single
+command that ends with a fenced report block ready to paste back into a
+card. Run it on the target machine, inside the desktop session, from a
+checkout:
+
+```sh
+uv sync --group dev
+LISTN_CMD="uv run listn" scripts/linux_hardware_check.sh          # 5 s capture
+LISTN_CMD="uv run listn" scripts/linux_hardware_check.sh --duration 8
+LISTN_CMD="uv run listn" scripts/linux_hardware_check.sh --json > result.json
+scripts/linux_hardware_check.sh --list       # preflight + discovery only
+scripts/linux_hardware_check.sh --non-interactive   # skip the prompted phases
+```
+
+Five phases, all against the **real session daemon** (no synthetic rig, no
+private daemon, no fake devices):
+
+1. **Preflight** — `pipewire`, `wireplumber`, `pw-dump`, `pw-record` on
+   `PATH`; the session socket at `$XDG_RUNTIME_DIR/pipewire-0`; `listn`
+   importable through the interpreter `LISTN_CMD` names (the same rule as
+   the capture rig); `/dev/snd` reported present or absent, never assumed.
+2. **Discovery** — `listn record --list`, then every graph node labelled
+   with its media class straight from `pw-dump` (the report carries the
+   daemon's own words, not only the CLI's). Targets are resolved with the
+   app's own `select_targets()`, so a session default that names a sink is
+   refused exactly as capture would refuse it.
+3. **Capture** — a 4-6 s two-track run through `listn record … --json`,
+   printing per-track state, duration, frames, peak/RMS dBFS and verdict.
+   The check passes only on the recorder's own `report.ok`: both tracks
+   stopped clean and the mic carries measured signal. A silent mic fails;
+   a silent system track alone does not (nobody may be playing anything —
+   the engine's own rule).
+4. **Pause/resume** — starts a temporary loopback web UI (isolated data
+   directory; your real library is untouched), drives `POST /api/live/start`
+   → pause → resume → stop through the app's own API, then verifies the
+   evidence in the stored session: the engine reports `paused` mid-run, the
+   session WAVs contain a real silent window of at least 2 s, the
+   transcript carries a `[paused]` marker, and the recorder's final
+   per-track report is ok.
+5. **Hot-plug** (interactive) — with a mic you can unplug, runs a 15 s
+   capture, prompts you to unplug mid-run and **expects the mic track to
+   fail** with `target node … disappeared` (a silent re-target to another
+   source fails the check); then prompts for the replug and confirms a
+   fresh 4 s capture records the mic again. No external mic → honestly
+   reported as `SKIP`, never as a pass.
+
+Interactive phases prompt and never guess; with `--non-interactive` (or no
+tty) they are skipped and the report says so. Everything runs with
+`LISTN_DATA_DIR` pointed at a private temp directory and model downloads and
+telemetry forced off (`HF_HUB_OFFLINE=1` etc.), so the engine falls back to
+recording-only mode when no model is cached — the check never touches the
+network. Only daemons the script starts are killed on exit; the session
+PipeWire is never touched.
+
+Exit codes: `0` every executed check passed with measured signal, `1` the
+script ran but a check failed (including "the mic recorded only silence"),
+`3` a prerequisite is missing (tools, session daemon, importable `listn`).
+`--json` prints a machine-readable document on stdout (progress moves to
+stderr) with the same per-phase results, counts and exit code.
+
+Verified on this machine (headless Debian LXC, PipeWire 1.4.2, WirePlumber
+0.5.8, no `/dev/snd`): against a live session-style daemon the check exits
+0 with `capture` and `pause/resume` passing — the pause phase measured a
+3.0 s silent window in both stored tracks and one `[paused]` marker; with
+the mic FIFO fed digital silence the capture phase fails with
+`verdict=silent` and exit 1; with only the system track silent it passes
+(engine rule). The automated gate is
+`LISTN_HW_IT=1 uv run pytest tests/test_hardware_check.py`; the default
+run covers the script's syntax, interface and the analyzer's honesty
+contract without any daemon.
 
 ## KDE tray (`listn tray`)
 
