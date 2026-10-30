@@ -993,6 +993,7 @@ async function boot() {
       ["#offer-meetings", "#auto-record", "#launch-at-login"].forEach(id => { $(id).closest("label").hidden = true; });
       $("#privacy-open").hidden = true;
       $("#pw-panel").hidden = false;   // two-track capture is Linux-only
+      $("#dashboard-link").hidden = false;   // session dashboard is Linux-scoped
     }
   } catch (err) {
     toast(`listn server unreachable: ${err.message}`, "error");
