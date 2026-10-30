@@ -2,6 +2,9 @@
 
 Status: **prototype with automated tests and one real-daemon verification on a
 headless machine — not validated on real audio hardware or a KDE session.**
+The real-daemon verification is reproducible in one command
+(`scripts/linux_capture_rig.sh`, see
+[Reproduce the real-daemon rig](#reproduce-the-real-daemon-rig)).
 This implements roadmap step 2 in [DECISIONS](DECISIONS.md) as a bounded
 increment; it does not ship KDE desktop support. The recorder is now wired
 into the app: `listn record` on the CLI and the Live tab of the local web UI
@@ -44,8 +47,12 @@ uv run listn record --system-target <node> --mic-target <node> --duration 5
 uv run listn ui --no-browser                       # web UI: pick both targets in
                                                    # the Live tab, then Start
 
+scripts/linux_capture_rig.sh                       # the whole headless rig, one
+                                                   # command (see below)
+
 uv run pytest tests/test_pipewire.py               # module tests
 uv run pytest tests/test_pipewire_wiring.py        # CLI/server wiring tests
+LISTN_RIG_IT=1 uv run pytest tests/test_capture_rig.py  # full daemon rig
 ```
 
 The app CLI and the web UI go through `listn/pipewire_live.py`, which only
@@ -63,7 +70,9 @@ peak/RMS, error) — never a bare "saved".
   server paths with stand-in `pw-dump`/`pw-record` executables, including
   the id-probe contract and every refusal path).
 - Real-daemon wiring run on this machine (same headless daemon as above, a
-  440 Hz tone piped into the sink and into the pipe-tunnel source):
+  440 Hz tone piped into the sink and into the pipe-tunnel source — the rig is
+  now scripted, see [Reproduce the real-daemon rig](#reproduce-the-real-daemon-rig)
+  below):
 
   ```text
   $ uv run listn record --list
@@ -84,6 +93,64 @@ peak/RMS, error) — never a bare "saved".
   audio-mic.wav 198738 B; transcripts empty (a pure tone carries no speech —
   expected). Starts without both explicit targets are refused with 400.
   ```
+
+## Reproduce the real-daemon rig
+
+`scripts/linux_capture_rig.sh` regenerates the real-daemon results above from
+a clean checkout on any headless Linux machine with PipeWire installed — no
+`/dev/snd`, no desktop session, no audio hardware:
+
+```sh
+scripts/linux_capture_rig.sh                 # 4 s capture; exit 0 only if both verdicts are ok
+scripts/linux_capture_rig.sh --duration 8 --out ./rig-artifacts   # also keep WAVs + report + log
+LISTN_CMD="uv run listn" scripts/linux_capture_rig.sh             # app CLI via uv instead of `python3 -m listn`
+scripts/linux_capture_rig.sh --list          # stand the rig up, run `listn record --list`, tear down
+```
+
+Everything is built inside a fresh `mktemp -d` (private `XDG_RUNTIME_DIR` +
+`XDG_CONFIG_HOME`) and removed on exit:
+
+1. a `pipewire.conf.d` drop-in adds a `support.null-audio-sink` adapter as
+   the system sink (`listn.rig.system`) and loads
+   `libpipewire-module-pipe-tunnel` with `tunnel.mode=source` +
+   `pipe.filename` (a FIFO in the rig dir) as the microphone source
+   (`listn.rig.mic`);
+2. headless `pipewire` + `wireplumber` start against that private config;
+3. a paced writer feeds a 440 Hz s16le/48 kHz/mono tone into the FIFO,
+   holding the write end open continuously (an empty FIFO reads as EOF and
+   the source goes silent — observed behaviour 10 below);
+4. `pw-cat` plays a 440 Hz WAV into the null sink while the app's own
+   `listn record … --json` captures both tracks;
+5. per-track `state/duration/frames/peak/rms/verdict` and each WAV's
+   dominant frequency are printed, then every process is killed and the
+   private runtime dir removed.
+
+Exit codes follow the recorder's contract, passed through: `0` both tracks
+`verdict=ok` with signal, `1` a track was not ok (silent/quiet/failed — the
+script refuses instead of claiming success), `3` the rig itself could not
+start (missing tools; daemon or nodes did not appear).
+
+Measured on this machine (PipeWire 1.4.2, WirePlumber 0.5.8, headless
+Debian LXC, default `LISTN_CMD="python3 -m listn"`); three consecutive runs
+were byte-identical:
+
+```text
+$ scripts/linux_capture_rig.sh
+rig: daemon up, nodes ready:
+rig:   listn.rig.system Audio/Sink
+rig:   listn.rig.mic Audio/Source
+system: state=stopped 4.011 s 192512 frames peak=-8.0 dBFS rms=-11.0 dBFS verdict=ok dominant=440.0 Hz
+mic: state=stopped 3.989 s 191488 frames peak=-14.0 dBFS rms=-17.0 dBFS verdict=ok dominant=440.0 Hz
+rig result: OK — both tracks recorded with real signal      # exit 0
+```
+
+Negative checks of the rig itself, run while writing it and reproducible by
+hand: feeding digital silence into the FIFO yields
+`mic: … peak=-120.0 dBFS verdict=silent` and exit 1; removing WirePlumber
+makes both `pw-record` streams produce no audio and the script refuses with
+exit 1; `LISTN_CMD="uv run --frozen listn"` behaves identically to the
+default. The full end-to-end run is also gated into pytest:
+`LISTN_RIG_IT=1 uv run pytest tests/test_capture_rig.py`.
 
 Exit codes: `0` capture succeeded with microphone signal, `1` capture failed
 or the microphone recorded only silence, `3` PipeWire/tools unavailable or
@@ -119,7 +186,12 @@ run (nobody may have been playing anything) — the same rule the engine uses.
   Two independent tracks were captured simultaneously from a real PipeWire
   daemon, both WAVs finalized and spectrally checked (440 Hz present in
   each). `mic: selection: fallback` is the module refusing the session
-  default, which named a sink on this rig (see below).
+  default, which named a sink on this rig (see below). This hand-built
+  container rig (two null sinks + an `audiotestsrc` adapter) was never
+  scripted, and the `audiotestsrc` SPA factory is commented out of the
+  default `context.spa-libs` on this stack, so the scripted
+  [capture rig](#reproduce-the-real-daemon-rig) builds the microphone side
+  as a pipe-tunnel source instead — that is the reproducible path.
 
 ## Observed PipeWire 1.4.2 behaviour (why the code is shaped this way)
 
@@ -156,6 +228,37 @@ Measured against a headless PipeWire 1.4.2 + WirePlumber 0.5.8 daemon:
    healthy node as gone (issue #4), which blocks `start()` outright. The
    probe therefore selects the element whose `id` equals the node's id and
    only then checks serial/name; no element with that id means gone.
+8. **`pw-cli create-node` fails silently.** On this build (PipeWire 1.4.2,
+   Debian package) unquoted property values fail client-side — `media.class=
+   Audio/Sink` is rejected with `syntax error in properties … Expected
+   object value` at the `/`, so values must be JSON — and with JSON-quoted
+   values the command returns rc=0, prints nothing, and creates no node at
+   all, with no error in the daemon log. The rig therefore configures its
+   nodes in a `pipewire.conf.d` drop-in (loaded at daemon start, where
+   failures are fatal and visible) instead of driving `pw-cli`.
+9. **`libpipewire-module-pipe-tunnel` silently ignores wrong property
+   names.** The path property is `pipe.filename` (not `path`), the direction
+   is `tunnel.mode=source` (not `media.class=Audio/Source`), and the stream
+   format is `audio.format`/`audio.rate`/`audio.channels` (not
+   `format`/`rate`/`channels`). Unknown keys are dropped without a word and
+   the module falls back to its defaults — `/tmp/fifo_output`, S16LE stereo
+   48 kHz — so `pw-cli load-module … path=…` returns rc=0 and produces a
+   node that carries nothing useful. This is why earlier hand-typed
+   invocations "loaded fine" yet yielded no recordable microphone.
+10. **A pipe-tunnel source goes silent if its FIFO ever reads empty.** The
+    capture side reads the FIFO non-blocking; a momentarily empty pipe is
+    treated as end-of-stream — the node exists, `pw-record` records exactly
+    1024 zero frames and then nothing (`underrun 0 < 4096` in the daemon
+    log), and this happens with *and* without WirePlumber. The rig's writer
+    therefore holds the write end open continuously and paces at ~95 % of
+    realtime. Flooding the FIFO instead triggers `resync` log spam and a
+    measurable pitch error (dominant 430 Hz instead of 440 Hz).
+11. **WirePlumber is load-bearing on a rig with no real devices.** With the
+    same drop-in config and daemon but no session manager, both `pw-record`
+    streams end with `recording was not finalized and contains no audio` —
+    even the null sink's monitor port carries no buffers. The rig starts
+    WirePlumber next to the daemon; a real desktop run inherits a session
+    manager anyway.
 
 ## Hardware limitations of this verification
 
