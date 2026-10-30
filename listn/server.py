@@ -216,6 +216,15 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
             "capture_sock": str(app.state.ingest.path) if getattr(app.state, "ingest", None) and app.state.ingest.path else None,
         }
 
+    @app.get("/api/dashboard")
+    def dashboard():
+        """Read-only snapshot of real engine state for the local dashboard."""
+        from listn.dashboard import build_snapshot
+
+        pwlive = getattr(app.state, "pw", None)
+        pipewire = pwlive.status() if pwlive is not None else None
+        return build_snapshot(eng(), pipewire)
+
     @app.get("/api/devices")
     def get_devices():
         return device_report()
@@ -601,6 +610,10 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
     @app.get("/")
     def index():
         return FileResponse(WEB_DIR / "index.html")
+
+    @app.get("/dashboard")
+    def dashboard_page():
+        return FileResponse(WEB_DIR / "dashboard.html")
 
     app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 

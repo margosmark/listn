@@ -1,6 +1,6 @@
 # listn
 
-**For contributors and agents:** [Agent guidance](AGENTS.md) · [Architecture](docs/ARCHITECTURE.md) · [Operations](docs/OPERATIONS.md) · [Decisions and Linux/KDE roadmap](docs/DECISIONS.md). Linux has a bounded Python CLI and local web workflow, including a PipeWire two-track recorder (`listn record` and the Live tab of the web UI); it is verified against a headless PipeWire daemon with synthetic audio, not yet on real hardware, and KDE tray integration is not implemented.
+**For contributors and agents:** [Agent guidance](AGENTS.md) · [Architecture](docs/ARCHITECTURE.md) · [Operations](docs/OPERATIONS.md) · [Decisions and Linux/KDE roadmap](docs/DECISIONS.md). Linux has a bounded Python CLI and local web workflow, including a PipeWire two-track recorder (`listn record` and the Live tab of the web UI) and a read-only session dashboard (`/dashboard`); capture is verified against a headless PipeWire daemon with synthetic audio, not yet on real hardware, and KDE tray integration is not implemented.
 
 Private, local-only transcripts of what you hear on your Mac, and of audio files, using Whisper on the machine itself.
 
@@ -67,6 +67,15 @@ tracks and transcription behave as they do on macOS. See
 [Linux capture](docs/LINUX_CAPTURE.md) for status and limits: prototype,
 verified against a headless PipeWire daemon with synthetic audio and covered
 by automated tests, not yet validated on real hardware or a KDE session.
+
+A read-only **dashboard** at `http://127.0.0.1:<port>/dashboard` shows the
+state the engine already tracks: the active recording (including per-track
+PipeWire state and frames while a two-track capture runs), the transcription
+queue, and recent recordings with their status (recording / processing /
+failed / done), track separation and transcription result. It renders
+`GET /api/dashboard`, a projection of engine and library state with no mock
+data; with nothing running it says so. Same loopback-only server and
+Host/origin checks as the rest of the UI.
 
 `listn live` and the web UI's single-input mode record **one** PortAudio
 input. A PipeWire/PulseAudio monitor may be selectable if exposed
