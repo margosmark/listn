@@ -1,6 +1,6 @@
 # listn
 
-**For contributors and agents:** [Agent guidance](AGENTS.md) · [Architecture](docs/ARCHITECTURE.md) · [Operations](docs/OPERATIONS.md) · [Decisions and Linux/KDE roadmap](docs/DECISIONS.md). Linux has a bounded Python CLI and local web workflow, including a PipeWire two-track recorder (`listn record` and the Live tab of the web UI) and a read-only session dashboard (`/dashboard`); capture is verified against a headless PipeWire daemon with synthetic audio, not yet on real hardware, and KDE tray integration is not implemented.
+**For contributors and agents:** [Agent guidance](AGENTS.md) · [Architecture](docs/ARCHITECTURE.md) · [Operations](docs/OPERATIONS.md) · [Decisions and Linux/KDE roadmap](docs/DECISIONS.md). Linux has a bounded Python CLI and local web workflow, including a PipeWire two-track recorder (`listn record` and the Live tab of the web UI), a read-only session dashboard (`/dashboard`), and a minimal KDE Plasma tray (`listn tray`: start/stop/pause, target pickers, privacy settings, quit); capture and the tray are verified against a headless PipeWire daemon with synthetic audio and a real D-Bus session, not yet on real hardware or a real plasmashell panel.
 
 Private, local-only transcripts of what you hear on your Mac, and of audio files, using Whisper on the machine itself.
 
@@ -77,12 +77,32 @@ failed / done), track separation and transcription result. It renders
 data; with nothing running it says so. Same loopback-only server and
 Host/origin checks as the rest of the UI.
 
+KDE Plasma gets a minimal system tray (StatusNotifierItem over D-Bus, no Qt
+dependency):
+
+```sh
+uv sync --extra tray               # installs dbus-next
+uv run listn tray                  # starts the engine if none is running on the port
+uv run listn tray --no-server      # only attach to an already-running engine
+```
+
+The tray menu is exactly: recording status, Start/Stop, Pause/Resume, the two
+target pickers (radio picks, session defaults labelled as suggestions), Open
+privacy settings (listn's own settings page — PipeWire has no macOS-style
+per-app permission list, and the tray does not pretend otherwise), and Quit
+(which stops an active recording first). Failure is shown as failure with the
+recorder's own cause (dead track, refused start, engine not answering) —
+never a stale "recording". The D-Bus contract is covered by tests against a
+real session bus; interaction with a running plasmashell panel is not yet
+exercised.
+
 `listn live` and the web UI's single-input mode record **one** PortAudio
 input. A PipeWire/PulseAudio monitor may be selectable if exposed
 by PortAudio; routing, permissions, device changes and audio quality need
 verification on the target desktop. Do not interpret its labels as reliable
-speaker identity. Per-app capture, KDE tray, meeting detection and
-launch-at-login integration are not implemented. Do not use the macOS
+speaker identity. Per-app capture, meeting detection and
+launch-at-login integration are not implemented (the tray hides those
+controls rather than faking them). Do not use the macOS
 management script on Linux. GPU acceleration is unverified; MLX-based
 notes are unavailable and the existing extractive fallback is used. See
 [operations](docs/OPERATIONS.md) for validation steps.
