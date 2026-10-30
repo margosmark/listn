@@ -317,9 +317,15 @@ def test_launcher_keeps_state_in_the_user_home():
     text = LAUNCHER.read_text(encoding="utf-8")
     assert "UV_PROJECT_ENVIRONMENT" in text
     assert "${XDG_DATA_HOME:-$HOME/.local/share}/listn/env" in text
-    assert "--frozen" in text
+    # Read-only /usr/share/listn: sync the locked deps only, never build the
+    # project (setuptools would need to write into the source tree), and run
+    # the module from there with PYTHONPATH.
+    assert "--frozen --no-install-project --no-dev" in text
+    assert '"$env/bin/python" -m listn "$@"' in text
+    assert 'PYTHONPATH="$project' in text
     # The tray extra is pulled in only by the tray command.
-    assert '--frozen --extra tray listn "$@"' in text
+    assert "--no-install-project --no-dev --extra tray" in text
+    assert text.count("--extra tray") == 1
     assert "/usr/share/listn" in text
 
 

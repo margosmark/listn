@@ -4,7 +4,10 @@
 # pacman ships only read-only code - the project tree in /usr/share/listn, the
 # `listn` launcher in /usr/bin and the menu entry/icon - and the launcher lets
 # uv build the Python environment per user on first run, from the repo's
-# uv.lock, into ${XDG_DATA_HOME:-$HOME/.local/share}/listn/env. That is the
+# uv.lock, into ${XDG_DATA_HOME:-$HOME/.local/share}/listn/env. uv never
+# builds the project itself: /usr/share/listn stays read-only (setuptools would
+# need to write listn.egg-info there), and the launcher imports the module from
+# it via PYTHONPATH. That is the
 # dependency set the tests run against, it needs no root, and no state outside
 # $HOME is written when listn runs. The first run downloads the locked wheels
 # (and, only if no Python in listn's supported range is found, a matching
