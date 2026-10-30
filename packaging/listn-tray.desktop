@@ -1,0 +1,15 @@
+[Desktop Entry]
+# XDG autostart entry for the listn tray. Installed to
+# ${XDG_CONFIG_HOME:-$HOME/.config}/autostart/ by an explicit install step -
+# this is an install-time choice, not a tray toggle. The tray itself has no
+# launch-at-login control.
+Type=Application
+Version=1.0
+Name=listn tray
+Comment=Start the listn tray and its engine at login
+Exec=listn tray
+Icon=listn
+Terminal=false
+NoDisplay=true
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

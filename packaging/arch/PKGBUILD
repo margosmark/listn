@@ -1,0 +1,56 @@
+# Maintainer: Mark <margosmark@users.noreply.github.com>
+#
+# listn on Arch/CachyOS. Install model, deliberately user-scope at runtime:
+# pacman ships only read-only code - the project tree in /usr/share/listn, the
+# `listn` launcher in /usr/bin and the menu entry/icon - and the launcher lets
+# uv build the Python environment per user on first run, from the repo's
+# uv.lock, into ${XDG_DATA_HOME:-$HOME/.local/share}/listn/env. uv never
+# builds the project itself: /usr/share/listn stays read-only (setuptools would
+# need to write listn.egg-info there), and the launcher imports the module from
+# it via PYTHONPATH. That is the
+# dependency set the tests run against, it needs no root, and no state outside
+# $HOME is written when listn runs. The first run downloads the locked wheels
+# (and, only if no Python in listn's supported range is found, a matching
+# interpreter - exactly what `uv sync` does); afterwards it runs locally.
+
+pkgname=listn
+pkgver=0.5.0
+pkgrel=1
+pkgdesc="Local-only meeting transcription with a KDE Plasma tray"
+arch=('x86_64' 'aarch64')
+url="https://github.com/margosmark/listn"
+license=('MIT')
+depends=('python' 'uv' 'portaudio' 'pipewire' 'wireplumber')
+optdepends=(
+  'tray: KDE Plasma tray controls - `listn tray` pulls the dbus-next extra into the user environment on demand'
+)
+install=listn.install
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# The repository has no tags yet (`git ls-remote --tags origin` prints
+# nothing), so the checksum cannot be measured until v$pkgver is cut; makepkg
+# fails loudly on a missing or changed source either way. Once the tag exists:
+#   updpkgsums
+sha256sums=('SKIP')
+
+package() {
+  cd "$pkgname-$pkgver"
+
+  # Read-only project tree: pyproject + lock + code + docs. No venv here; the
+  # launcher points uv at the per-user environment instead.
+  install -d "$pkgdir/usr/share/listn"
+  install -m644 pyproject.toml uv.lock README.md "$pkgdir/usr/share/listn/"
+  cp -a listn "$pkgdir/usr/share/listn/listn"
+
+  install -Dm755 packaging/arch/listn-launcher.sh "$pkgdir/usr/bin/listn"
+
+  # Menu entry (Exec=listn ui resolves through /usr/bin) and its icon.
+  install -Dm644 packaging/listn.desktop "$pkgdir/usr/share/applications/listn.desktop"
+  install -Dm644 macos/Resources/AppIcon.iconset/icon_128x128.png \
+    "$pkgdir/usr/share/icons/hicolor/128x128/apps/listn.png"
+
+  # The tray-at-login entry is an install-time choice, never automatic: ship
+  # the template, let each user copy it into their own autostart directory
+  # (see the .install message and README). Nothing lands in /etc/xdg/autostart.
+  install -Dm644 packaging/listn-tray.desktop \
+    "$pkgdir/usr/share/listn/packaging/listn-tray.desktop"
+}

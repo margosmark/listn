@@ -107,6 +107,69 @@ management script on Linux. GPU acceleration is unverified; MLX-based
 notes are unavailable and the existing extractive fallback is used. See
 [operations](docs/OPERATIONS.md) for validation steps.
 
+### Desktop integration (Linux): menu entry, login, and the Arch package
+
+Everything here is user scope: files land under `$XDG_DATA_HOME` and
+`$XDG_CONFIG_HOME` (the `~/.local/share` and `~/.config` defaults), nothing
+needs root, and nothing is written outside your home directory. It works like
+the macOS management workflow — one script, named commands, `--dry-run` for
+all of them — and it refuses to run on macOS (`scripts/listn-manage.sh` is
+the macOS installer and is not used on Linux).
+
+| Task | Command |
+|---|---|
+| Install the app menu entry and icon (KDE app menu: "listn") | `scripts/listn-desktop.sh install` |
+| Also start the tray at login | `scripts/listn-desktop.sh install --autostart` |
+| See what is installed and what each entry launches | `scripts/listn-desktop.sh status` |
+| Remove the menu entry, icon and login entry | `scripts/listn-desktop.sh uninstall` |
+
+The menu entry runs `listn ui` (the local web UI on this machine). The
+autostart entry runs `listn tray`, which attaches to an engine that is already
+running or starts one on the port if nothing is answering — so a login start
+never doubles up on a running server. The login entry is an install-time
+choice made by `install --autostart`, never a tray control: the tray has no
+launch-at-login control, that macOS control stays hidden. `uninstall` removes
+the login entry too, whether or not you installed it.
+
+The script launches the `listn` command it finds: `$LISTN_CMD` if you set it,
+this checkout's `.venv/bin/listn`, then `listn` on `PATH`. Set `LISTN_CMD`
+when your command is something else, for example
+`LISTN_CMD="uv run --directory $PWD listn"`. Installed entries carry the
+resolved absolute path, so they work from the app menu regardless of that
+session's `PATH`.
+
+**Arch Linux / CachyOS package.** `packaging/arch/PKGBUILD` builds from the
+repository's release tag (`v<version>`) and installs read-only code only:
+
+```sh
+cd packaging/arch
+makepkg -si
+```
+
+The repository has no tags yet (`git ls-remote --tags origin` prints
+nothing), so the tag download fails until one is cut; `sha256sums` is `SKIP`
+until then and should be refreshed with `updpkgsums` once the tag exists.
+pacman installs the project tree in `/usr/share/listn`, the launcher in
+`/usr/bin/listn`, and the menu entry with its icon. The launcher lets `uv`
+build **your** environment on first run from the shipped `uv.lock`, into
+`~/.local/share/listn/env`: that run downloads the locked dependencies once
+(and a Python 3.10–3.13 interpreter only if the system one is outside
+listn's supported range — the same thing `uv sync` does); afterwards it runs
+locally, and no state outside `$HOME` is ever written. Declared depends:
+`python`, `uv`, `portaudio`, `pipewire`, `wireplumber`; the optional `tray`
+extra (dbus-next) is pulled into your environment when you run `listn tray`.
+Starting the tray at login stays an install-time choice — copy the shipped
+template into your own autostart directory:
+
+```sh
+install -Dm644 /usr/share/listn/packaging/listn-tray.desktop \
+        "$HOME/.config/autostart/listn-tray.desktop"
+```
+
+Remove that file to stop; the package's `.install` message repeats both
+commands. Desktop-entry correctness, the installer's XDG writes and these
+documented commands are covered by `uv run pytest tests/test_desktop_packaging.py`.
+
 ## Quick start
 
 On an Apple Silicon Mac with macOS 14.2 or later:
