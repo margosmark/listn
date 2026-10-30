@@ -36,18 +36,43 @@
         <h2>Capture</h2>
         <div id="guidance" class="guidance"></div>
 
-        <label class="field">
-          <span>Input device</span>
-          <div class="row">
-            <select id="device"></select>
-            <button class="btn ghost small" id="refresh-devices" title="Re-scan devices">Rescan</button>
+        <div id="pw-panel" hidden>
+          <label class="field">
+            <span>Capture mode</span>
+            <select id="pw-mode">
+              <option value="pipewire">Two tracks — system output + microphone (PipeWire)</option>
+              <option value="device">One input device</option>
+            </select>
+          </label>
+          <label class="field" id="pw-system-field">
+            <span>System output track</span>
+            <select id="pw-system"></select>
+          </label>
+          <label class="field" id="pw-mic-field">
+            <span>Microphone track</span>
+            <select id="pw-mic"></select>
+          </label>
+          <div class="row gap">
+            <button class="btn ghost small" id="pw-refresh" title="Re-scan the PipeWire graph">Rescan</button>
+            <span id="pw-note" class="muted small-text"></span>
           </div>
-        </label>
-        <div class="row gap">
-          <button class="btn secondary small" id="test-device">Test input</button>
-          <span id="test-result" class="muted small-text"></span>
+          <div id="pw-guidance" class="guidance"></div>
         </div>
-        <div id="test-meters" class="test-meters"></div>
+
+        <div id="device-panel">
+          <label class="field">
+            <span>Input device</span>
+            <div class="row">
+              <select id="device"></select>
+              <button class="btn ghost small" id="refresh-devices" title="Re-scan devices">Rescan</button>
+            </div>
+          </label>
+          <div class="row gap">
+            <button class="btn secondary small" id="test-device">Test input</button>
+            <span id="test-result" class="muted small-text"></span>
+          </div>
+          <div id="test-meters" class="test-meters"></div>
+        </div>
 
         <div class="two">
           <label class="field">

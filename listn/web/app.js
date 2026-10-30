@@ -32,6 +32,9 @@ const state = {
   pickedFiles: [],
   selected: null,
   query: "",
+  pwDevices: null,      // GET /api/pipewire/devices: nodes for explicit target picking
+  pwReport: null,       // last two-track capture report (from /api/live/stop)
+  pwLevels: null,       // per-track levels from live.level events (ingest mode)
 };
 
 async function api(method, path, body) {
@@ -196,7 +199,9 @@ async function saveSetting(key, value) {
     state.settings = await api("PUT", "/api/settings", { [key]: value });
     state.status = await api("GET", "/api/status");
     if (state.status.platform === "linux") {
-      $("#capture-help").textContent = "This page records one selected input only. Separate microphone and system tracks, KDE tray controls, and per-app capture are not implemented. A PipeWire monitor may be available depending on your audio setup.";
+      if (!pwUsable()) {
+        $("#capture-help").textContent = "This page records one selected input only. Separate microphone and system tracks, KDE tray controls, and per-app capture are not implemented. A PipeWire monitor may be available depending on your audio setup.";
+      }
       ["#offer-meetings", "#auto-record", "#launch-at-login"].forEach(id => { $(id).closest("label").hidden = true; });
       $("#privacy-open").hidden = true;
     }
@@ -285,6 +290,103 @@ $("#test-device").addEventListener("click", async () => {
   } finally { btn.disabled = false; }
 });
 
+/* ---------- pipewire two-track capture ---------- */
+function usePipeWire() {
+  return !$("#pw-panel").hidden && $("#pw-mode").value === "pipewire";
+}
+
+function pwUsable() {
+  const d = state.pwDevices;
+  return !!(d && d.available && d.usable && d.usable.system && d.usable.mic);
+}
+
+function pwTargetsChosen() {
+  return !!$("#pw-system").value && !!$("#pw-mic").value;
+}
+
+function pwNote(text) { $("#pw-note").textContent = text; }
+
+function renderPipeWire() {
+  const pw = usePipeWire();
+  $("#pw-system-field").hidden = !pw;
+  $("#pw-mic-field").hidden = !pw;
+  $("#device-panel").hidden = pw;
+  if (!pw) { pwNote(""); return; }
+  if (!state.pwDevices) pwNote("Scanning the PipeWire graph…");
+  else if (!pwUsable()) pwNote("Two-track capture is unavailable.");
+  else if (!pwTargetsChosen()) pwNote("Choose both tracks to enable Start.");
+  else pwNote("");
+}
+
+async function loadPipeWire() {
+  try {
+    const d = await api("GET", "/api/pipewire/devices");
+    state.pwDevices = d;
+    const notes = [];
+    if (!d.available) {
+      notes.push({ level: "error", title: "PipeWire capture unavailable", detail: d.error || "Unknown error." });
+    } else if (!d.usable.system || !d.usable.mic) {
+      notes.push({ level: "error", title: "No usable PipeWire nodes", detail: d.error || "Nothing was started." });
+    } else if (d.error) {
+      notes.push({ level: "warn", title: "PipeWire warning", detail: d.error });
+    }
+    $("#pw-guidance").replaceChildren(...notes.map(n =>
+      el("div", { class: `note ${n.level}` }, el("strong", { text: n.title }), ` ${n.detail}`)));
+    const sinks = d.sinks.map(n =>
+      [n.name, `${n.description || n.name} · ${n.name}${d.defaults.sink === n.name ? " · session default" : ""}`]);
+    const sources = d.sources.map(n =>
+      [n.name, `${n.description || n.name} · ${n.name}${d.defaults.source === n.name ? " · session default" : ""}`]);
+    fillSelect($("#pw-system"), [["", "Choose a system output…"], ...sinks], $("#pw-system").value || "");
+    fillSelect($("#pw-mic"), [["", "Choose a microphone…"], ...sources], $("#pw-mic").value || "");
+    const mode = $("#pw-mode");
+    const pipewireOption = mode.querySelector("option[value=pipewire]");
+    pipewireOption.disabled = !pwUsable();
+    if (!pwUsable() && mode.value === "pipewire") mode.value = "device";
+    if (pwUsable()) {
+      $("#capture-help").textContent = "Choose a system output and a microphone above, then Start: both are recorded as separate tracks through PipeWire. The session keeps independent system and microphone tracks; nothing leaves this computer.";
+    }
+    renderPipeWire();
+    renderLive();
+  } catch (err) {
+    state.pwDevices = { available: false, error: err.message, sinks: [], sources: [] };
+    $("#pw-guidance").replaceChildren(el("div", { class: "note error" },
+      el("strong", { text: "PipeWire capture unavailable" }), ` ${err.message}`));
+    const mode = $("#pw-mode");
+    const pipewireOption = mode.querySelector("option[value=pipewire]");
+    pipewireOption.disabled = true;
+    if (mode.value === "pipewire") mode.value = "device";
+    renderPipeWire();
+    renderLive();
+  }
+}
+
+$("#pw-mode").addEventListener("change", () => {
+  if (usePipeWire() && !state.pwDevices) loadPipeWire();
+  else renderPipeWire();
+  renderLive();
+});
+$("#pw-system").addEventListener("change", renderPipeWire);
+$("#pw-mic").addEventListener("change", renderPipeWire);
+$("#pw-refresh").addEventListener("click", () =>
+  loadPipeWire().then(() => toast("PipeWire graph rescanned")));
+
+function pipewireStopSummary(report) {
+  if (!report) return;
+  state.pwReport = report;
+  const parts = [];
+  const bad = [];
+  for (const name of ["system", "mic"]) {
+    const t = report.tracks[name];
+    const verdict = (t.verdict || "no signal").toUpperCase();
+    parts.push(`${name} ${t.duration.toFixed(1)}s · ${verdict}`);
+    if (t.state !== "stopped" || t.verdict === "silent") {
+      bad.push(`${name}: ${t.error || t.verdict || t.state}`);
+    }
+  }
+  if (bad.length) toast(`Two-track capture NOT OK — ${bad.join("; ")}`, "error");
+  else toast(`Two tracks captured · ${parts.join(" · ")} → ${report.out_dir}`);
+}
+
 /* ---------- live ---------- */
 function renderLive() {
   const live = state.live;
@@ -294,6 +396,8 @@ function renderLive() {
   btn.classList.toggle("recording", !!active);
   btn.querySelector(".record-label").textContent = active ? (live.state === "finishing" || live.state === "diarizing" ? "Finishing…" : "Stop") : "Start";
   btn.disabled = !!active && ["finishing", "diarizing"].includes(live.state);
+  const needsTargets = !active && usePipeWire() && (!pwUsable() || !pwTargetsChosen());
+  if (needsTargets) btn.disabled = true;
   btn.setAttribute("aria-label", active ? "Stop recording" : "Start recording");
   const pauseBtn = $("#pause-btn");
   pauseBtn.hidden = !active || ["finishing", "diarizing"].includes(live && live.state);
@@ -312,6 +416,15 @@ function renderLive() {
       stats.push(bits.join(" · "));
     }
     if (live.model) stats.push(`${live.model} on ${live.backend}`);
+    if (live.capture === "ingest" && state.pwLevels) {
+      stats.push(`system ${state.pwLevels.system} dB`, `mic ${state.pwLevels.mic} dB`);
+    }
+    if (state.pwReport && !active) {
+      for (const n of ["system", "mic"]) {
+        const t = state.pwReport.tracks[n];
+        if (t) stats.push(`${n} ${t.duration.toFixed(1)}s ${(t.verdict || "no data").toUpperCase()}`);
+      }
+    }
     if (live.pending_chunks > 1) stats.push(`${live.pending_chunks} chunks waiting`);
     if (live.dropped_blocks) stats.push(`${live.dropped_blocks} audio blocks dropped`);
     $("#live-stats").replaceChildren(...stats.map(s => el("span", { text: s })));
@@ -361,14 +474,28 @@ $("#record-btn").addEventListener("click", async () => {
   const active = live && !["done", "error"].includes(live.state);
   try {
     if (active) {
-      await api("POST", "/api/live/stop");
+      const stopped = await api("POST", "/api/live/stop");
       state.live.state = "finishing";
+      if (stopped && stopped.pipewire) pipewireStopSummary(stopped.pipewire);
       setLiveStatus("Finishing the last chunks…");
     } else {
+      const body = { title: $("#live-title").value.trim() || null };
+      if (usePipeWire()) {
+        const system = $("#pw-system").value, mic = $("#pw-mic").value;
+        if (!system || !mic) {
+          toast("Choose a system output and a microphone first — listn never guesses a capture target.", "error");
+          return;
+        }
+        body.capture = "pipewire";
+        body.system_target = system;
+        body.mic_target = mic;
+      }
       $("#live-transcript").replaceChildren();
       $("#privacy-banner").hidden = true;
       state.liveSegments = [];
-      state.live = await api("POST", "/api/live/start", { title: $("#live-title").value.trim() || null });
+      state.pwReport = null;
+      state.pwLevels = null;
+      state.live = await api("POST", "/api/live/start", body);
       setLiveStatus("Loading model… audio is already being captured.");
     }
     renderLive();
@@ -798,6 +925,7 @@ function connectEvents() {
       case "live.started": state.live = ev.status; renderLive(); break;
       case "live.level":
         if (state.live) { state.live.elapsed = ev.elapsed; state.live.pending_chunks = ev.pending; state.live.dropped_blocks = ev.dropped; }
+        if (ev.levels) state.pwLevels = ev.levels;
         setMeter(ev.level_db); renderLive(); break;
       case "live.status":
         if (state.live && ev.state) state.live.state = ev.state;
@@ -864,6 +992,7 @@ async function boot() {
       $("#capture-help").textContent = "This page records one selected input only. Separate microphone and system tracks, KDE tray controls, and per-app capture are not implemented. A PipeWire monitor may be available depending on your audio setup.";
       ["#offer-meetings", "#auto-record", "#launch-at-login"].forEach(id => { $(id).closest("label").hidden = true; });
       $("#privacy-open").hidden = true;
+      $("#pw-panel").hidden = false;   // two-track capture is Linux-only
     }
   } catch (err) {
     toast(`listn server unreachable: ${err.message}`, "error");
@@ -872,12 +1001,14 @@ async function boot() {
   state.settings = state.status.settings;
   renderSettings();
   await loadDevices();
+  if (!$("#pw-panel").hidden) await loadPipeWire();
   for (const j of state.status.jobs) state.jobs.set(j.id, j);
   renderJobs();
   if (state.status.live) {
-    const { live, segments } = await api("GET", "/api/live");
+    const { live, segments, pipewire } = await api("GET", "/api/live");
     state.live = live;
     state.liveSegments = segments;
+    if (pipewire && pipewire.report) state.pwReport = pipewire.report;
     if (segments.length) appendLiveSegments(segments);
     if (!["done", "error"].includes(live.state)) setLiveStatus("Recording…");
   }
