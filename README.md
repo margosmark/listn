@@ -94,7 +94,7 @@ On an Apple Silicon Mac with macOS 14.2 or later:
 ```bash
 xcode-select --install          # Command Line Tools (Swift, codesign), if you don't have them
 brew install uv                 # https://brew.sh first, if you don't have Homebrew
-git clone git@github.com:marslan-coursera/listn.git
+git clone git@github.com:margosmark/listn.git
 cd listn
 scripts/listn-manage.sh first-run
 ```
