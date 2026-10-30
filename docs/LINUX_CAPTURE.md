@@ -7,8 +7,9 @@ The real-daemon verification is reproducible in one command
 [Reproduce the real-daemon rig](#reproduce-the-real-daemon-rig)).
 This implements roadmap step 2 in [DECISIONS](DECISIONS.md) as a bounded
 increment; it does not ship KDE desktop support. The recorder is now wired
-into the app: `listn record` on the CLI and the Live tab of the local web UI
-both start two-track captures through the same code paths.
+into the app: `listn record` on the CLI, the Live tab of the local web UI,
+and the KDE Plasma tray (`listn tray`) all start two-track captures through
+the same code paths.
 
 ## What it is
 
@@ -269,20 +270,51 @@ Measured against a headless PipeWire 1.4.2 + WirePlumber 0.5.8 daemon:
 - Therefore: **no real-hardware claim.** Real microphone capture, real
   device unplug/replug, default-device switching during a recording, system
   output from actual applications, Bluetooth headsets, and KDE-specific
-  integration (tray, portal permissions, session defaults on a desktop) are
-  **untested**.
+  integration (portal permissions, session defaults on a desktop, and the
+  tray as rendered by a running plasmashell panel) are **untested**.
 - To validate on the target machine, run the commands above on CachyOS/KDE
   with real devices: check both verdicts are `ok` while speaking and playing
   audio, unplug the microphone mid-recording (expect `mic: failed … target
   node disappeared`), and confirm `pw-dump`/`pw-record` come from the
   distribution's PipeWire packages.
 
+## KDE tray (`listn tray`)
+
+The tray is a *client* of the local server — the same loopback API the web
+UI uses — rendered as a StatusNotifierItem plus `com.canonical.dbusmenu`
+over the session bus (`dbus-next`, installed with `uv sync --extra tray`; no
+Qt dependency). `listn tray` starts the engine when none is answering on the
+port; `--no-server` refuses to start one and fails with a clear message.
+
+- Controls: recording status line, Start/Stop, Pause/Resume, system-output
+  and microphone pickers (radio items; session defaults are adopted as
+  labelled suggestions, a vanished remembered node re-adopts only the
+  graph's own default, never the first node it saw), Open privacy settings
+  (opens the web UI's settings page — listn's own retention/audio settings
+  are the privacy surface on Linux; PipeWire has no macOS-style per-app
+  permission list), and Quit, which stops an active recording first.
+- Honest states: idle / starting / recording (with per-track frame counts)
+  / paused / stopping / failed (with the recorder's own per-track cause) /
+  unreachable ("listn is not answering"). A refused Start keeps the server's
+  reason visible instead of pretending to record. The macOS-only or
+  unimplemented controls (meetings, auto-record, launch-at-login) are
+  absent, not greyed.
+- Verification: the pure state machine and controller are covered in
+  `tests/test_tray.py` against the real server app with the stand-in
+  `pw-dump`/`pw-record` tools; the D-Bus contract (properties, menu layout,
+  `Event(clicked)` dispatch, watcher registration, `LayoutUpdated` on state
+  change, failure icons) is covered in `tests/test_tray_sni.py` against a
+  real private `dbus-daemon` session and a real uvicorn engine. **Not
+  exercised: interaction with a running plasmashell panel** — that needs a
+  real KDE session.
+
 ## Not in this increment
 
-KDE tray controls, per-app capture, pause inside the capture layer (pause
+Per-app capture, pause inside the capture layer (pause
 stays with the engine session consuming `on_block`), packaging, GPU/model
 changes, and any change to macOS behaviour or to the ingest socket protocol.
 Web-UI/server wiring now exists (this increment): `listn record`,
 `GET /api/pipewire/devices`, `POST /api/live/start` with
 `capture: "pipewire"` plus explicit `system_target`/`mic_target`, the report
-on `GET /api/live` and in the `POST /api/live/stop` response.
+on `GET /api/live` and in the `POST /api/live/stop` response. The KDE tray
+controls now exist (this increment): `listn tray` with the menu above.
