@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import signal
 import sys
+import tempfile
 import threading
+import time
 from pathlib import Path
 
 from listn import __version__
@@ -82,6 +85,97 @@ def cmd_devices(args) -> int:
             print(f"  ch{ch['channel']}: rms {ch['rms_db']} dBFS, peak {ch['peak_db']} dBFS")
         print(f"  {report['advice']}")
     return 0
+
+
+def _print_pipewire_targets(targets, stream) -> None:
+    for name, target in targets.to_dict().items():
+        print(f"{name}: {target['name']} ({target['media_class']}, id {target['id']}, "
+              f"selection: {target['selection']})", file=stream)
+
+
+def cmd_record(args) -> int:
+    """Two-track capture through PipeWire: system output and microphone."""
+    from listn import pipewire as pw
+
+    try:
+        graph = pw.discover()
+    except pw.CaptureError as exc:
+        print(f"PipeWire capture unavailable: {exc}", file=sys.stderr)
+        return 3
+    if args.list_targets:
+        print("System outputs (Audio/Sink):")
+        default = graph.default_sink or ""
+        for node in graph.sinks:
+            mark = "  [session default]" if node.name == default else ""
+            desc = f" — {node.description}" if node.description else ""
+            print(f"  {node.name}  (id {node.id}){desc}{mark}")
+        print("Microphones (Audio/Source):")
+        default = graph.default_source or ""
+        for node in graph.sources:
+            mark = "  [session default]" if node.name == default else ""
+            desc = f" — {node.description}" if node.description else ""
+            print(f"  {node.name}  (id {node.id}){desc}{mark}")
+        print("\nPick both explicitly: listn record --system-target <node> --mic-target <node>")
+        return 0
+    if args.backend != "pipewire":
+        print(f"Unknown capture backend '{args.backend}'. Use pipewire.", file=sys.stderr)
+        return 2
+    chatter = sys.stderr if args.json else sys.stdout
+    try:
+        targets = pw.select_targets(graph, args.system_target, args.mic_target)
+    except pw.CaptureError as exc:
+        print(f"PipeWire targets unavailable: {exc}", file=sys.stderr)
+        return 3
+    _print_pipewire_targets(targets, chatter)
+    if args.out:
+        out_dir = Path(args.out)
+    else:
+        from listn.config import data_dir
+
+        root = data_dir() / "pipewire"
+        root.mkdir(parents=True, exist_ok=True)
+        out_dir = Path(tempfile.mkdtemp(prefix=time.strftime("%Y%m%d-%H%M%S") + "-",
+                                        dir=root))
+    print(f"Recording two tracks into {out_dir}", file=chatter)
+    recorder = pw.TwoTrackRecorder(out_dir, targets, rate=args.rate)
+    try:
+        recorder.start()
+    except pw.CaptureError as exc:
+        print(f"Capture unavailable: {exc}", file=sys.stderr)
+        return 3
+    duration = max(0.0, args.duration)
+    try:
+        end = time.monotonic() + duration
+        while duration > 0 and time.monotonic() < end:
+            time.sleep(min(0.2, max(0.0, end - time.monotonic())))
+        if duration <= 0:
+            print("Recording until Ctrl+C...", file=chatter)
+            while True:
+                time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\nStopping...", file=chatter)
+    report = recorder.stop()
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 0 if report["ok"] else 1
+    for name, track in report["tracks"].items():
+        verdict = (track["verdict"] or "no signal data").upper()
+        line = (f"{name}: {track['state']} {track['duration']:.2f}s -> "
+                f"{track['file'] or 'no file'} [{verdict}")
+        if track["peak_db"] is not None:
+            line += f" peak {track['peak_db']} dBFS"
+        line += "]"
+        if track["error"]:
+            line += f"  error: {track['error']}"
+        print(line)
+    if report["ok"]:
+        print(f"Capture OK: both tracks recorded with signal in {report['out_dir']}.")
+    else:
+        reasons = [f"{n}: {t['error'] or t['verdict'] or t['state']}"
+                   for n, t in report["tracks"].items()
+                   if t["state"] != "stopped" or t["verdict"] == "silent"]
+        print("Capture NOT OK — " + "; ".join(reasons), file=sys.stderr)
+    return 0 if report["ok"] else 1
 
 
 def cmd_live(args) -> int:
@@ -374,6 +468,26 @@ def build_parser() -> argparse.ArgumentParser:
     lv.add_argument("--format", choices=EXPORT_FORMATS, default="txt")
     _add_model_args(lv)
     lv.set_defaults(func=cmd_live)
+
+    rc = sub.add_parser(
+        "record",
+        help="Record system output and microphone as two separate tracks (Linux/PipeWire)")
+    rc.add_argument("--backend", choices=["pipewire"], default="pipewire",
+                    help="Capture backend (default: pipewire)")
+    rc.add_argument("--system-target", metavar="NODE",
+                    help="PipeWire node name or id for the system output track (see --list)")
+    rc.add_argument("--mic-target", metavar="NODE",
+                    help="PipeWire node name or id for the microphone track (see --list)")
+    rc.add_argument("--duration", type=float, default=5.0, metavar="SEC",
+                    help="Seconds to record; 0 runs until Ctrl+C (default: 5)")
+    rc.add_argument("--out", metavar="DIR",
+                    help="Directory for system.wav/mic.wav (default: a fresh folder in the data directory)")
+    rc.add_argument("--rate", type=int, default=48000, metavar="HZ",
+                    help="Sample rate (default: 48000)")
+    rc.add_argument("--list", action="store_true", dest="list_targets",
+                    help="List the discovered PipeWire nodes and exit")
+    rc.add_argument("--json", action="store_true", help="Print the capture report as JSON")
+    rc.set_defaults(func=cmd_record)
 
     tr = sub.add_parser("transcribe", help="Transcribe audio files (wav, mp3, m4a, ...)")
     tr.add_argument("files", nargs="+")

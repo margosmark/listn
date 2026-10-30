@@ -1,6 +1,6 @@
 # listn
 
-**For contributors and agents:** [Agent guidance](AGENTS.md) · [Architecture](docs/ARCHITECTURE.md) · [Operations](docs/OPERATIONS.md) · [Decisions and Linux/KDE roadmap](docs/DECISIONS.md). Linux has a bounded Python CLI and local web workflow; separate-track Linux capture and KDE integration are not implemented.
+**For contributors and agents:** [Agent guidance](AGENTS.md) · [Architecture](docs/ARCHITECTURE.md) · [Operations](docs/OPERATIONS.md) · [Decisions and Linux/KDE roadmap](docs/DECISIONS.md). Linux has a bounded Python CLI and local web workflow, including a PipeWire two-track recorder (`listn record` and the Live tab of the web UI); it is verified against a headless PipeWire daemon with synthetic audio, not yet on real hardware, and KDE tray integration is not implemented.
 
 Private, local-only transcripts of what you hear on your Mac, and of audio files, using Whisper on the machine itself.
 
@@ -51,13 +51,30 @@ accurate; choose a larger model as needed. The Files tab supports uploads and
 the Library tab browsing/export. The server is loopback-only. Data lives in
 `$XDG_DATA_HOME/listn` or `~/.local/share/listn` (override `LISTN_DATA_DIR`).
 
-Live/`listn live` records **one** PortAudio input, not independent microphone
-and system tracks. A PipeWire/PulseAudio monitor may be selectable if exposed
+Separate microphone and system tracks are recorded through PipeWire:
+
+```sh
+uv run listn record --list                      # discovered nodes (sinks + microphones)
+uv run listn record --system-target <node> --mic-target <node> --duration 10
+```
+
+The web UI's Live tab offers the same two-track capture on Linux: it shows the
+discovered PipeWire nodes, you pick the system output and the microphone
+explicitly, and Start is refused with the reason when discovery finds nothing
+usable — listn never guesses a capture target. Both paths use the same
+recorder and feed the engine's ingest pipeline, so pause, the independent
+tracks and transcription behave as they do on macOS. See
+[Linux capture](docs/LINUX_CAPTURE.md) for status and limits: prototype,
+verified against a headless PipeWire daemon with synthetic audio and covered
+by automated tests, not yet validated on real hardware or a KDE session.
+
+`listn live` and the web UI's single-input mode record **one** PortAudio
+input. A PipeWire/PulseAudio monitor may be selectable if exposed
 by PortAudio; routing, permissions, device changes and audio quality need
 verification on the target desktop. Do not interpret its labels as reliable
-speaker identity. There is no Linux separate-track recorder, per-app capture,
-KDE tray, meeting detection or launch-at-login integration. Do not use the
-macOS management script on Linux. GPU acceleration is unverified; MLX-based
+speaker identity. Per-app capture, KDE tray, meeting detection and
+launch-at-login integration are not implemented. Do not use the macOS
+management script on Linux. GPU acceleration is unverified; MLX-based
 notes are unavailable and the existing extractive fallback is used. See
 [operations](docs/OPERATIONS.md) for validation steps.
 
