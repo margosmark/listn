@@ -1017,5 +1017,11 @@ async function boot() {
   connectEvents();
   const view = location.hash.slice(1);
   if (["live", "files", "library"].includes(view)) showView(view);
+  if (view === "settings") {
+    // Opened from the KDE tray's "Open privacy settings" item: listn's own
+    // retention/audio settings are the privacy surface on Linux.
+    loadVoices();
+    $("#settings-dialog").showModal();
+  }
 }
 boot();

@@ -50,6 +50,70 @@ def cmd_ui(args) -> int:
     return 0
 
 
+def cmd_tray(args) -> int:
+    """KDE Plasma tray controls for the real two-track recorder.
+
+    The tray is a client of the loopback server (same API the web UI uses).
+    If no server is answering on --port, one is started here and the tray
+    owns its lifetime; otherwise the tray attaches to the running server and
+    only ever acts on it.
+    """
+    if sys.platform == "darwin":
+        print("The KDE tray is Linux-only; on macOS use the listn menu bar app.",
+              file=sys.stderr)
+        return 2
+    import asyncio
+
+    try:
+        import dbus_next  # noqa: F401
+    except ImportError:
+        print("The tray needs dbus-next. Install it with `uv sync --extra tray` "
+              "or `pip install 'listn[tray]'`.", file=sys.stderr)
+        return 3
+
+    from listn.tray import ServerClient, TrayController, port_in_use
+    from listn.tray_sni import StatusNotifierItem
+
+    port = args.port
+    owned = None
+    thread = None
+    if port_in_use(port):
+        print(f"listn tray: attached to the engine on 127.0.0.1:{port}")
+    elif args.no_server:
+        print(f"listn is not answering on 127.0.0.1:{port}. Start it with "
+              "`listn ui`, or drop --no-server to let the tray start it.",
+              file=sys.stderr)
+        return 1
+    else:
+        from listn.tray import start_embedded_server
+
+        owned, thread = start_embedded_server(port)
+        end = time.monotonic() + 30
+        while time.monotonic() < end and not port_in_use(port):
+            time.sleep(0.2)
+        if not port_in_use(port):
+            print("The tray's embedded engine did not come up.", file=sys.stderr)
+            return 1
+        print(f"listn tray: engine started on 127.0.0.1:{port}")
+
+    controller = TrayController(ServerClient(port=port))
+    tray = StatusNotifierItem(controller)
+    try:
+        asyncio.run(tray.run())
+    finally:
+        # Quit must never leave a recording running behind us.
+        if controller.status.active:
+            try:
+                controller.client.stop()
+            except Exception:
+                logging.getLogger("listn.tray").exception(
+                    "stop on quit failed; check the engine at 127.0.0.1:%s", port)
+        if owned is not None and thread is not None:
+            owned.should_exit = True
+            thread.join(timeout=10)
+    return 0
+
+
 def cmd_devices(args) -> int:
     from listn import devices as devmod
     from listn.capture import DeviceError, measure_levels
@@ -488,6 +552,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="List the discovered PipeWire nodes and exit")
     rc.add_argument("--json", action="store_true", help="Print the capture report as JSON")
     rc.set_defaults(func=cmd_record)
+
+    ty = sub.add_parser(
+        "tray",
+        help="KDE Plasma tray: start/stop/pause the two-track recorder (Linux)")
+    ty.add_argument("--port", type=int, default=8765,
+                    help="Engine port to control (default: 8765)")
+    ty.add_argument("--no-server", action="store_true",
+                    help="Only attach to an engine that is already running")
+    ty.set_defaults(func=cmd_tray)
 
     tr = sub.add_parser("transcribe", help="Transcribe audio files (wav, mp3, m4a, ...)")
     tr.add_argument("files", nargs="+")
