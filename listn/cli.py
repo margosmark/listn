@@ -34,6 +34,28 @@ def _settings_from(args) -> Settings:
     return s.validated()
 
 
+def _perf_epilog() -> str:
+    """Show the transcription performance knobs as they are right now.
+
+    Reads the effective ``Settings`` (settings.json + ``LISTN_*`` env), so
+    ``--help`` reports what a run would actually use instead of a hard-coded
+    default that may no longer be true.
+    """
+    try:
+        s = Settings.load()
+    except ValueError as exc:
+        return (f"performance knobs: INVALID — {exc}\n"
+                "  Fix settings.json or the LISTN_COMPUTE_TYPE / "
+                "LISTN_CPU_THREADS / LISTN_BEAM_SIZE environment variable.")
+    threads = "auto (backend chooses)" if s.cpu_threads is None else str(s.cpu_threads)
+    return ("performance knobs (effective for this run):\n"
+            f"  compute type: {s.compute_type}\n"
+            f"  cpu threads:  {threads}\n"
+            f"  beam size:    {s.beam_size}\n"
+            "  override with LISTN_COMPUTE_TYPE, LISTN_CPU_THREADS, LISTN_BEAM_SIZE "
+            "(env wins over settings.json)")
+
+
 def _add_model_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--model", choices=MODELS,
                    help="Whisper model (default: saved setting; first run is large-v3-turbo on Apple Silicon with MLX, otherwise small)")
@@ -562,7 +584,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Only attach to an engine that is already running")
     ty.set_defaults(func=cmd_tray)
 
-    tr = sub.add_parser("transcribe", help="Transcribe audio files (wav, mp3, m4a, ...)")
+    tr = sub.add_parser("transcribe", help="Transcribe audio files (wav, mp3, m4a, ...)",
+                        epilog=_perf_epilog(),
+                        formatter_class=argparse.RawDescriptionHelpFormatter)
     tr.add_argument("files", nargs="+")
     tr.add_argument("--title")
     tr.add_argument("--output", help="File (or directory for several inputs) to write")
@@ -611,3 +635,8 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except KeyboardInterrupt:
         return 130
+    except ValueError as exc:
+        # Invalid settings (e.g. a LISTN_* knob) fail loudly and readably,
+        # never silently fall back to a different value.
+        print(f"listn: {exc}", file=sys.stderr)
+        return 2
