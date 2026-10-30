@@ -52,8 +52,16 @@ die() { echo "rig: $*" >&2; exit 3; }
 for tool in pipewire wireplumber pw-dump pw-record pw-cat python3; do
   command -v "$tool" >/dev/null 2>&1 || die "required tool '$tool' not found on PATH"
 done
-python3 -c 'import numpy' >/dev/null 2>&1 \
-  || die "python3 numpy is required (the recorder analyzes WAVs with it)"
+# The numpy check must use the interpreter LISTN_CMD actually runs, not the
+# system python3: with `LISTN_CMD=".venv/bin/python -m listn"` numpy lives in
+# the venv and the system interpreter cannot import it.
+LISTN_PY="${LISTN_CMD%% *}"
+case "$LISTN_PY" in
+  *python*) ;;
+  *) LISTN_PY="python3" ;;   # e.g. LISTN_CMD="uv run listn" → no python prefix
+esac
+"$LISTN_PY" -c 'import numpy' >/dev/null 2>&1 \
+  || die "numpy is required (the recorder analyzes WAVs with it), but '$LISTN_PY' cannot import it — install it for that interpreter (e.g. 'uv sync --group dev')"
 
 # ---- private rig dir -------------------------------------------------------
 RIG="$(mktemp -d "${TMPDIR:-/tmp}/listn-capture-rig.XXXXXX")" || die "mktemp failed"
@@ -76,7 +84,7 @@ export XDG_CONFIG_HOME="$RIG/xdg"
 # ---- tones + node config ---------------------------------------------------
 # tone.raw: 1 s of 440 Hz s16le mono 48 kHz, looped into the mic FIFO.
 # tone.wav: DURATION+3 s stereo WAV, played into the null sink by pw-cat.
-python3 - "$RIG" "$DURATION" "$TONE_HZ" <<'PYEOF'
+"$LISTN_PY" - "$RIG" "$DURATION" "$TONE_HZ" <<'PYEOF'
 import math, struct, sys, wave
 import numpy as np
 rig, dur, hz = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
@@ -128,7 +136,7 @@ EOF
 # module opens the read end) and then paces ~1:1 with the graph. Holding the
 # write end open the whole time matters: an empty FIFO reads as EOF and the
 # tunnel source goes silent (observed: exactly 1024 zero frames, then stop).
-python3 - "$RIG/mic.fifo" "$RIG/tone.raw" <<'PYEOF' >"$RIG/writer.log" 2>&1 &
+"$LISTN_PY" - "$RIG/mic.fifo" "$RIG/tone.raw" <<'PYEOF' >"$RIG/writer.log" 2>&1 &
 import os, sys, time
 fifo, tone = sys.argv[1], sys.argv[2]
 fd = os.open(fifo, os.O_WRONLY)
@@ -164,7 +172,7 @@ sleep 1.5
 nodes_seen=""
 ok=""
 for _ in $(seq 1 100); do
-  nodes_seen="$(pw-dump 2>/dev/null | python3 -c '
+  nodes_seen="$(pw-dump 2>/dev/null | "$LISTN_PY" -c '
 import json, sys
 try: objs = json.load(sys.stdin)
 except Exception: sys.exit(0)
@@ -212,7 +220,7 @@ if [ ! -s "$RIG/report.json" ]; then
 fi
 
 # ---- verdict ---------------------------------------------------------------
-python3 - "$RIG" "$rc" "$OUT_DIR" <<'PYEOF'
+"$LISTN_PY" - "$RIG" "$rc" "$OUT_DIR" <<'PYEOF'
 import json, math, os, shutil, sys
 import numpy as np
 import wave
