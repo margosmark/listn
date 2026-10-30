@@ -70,6 +70,9 @@ class DeviceTestIn(BaseModel):
 
 class LiveStartIn(BaseModel):
     title: str | None = None
+    capture: str | None = None          # None = input device, "pipewire" = two tracks
+    system_target: str | None = None    # explicit PipeWire node (name or id)
+    mic_target: str | None = None       # explicit PipeWire node (name or id)
 
 
 class SessionPatch(BaseModel):
@@ -131,6 +134,10 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
             app.state.ingest = None
         yield
         app.state.shutting_down.set()
+        pwlive = getattr(app.state, "pw", None)
+        if pwlive is not None and pwlive.active:
+            # Finalize the two tracks first; its stop also ends the session.
+            pwlive.stop(wait=True)
         if app.state.engine.live_active():
             app.state.engine.stop_live(wait=True)
         if app.state.ingest is not None:
@@ -144,6 +151,7 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
     app.state.shutting_down = threading.Event()
     app.state.http_port = None
     app.state.ingest = None
+    app.state.pw = None   # listn.pipewire_live.PipeWireLive while a two-track run is active
 
     def eng() -> Engine:
         return app.state.engine
@@ -212,6 +220,13 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
     def get_devices():
         return device_report()
 
+    @app.get("/api/pipewire/devices")
+    def get_pipewire_devices():
+        """Discovered PipeWire nodes for explicit target picking. Never selects."""
+        from listn.pipewire_live import discover_devices
+
+        return discover_devices()
+
     @app.post("/api/devices/test")
     def test_device(body: DeviceTestIn):
         if eng().live_active():
@@ -241,6 +256,31 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
 
     @app.post("/api/live/start")
     def live_start(body: LiveStartIn):
+        if body.capture not in (None, "", "pipewire"):
+            raise HTTPException(400, f"Unknown capture mode '{body.capture}'. "
+                                     "Use 'pipewire' for two tracks, or leave it out for the input device.")
+        wants_pipewire = body.capture == "pipewire" or bool(body.system_target or body.mic_target)
+        if wants_pipewire:
+            from listn.pipewire import CaptureError
+            from listn.pipewire_live import start_live
+
+            if not (body.system_target and body.mic_target):
+                raise HTTPException(400, "Choose both targets explicitly: a system output "
+                                         "and a microphone from GET /api/pipewire/devices. "
+                                         "listn never guesses a capture target.")
+            if eng().live_active():
+                raise HTTPException(409, "A recording is already running.")
+            try:
+                capture = start_live(eng(), Settings(**{**app.state.settings.__dict__}),
+                                     body.system_target, body.mic_target, body.title)
+            except CaptureError as exc:
+                raise HTTPException(400, str(exc))
+            except RuntimeError as exc:
+                raise HTTPException(409 if "already" in str(exc) else 400, str(exc))
+            app.state.pw = capture
+            if capture.session is None:  # start_live attaches before returning
+                raise HTTPException(500, "The live session did not start.")
+            return capture.session.status()
         try:
             session = eng().start_live(Settings(**{**app.state.settings.__dict__}), body.title)
         except RuntimeError as exc:
@@ -269,6 +309,14 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
 
     @app.post("/api/live/stop")
     def live_stop():
+        pwlive = getattr(app.state, "pw", None)
+        if pwlive is not None and pwlive.active:
+            # Stops the recorder first (finalizing both WAVs with its own
+            # honest report), then the session that consumed the blocks.
+            result = pwlive.stop(wait=False)
+            if result["id"] is None and result["pipewire"] is None:
+                raise HTTPException(409, "Nothing is recording.")
+            return result
         meta = eng().stop_live(wait=False)
         if meta is None:
             raise HTTPException(409, "Nothing is recording.")
@@ -277,9 +325,12 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
     @app.get("/api/live")
     def live_status():
         e = eng()
+        pwlive = getattr(app.state, "pw", None)
+        pw_status = pwlive.status() if pwlive is not None else None
         if not e.live:
-            return {"live": None}
-        return {"live": e.live.status(), "segments": [s.to_dict() for s in e.live.segments]}
+            return {"live": None, "pipewire": pw_status}
+        return {"live": e.live.status(), "segments": [s.to_dict() for s in e.live.segments],
+                "pipewire": pw_status}
 
     @app.post("/api/files")
     async def upload(file: UploadFile = File(...), title: str = Form(""), diarize_speakers: bool = Form(False)):

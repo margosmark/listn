@@ -3,7 +3,9 @@
 Status: **prototype with automated tests and one real-daemon verification on a
 headless machine — not validated on real audio hardware or a KDE session.**
 This implements roadmap step 2 in [DECISIONS](DECISIONS.md) as a bounded
-increment; it does not ship KDE desktop support.
+increment; it does not ship KDE desktop support. The recorder is now wired
+into the app: `listn record` on the CLI and the Live tab of the local web UI
+both start two-track captures through the same code paths.
 
 ## What it is
 
@@ -33,11 +35,55 @@ Run it:
 
 ```sh
 uv sync --group dev
-uv run python -m listn.pipewire --dry-run          # discovery only
+uv run python -m listn.pipewire --dry-run          # discovery only (module probe)
 uv run python -m listn.pipewire --duration 5       # record both tracks
 uv run python -m listn.pipewire --duration 5 --json > report.json
-uv run pytest tests/test_pipewire.py               # automated tests
+
+uv run listn record --list                         # discovered nodes, app CLI
+uv run listn record --system-target <node> --mic-target <node> --duration 5
+uv run listn ui --no-browser                       # web UI: pick both targets in
+                                                   # the Live tab, then Start
+
+uv run pytest tests/test_pipewire.py               # module tests
+uv run pytest tests/test_pipewire_wiring.py        # CLI/server wiring tests
 ```
+
+The app CLI and the web UI go through `listn/pipewire_live.py`, which only
+adapts the module: `discover()` and `select_targets()` resolve targets (the
+web UI requires both to be picked explicitly from `GET /api/pipewire/devices`
+and never starts when discovery returns nothing usable), and
+`TwoTrackRecorder` feeds every block into the engine's ingest seam
+(`LiveSession.push_audio`), so the session gets the independent system/mic
+tracks, pause semantics and transcription unchanged. A completed web run
+reports the recorder's own per-track WAV analysis (state, duration, verdict,
+peak/RMS, error) — never a bare "saved".
+
+- Wiring (this increment): `uv run pytest` — **267 passed** (254 pre-existing
+  + 13 new tests in `tests/test_pipewire_wiring.py` covering the CLI and
+  server paths with stand-in `pw-dump`/`pw-record` executables, including
+  the id-probe contract and every refusal path).
+- Real-daemon wiring run on this machine (same headless daemon as above, a
+  440 Hz tone piped into the sink and into the pipe-tunnel source):
+
+  ```text
+  $ uv run listn record --list
+  System outputs (Audio/Sink):
+    listn.test.system  (id 34) — Test System Output  [session default]
+  Microphones (Audio/Source):
+    listn.test.mic  (id 38) — Test Mic Tone
+
+  $ uv run listn record --system-target listn.test.system --mic-target listn.test.mic --duration 4 --json
+  ok: true, CLI exit 0
+  system: state=stopped 4.011 s 192512 frames peak=-10.5 dBFS rms=-13.5 verdict=ok
+  mic:    state=stopped 3.989 s 191488 frames peak=-7.4  dBFS rms=-11.0 verdict=ok
+
+  $ curl -X POST /api/live/start -d '{"capture":"pipewire",
+      "system_target":"listn.test.system","mic_target":"listn.test.mic"}'
+  state=recording; mid-run GET /api/live: system 293888 frames, mic 294912 frames
+  POST /api/live/stop -> report ok=true; session audio-system.wav 197600 B,
+  audio-mic.wav 198738 B; transcripts empty (a pure tone carries no speech —
+  expected). Starts without both explicit targets are refused with 400.
+  ```
 
 Exit codes: `0` capture succeeded with microphone signal, `1` capture failed
 or the microphone recorded only silence, `3` PipeWire/tools unavailable or
@@ -130,7 +176,10 @@ Measured against a headless PipeWire 1.4.2 + WirePlumber 0.5.8 daemon:
 
 ## Not in this increment
 
-KDE tray controls, web-UI/server wiring (the prototype is CLI/module only),
-per-app capture, pause inside the capture layer (pause stays with the engine
-session consuming `on_block`), packaging, GPU/model changes, and any change
-to macOS behaviour or to the ingest socket protocol.
+KDE tray controls, per-app capture, pause inside the capture layer (pause
+stays with the engine session consuming `on_block`), packaging, GPU/model
+changes, and any change to macOS behaviour or to the ingest socket protocol.
+Web-UI/server wiring now exists (this increment): `listn record`,
+`GET /api/pipewire/devices`, `POST /api/live/start` with
+`capture: "pipewire"` plus explicit `system_target`/`mic_target`, the report
+on `GET /api/live` and in the `POST /api/live/stop` response.
