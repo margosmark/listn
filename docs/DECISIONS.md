@@ -17,6 +17,7 @@ Mark requested Linux desktop support focused on KDE, and raised the idea of a da
 2. Prototype microphone and system-output capture as separate tracks using the target desktop's audio stack. Verify permissions, device changes, silence, failure and pause handling on real hardware.
    A first prototype now exists in `listn/pipewire.py` with automated tests and a headless-daemon run documented in [LINUX_CAPTURE](LINUX_CAPTURE.md); verification on real hardware is still outstanding.
 3. Add KDE tray controls and a dashboard based on the existing local web UI, subject to a concrete UX/design specification. Candidate information: recording status, input/output sources, activity/levels, transcript library and diagnostics. Clearly distinguish proposed from observed data; never present silence as a successful recording.
+   A first read-only dashboard now ships at `/dashboard` (backed by `GET /api/dashboard`): recording status, per-track PipeWire state, transcription queue and recent recordings with track separation, rendered from real engine state with honest empty states. Tray controls and a designed UX remain unimplemented.
 4. Evaluate packaging and hardware acceleration on CachyOS. Per-application capture, generative notes and other distributions are follow-up decisions, not prerequisites for documenting the repo.
 
 ## Acceptance principles for a future Linux release
