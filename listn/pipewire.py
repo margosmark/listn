@@ -14,7 +14,10 @@ How it fits together
   can be handed to an ``on_block`` callback — the same shape as the
   engine's ``LiveSession.push_audio(track, sample_rate, samples)`` used by
   the macOS capture client, so the existing ingest pipeline, pause
-  semantics and silence detection apply unchanged.
+  semantics and silence detection apply unchanged. Because the system
+  track targets an ``Audio/Sink``, that stream also asks for monitor
+  capture explicitly (``--properties stream.capture.sink=true``) — see
+  the honesty rules for why ``--target`` alone is not enough.
 * While recording, the target node of each track is watched with
   ``pw-dump <id>``. PipeWire 1.4.2 ``pw-record`` does not stop when its
   target disappears: it silently switches to another source (verified on a
@@ -25,13 +28,31 @@ How it fits together
 Honesty rules
 -------------
 * ``report["ok"]`` is true only when both tracks stopped cleanly, wrote a
-  finalized WAV with more than zero frames, kept their target node, and the
-  mic captured actual signal. Silence is never reported as success: each
-  track carries its own ``verdict`` (``ok``/``quiet``/``silent``).
-* Nothing here was verified on real audio hardware or a KDE session; the
-  automated tests use a fake ``pw-record`` and synthetic audio. The runtime
-  probe (``python -m listn.pipewire``) is the tool for real-hardware checks
-  and says so in its output.
+  finalized WAV with more than zero frames, kept their target node, the
+  mic captured actual signal, **neither track is pinned at the format
+  maximum across a large share of its samples** (``verdict: clipped``),
+  and **the two tracks are not the same waveform** — a capture that put
+  one node's audio into both files fails with ``system and mic tracks are
+  identical: <measured cause>``, because independent system/mic tracks
+  are the feature, not a side effect. Silence is never reported as
+  success either: each track carries its own ``verdict``
+  (``ok``/``quiet``/``silent``/``clipped``).
+* ``pw-record --target`` only *names* a node. For an ``Audio/Sink``
+  target the stream additionally sets
+  ``--properties stream.capture.sink=true``: on a real CachyOS/KDE
+  laptop, plain ``--target <sink>`` bound the capture to the session's
+  default source instead of the sink monitor — both tracks then recorded
+  the microphone (raw two-process A/B without any listn code:
+  corr=1.000000, 96.6% identical samples, empty ``pw-record`` stderr) —
+  while the headless rig on PipeWire 1.4.2 links the same argv
+  correctly. The routing is environment-dependent, so the property is
+  passed unconditionally.
+* What has actually been measured where: the tests fake ``pw-record``
+  with per-target synthetic content; the headless rig asserts real-daemon
+  capture *and* track distinctness; the identical-track failure and the
+  ``stream.capture.sink=true`` A/B were measured on the real laptop. The
+  acceptance rerun of the fixed app on that laptop is pending — use
+  ``python -m listn.pipewire`` or ``scripts/linux_capture_rig.sh``.
 
 Limitations of this increment: no KDE tray, no web-UI wiring, no per-app
 capture, no pause of its own (pause belongs to the engine session that
@@ -70,6 +91,20 @@ NODE_WATCH_INTERVAL = 1.0
 CLEAN_STOP_CODES = (0, 1, 130)
 SILENT_PEAK_DB = -60.0
 QUIET_PEAK_DB = -35.0
+# |int16| at or above 32766 is "at the format maximum". A large share of a
+# file pinned there is clipping/DC, not a capture of the source — the
+# failing real-hardware run measured 7.2% of samples at full scale while
+# the peak -0.0 dBFS was reported as success.
+RAIL_LEVEL = 32766.0 / 32768.0
+CLIPPED_FS_FRACTION = 0.02
+# Two completed tracks count as one signal when their samples match across
+# most of the overlapping span or their correlation is ~1 (the
+# real-hardware fallback measured 96.6% identical, corr=1.000000; two
+# genuinely different tracks measured 0.5% identical, corr=-0.03).
+IDENTICAL_SAMPLE_FRACTION = 0.90
+IDENTICAL_CORR = 0.999
+# compare at most ~60 s of each file so a long recording stays cheap
+COMPARE_MAX_FRAMES = 60 * DEFAULT_RATE
 TRACK_NAMES = {TRACK_SYSTEM: "system", TRACK_MIC: "mic"}
 
 
@@ -330,6 +365,41 @@ def select_targets(graph: Graph, system: str | None = None, mic: str | None = No
     return Targets(system=system_target, mic=mic_target)
 
 
+def _scan_wav_chunks(fh, size: int):
+    """Walk a WAV's chunks once: ``(fmt, data_offset, declared)``.
+
+    ``fmt`` is ``(channels, rate, sample_width_bytes)`` or ``None`` when
+    there is no usable ``fmt`` chunk; ``declared`` is the ``data`` chunk's
+    size field (``None`` when there is no data chunk). Pure — every error
+    *decision* and message belongs to the caller, so the behaviour of
+    :func:`analyze_wav` stays exactly where its tests pin it.
+    """
+    fmt = None
+    data_offset = None
+    declared = None
+    offset = 12
+    fh.seek(12)
+    while offset + 8 <= size:
+        fh.seek(offset)
+        raw = fh.read(8)
+        if len(raw) < 8:
+            break
+        cid, csize = raw[:4], int.from_bytes(raw[4:], "little")
+        if cid == b"fmt " and csize >= 16:
+            body = fh.read(16)
+            if len(body) < 16:
+                break
+            fmt = (int.from_bytes(body[2:4], "little"),
+                   int.from_bytes(body[4:8], "little"),
+                   int.from_bytes(body[12:14], "little"))
+        elif cid == b"data":
+            data_offset = offset + 8
+            declared = csize
+            break
+        offset += 8 + csize + (csize & 1)
+    return fmt, data_offset, declared
+
+
 def analyze_wav(path: Path | str) -> dict:
     """Inspect a captured WAV without trusting its header.
 
@@ -337,10 +407,16 @@ def analyze_wav(path: Path | str) -> dict:
     (``data`` = 0, ``RIFF`` = 8 with PipeWire 1.4.2) and the stdlib ``wave``
     module refuses to open it, so the chunks are walked manually and an
     unfinalized file is reported as such instead of raising.
+
+    Besides level and duration, the result carries ``fs_fraction`` — the
+    share of samples at the format maximum — and a ``clipped`` verdict
+    when that share is large: a peak pinned at full scale across a big
+    fraction of the file is clipping, not evidence of signal.
     """
     result = {
         "file": None, "duration": 0.0, "samplerate": 0, "channels": 0,
-        "frames": 0, "rms_db": None, "peak_db": None, "verdict": None, "error": None,
+        "frames": 0, "rms_db": None, "peak_db": None, "fs_fraction": 0.0,
+        "verdict": None, "error": None,
     }
     p = Path(path)
     if not p.is_file():
@@ -353,28 +429,7 @@ def analyze_wav(path: Path | str) -> dict:
         if len(header) < 12 or header[:4] != b"RIFF" or header[8:12] != b"WAVE":
             result["error"] = "not a WAV file"
             return result
-        fmt = None
-        data_offset = None
-        declared = None
-        offset = 12
-        while offset + 8 <= size:
-            fh.seek(offset)
-            raw = fh.read(8)
-            if len(raw) < 8:
-                break
-            cid, csize = raw[:4], int.from_bytes(raw[4:], "little")
-            if cid == b"fmt " and csize >= 16:
-                body = fh.read(16)
-                if len(body) < 16:
-                    break
-                fmt = (int.from_bytes(body[2:4], "little"),
-                       int.from_bytes(body[4:8], "little"),
-                       int.from_bytes(body[12:14], "little"))
-            elif cid == b"data":
-                data_offset = offset + 8
-                declared = csize
-                break
-            offset += 8 + csize + (csize & 1)
+        fmt, data_offset, declared = _scan_wav_chunks(fh, size)
     if fmt is None or data_offset is None:
         result["error"] = "WAV file has no fmt/data chunk"
         return result
@@ -408,16 +463,111 @@ def analyze_wav(path: Path | str) -> dict:
         "duration": round(frames / rate, 3) if rate else 0.0,
     })
     if samples.size:
-        peak = float(np.max(np.abs(samples)))
+        magnitude = np.abs(samples)
+        peak = float(np.max(magnitude))
         rms = float(np.sqrt(np.mean(np.square(samples, dtype=np.float64))))
         result["rms_db"] = round(dbfs(rms), 1)
         result["peak_db"] = round(dbfs(peak), 1)
+        rail = int(np.count_nonzero(magnitude >= RAIL_LEVEL))
+        result["fs_fraction"] = round(rail / samples.size, 4)
         if result["peak_db"] < SILENT_PEAK_DB:
             result["verdict"] = "silent"
         elif result["peak_db"] < QUIET_PEAK_DB:
             result["verdict"] = "quiet"
+        elif result["fs_fraction"] >= CLIPPED_FS_FRACTION:
+            result["verdict"] = "clipped"
         else:
             result["verdict"] = "ok"
+    return result
+
+
+def _read_wav_samples(path: Path | str, max_frames: int):
+    """Read up to ``max_frames`` frames of 16-bit PCM from ``path``.
+
+    Shares :func:`_scan_wav_chunks` with :func:`analyze_wav` so both
+    interpret the same header walk. Raises ``ValueError``/``OSError`` —
+    the caller decides what a file it cannot read means for its verdict.
+    Returns ``(samples, sample_rate, frames)`` with samples flattened
+    (the recorder's files are mono).
+    """
+    p = Path(path)
+    size = p.stat().st_size
+    with open(p, "rb") as fh:
+        header = fh.read(12)
+        if len(header) < 12 or header[:4] != b"RIFF" or header[8:12] != b"WAVE":
+            raise ValueError(f"{p.name}: not a WAV file")
+        fmt, data_offset, declared = _scan_wav_chunks(fh, size)
+    if fmt is None or data_offset is None:
+        raise ValueError(f"{p.name}: WAV file has no fmt/data chunk")
+    channels, rate, width = fmt
+    if channels < 1 or rate < 1 or width != 2:
+        raise ValueError(f"{p.name}: unsupported WAV format "
+                         f"({channels}ch {rate}Hz {width * 8}-bit)")
+    available = max(0, size - data_offset)
+    if declared is None or declared == 0 or declared > available:
+        payload = available
+    else:
+        payload = declared
+    frames = min(payload // (channels * 2), int(max_frames))
+    with open(p, "rb") as fh:
+        fh.seek(data_offset)
+        raw = fh.read(frames * channels * 2)
+    return np.frombuffer(raw, dtype="<i2"), rate, frames
+
+
+def compare_tracks(path_a: Path | str, path_b: Path | str, *,
+                   max_frames: int = COMPARE_MAX_FRAMES) -> dict:
+    """Measure whether two captured WAVs contain the same waveform.
+
+    Independent system and microphone tracks are the product's promise on
+    Linux, so the check is made *across* the files: when ``pw-record
+    --target`` binds both processes to one source, each track on its own
+    still looks healthy (measured on real hardware: both verdicts ``ok``,
+    peak -0.0 dBFS) while the capture is worthless — corr=1.000000 and
+    96.6% byte-identical samples between the two files.
+
+    Compares the overlapping span capped at ``max_frames`` (bounded
+    memory) and returns:
+
+    * ``identical`` — True when the samples match byte-wise for
+      ``IDENTICAL_SAMPLE_FRACTION`` of the span **or** their Pearson
+      correlation is at least ``IDENTICAL_CORR``;
+    * ``identical_fraction`` / ``corr`` / ``frames`` — the measurements
+      behind that verdict (``corr`` is ``None`` for constant signals,
+      where correlation is undefined and only the fraction can speak);
+    * ``cause`` — the measured one-liner for a failure report;
+    * ``error`` — set when the files cannot be read or the overlap is too
+      short to judge; a comparison that cannot run never claims identity.
+    """
+    result = {"frames": 0, "identical_fraction": None, "corr": None,
+              "identical": False, "error": None, "cause": None}
+    try:
+        samples_a, rate_a, _ = _read_wav_samples(path_a, max_frames)
+        samples_b, rate_b, _ = _read_wav_samples(path_b, max_frames)
+    except (OSError, ValueError) as exc:
+        result["error"] = f"could not compare tracks: {exc}"
+        return result
+    n = min(samples_a.size, samples_b.size)
+    if n < max(1, min(rate_a, rate_b) // 10):
+        result["error"] = "track overlap is too short to compare"
+        return result
+    a, b = samples_a[:n], samples_b[:n]
+    result["frames"] = int(n)
+    fraction = float(np.count_nonzero(a == b) / n)
+    result["identical_fraction"] = round(fraction, 4)
+    if float(a.std()) > 1.0 and float(b.std()) > 1.0:
+        corr = np.corrcoef(a.astype(np.float64), b.astype(np.float64))[0, 1]
+        result["corr"] = round(float(corr), 6)
+    identical = (fraction >= IDENTICAL_SAMPLE_FRACTION
+                 or (result["corr"] is not None and result["corr"] >= IDENTICAL_CORR))
+    result["identical"] = bool(identical)
+    if identical:
+        if result["corr"] is not None:
+            result["cause"] = (f"corr={result['corr']:.6f}, "
+                               f"{fraction * 100:.1f}% of {n} samples match")
+        else:
+            result["cause"] = (f"{fraction * 100:.1f}% of {n} samples match "
+                               "(constant signals, correlation undefined)")
     return result
 
 
@@ -520,6 +670,19 @@ class TwoTrackRecorder:
                 argv = [
                     self.pw_record, "--raw",
                     "--target", track.target.node.name,
+                ]
+                if track.target.node.is_sink:
+                    # --target only *names* a node. For an Audio/Sink the
+                    # session manager may bind the stream to the default
+                    # SOURCE instead of the sink's monitor (measured on a
+                    # real CachyOS/KDE desktop: both tracks recorded the
+                    # microphone, corr=1.0, empty pw-record stderr, no
+                    # listn code involved), while the headless rig links
+                    # the same argv correctly. Routing is
+                    # environment-dependent, so monitor capture is asked
+                    # for unconditionally instead of relying on it.
+                    argv += ["--properties", "stream.capture.sink=true"]
+                argv += [
                     "--rate", str(self.rate),
                     "--channels", str(track.channels),
                     "--format", "s16", "-",
@@ -625,11 +788,38 @@ class TwoTrackRecorder:
                 "frames": analysis["frames"],
                 "rms_db": analysis["rms_db"],
                 "peak_db": analysis["peak_db"],
+                "fs_fraction": analysis["fs_fraction"],
                 "verdict": analysis["verdict"],
                 "error": track.error,
                 "exit_code": track.exit_code,
                 "log": str(track.log_path) if track.log_path.exists() else None,
             }
+        # A capture that put one node's audio into both files is not two
+        # tracks: the independence guarantee failed, so the capture fails
+        # with the measured cause. Checked before the clipping flip below
+        # so the primary defect is the one reported (the failing
+        # real-hardware run had both at once).
+        sys_track, mic_track = tracks["system"], tracks["mic"]
+        if (sys_track["state"] == "stopped" and mic_track["state"] == "stopped"
+                and sys_track["frames"] > 0 and mic_track["frames"] > 0
+                and sys_track["verdict"] != "silent" and mic_track["verdict"] != "silent"):
+            comparison = compare_tracks(sys_track["file"], mic_track["file"])
+            if comparison["identical"]:
+                message = ("system and mic tracks are identical: "
+                           + (comparison["cause"] or "same waveform in both files"))
+                for track in (sys_track, mic_track):
+                    track["state"] = "failed"
+                    track["error"] = track["error"] or message
+        # A track pinned at the format maximum across a large share of its
+        # samples is clipping, not a capture — per-track signal levels
+        # alone would still call it ok (they did, on the failing run).
+        for track in tracks.values():
+            if track["state"] == "stopped" and track["verdict"] == "clipped":
+                track["state"] = "failed"
+                track["error"] = track["error"] or (
+                    f"peak {track['peak_db']} dBFS with "
+                    f"{track['fs_fraction'] * 100:.1f}% of samples at full scale: "
+                    "this track is clipping, not a clean capture of its source")
         mic = tracks["mic"]
         ok = (all(t["state"] == "stopped" and t["error"] is None for t in tracks.values())
               and mic["verdict"] != "silent")
