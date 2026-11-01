@@ -26,11 +26,12 @@ optdepends=(
 )
 install=listn.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# The repository has no tags yet (`git ls-remote --tags origin` prints
-# nothing), so the checksum cannot be measured until v$pkgver is cut; makepkg
-# fails loudly on a missing or changed source either way. Once the tag exists:
-#   updpkgsums
-sha256sums=('SKIP')
+# v$pkgver is tagged, so the checksum is measured, not skipped: this is the
+# sha256 of the tag archive the source line downloads. When the next tag is
+# cut, bump pkgver and refresh with `updpkgsums` - the test suite stays red
+# until the newest tag and pkgver match, and makepkg fails loudly on a
+# missing or changed source either way.
+sha256sums=('f402f90543c2e80928d817ca37f0daabdd0e3eec715f7abfcac7b173f5591185')
 
 package() {
   cd "$pkgname-$pkgver"

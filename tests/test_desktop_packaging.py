@@ -9,6 +9,7 @@ the files actually run.
 from __future__ import annotations
 
 import configparser
+import hashlib
 import os
 import re
 import shutil
@@ -134,10 +135,10 @@ def test_readme_documents_the_same_commands_the_files_run():
     assert autostart_doc.group(1) == autostart_exec
 
     # The PKGBUILD path is documented, honestly, including that it builds from
-    # a release tag the repository does not have yet.
+    # a release tag and how the checksum is refreshed when a new one is cut.
     assert "packaging/arch/PKGBUILD" in readme
     assert "makepkg" in readme
-    assert "no tags" in readme
+    assert "updpkgsums" in readme
 
     # The installer renders each entry with exactly the documented subcommand.
     installer = INSTALLER.read_text(encoding="utf-8")
@@ -274,6 +275,23 @@ def test_pkgbuild_depends_are_honest_and_match_pyproject():
     assert fields["install"] == "listn.install"
 
 
+def tag_version_key(name: str):
+    """Total order over tag names like '0.5.0' / '0.10.0-rc1': numeric runs
+    compare as numbers, everything else as text."""
+    return tuple((0, int(part)) if part.isdigit() else (1, part)
+                 for part in re.split(r"[._-]", name.lstrip("v")))
+
+
+def origin_tags() -> list[str]:
+    result = subprocess.run(["git", "ls-remote", "--tags", "--refs", "origin"],
+                            cwd=ROOT, capture_output=True, text=True)
+    if result.returncode != 0:
+        pytest.skip(f"cannot reach origin: {result.stderr.strip()}")
+    return sorted((line.split("refs/tags/")[1]
+                   for line in result.stdout.splitlines()
+                   if "refs/tags/" in line), key=tag_version_key)
+
+
 def test_pkgbuild_builds_from_the_tag_and_says_so():
     fields = source_pkgbuild()
     # Source is the release tag archive of this repo ...
@@ -282,18 +300,55 @@ def test_pkgbuild_builds_from_the_tag_and_says_so():
         f"listn-{version}.tar.gz::"
         f"https://github.com/margosmark/listn/archive/refs/tags/v{version}.tar.gz"
     )
-    # ... and the checksum gap (no tags exist yet) is stated, not hidden.
+    # ... and the checksum is measured, not a SKIP gap; the comment says how
+    # to refresh it for the next tag.
     text = PKGBUILD.read_text(encoding="utf-8")
-    assert fields["sums"] == "SKIP"
+    assert re.fullmatch(r"[0-9a-f]{64}", fields["sums"]), (
+        "sha256sums must be the measured hash of the tag archive: bump "
+        "pkgver and run updpkgsums after cutting a tag")
     assert "updpkgsums" in text
-    assert "no tags yet" in text
-    result = subprocess.run(["git", "ls-remote", "--tags", "origin"],
-                            cwd=ROOT, capture_output=True, text=True)
-    if result.returncode != 0:
-        pytest.skip(f"cannot reach origin: {result.stderr.strip()}")
-    assert result.stdout.strip() == "", (
-        "a tag exists now: refresh sha256sums with updpkgsums and update the "
-        "PKGBUILD comment and this test")
+    # Tripwire for the NEXT tag: this stays red until pkgver tracks the
+    # newest tag on origin and updpkgsums has re-measured its archive.
+    tags = origin_tags()
+    assert tags, "no tags on origin - the PKGBUILD builds from one"
+    assert f"v{version}" == tags[-1], (
+        f"origin's newest tag is {tags[-1]} but the PKGBUILD builds "
+        f"v{version}: bump pkgver, run updpkgsums, and update this test")
+
+
+def test_pkgbuild_sha256_is_the_hash_of_the_published_tag_archive(tmp_path):
+    """The sum must be what GitHub actually serves for the tag archive the
+    PKGBUILD downloads - a moved or regenerated tag goes red here before
+    makepkg fails on the user's machine. The repo is private, so the fetch
+    borrows git's stored credentials the way makepkg's own curl config does.
+    """
+    fields = source_pkgbuild()
+    url = fields["source"].split("::", 1)[1]
+    curl = shutil.which("curl") or ""
+    if not curl:
+        pytest.skip("curl not installed")
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    env.pop("GIT_ASKPASS", None)
+    cred = subprocess.run(["git", "credential", "fill"], cwd=ROOT, text=True,
+                          input="protocol=https\nhost=github.com\n\n",
+                          capture_output=True, env=env)
+    secrets = dict(line.split("=", 1) for line in cred.stdout.splitlines()
+                   if "=" in line)
+    if (cred.returncode != 0 or not secrets.get("username")
+            or not secrets.get("password")):
+        pytest.skip("no stored GitHub credentials to fetch the archive")
+    login = f'{secrets["username"]}:{secrets["password"]}'
+    login = login.replace("\\", "\\\\").replace('"', '\\"')
+    archive = tmp_path / "tag.tar.gz"
+    fetch = subprocess.run([curl, "-fsSL", "-K", "-", "-o", str(archive), url],
+                           input=f'user = "{login}"\n', text=True,
+                           capture_output=True, cwd=ROOT, env=env)
+    if fetch.returncode != 0:
+        pytest.skip(f"cannot fetch the tag archive: {fetch.stderr.strip()}")
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    assert digest == fields["sums"], (
+        f"GitHub serves sha256 {digest} for v{fields['pkgver']} but the "
+        f"PKGBUILD pins {fields['sums']}: run updpkgsums")
 
 
 def test_pkgbuild_ships_only_user_scope_autostart_and_no_root_state():
