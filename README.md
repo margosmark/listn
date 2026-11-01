@@ -146,9 +146,10 @@ cd packaging/arch
 makepkg -si
 ```
 
-The repository has no tags yet (`git ls-remote --tags origin` prints
-nothing), so the tag download fails until one is cut; `sha256sums` is `SKIP`
-until then and should be refreshed with `updpkgsums` once the tag exists.
+The newest release tag must match `pkgver` (currently `v0.5.0`): when a new
+tag is cut, bump `pkgver` and refresh the measured `sha256sums` with
+`updpkgsums`. The test suite stays red until the two match, and `makepkg`
+fails loudly on a missing or changed source either way.
 pacman installs the project tree in `/usr/share/listn`, the launcher in
 `/usr/bin/listn`, and the menu entry with its icon. The launcher lets `uv`
 build **your** environment on first run from the shipped `uv.lock`, into
