@@ -138,11 +138,18 @@ class Transcriber:
 class FasterWhisper(Transcriber):
     backend = "faster-whisper"
 
-    def __init__(self, model: str, download: Callable[[str], None] | None = None):
+    def __init__(self, model: str, download: Callable[[str], None] | None = None, *,
+                 compute_type: str = "int8", cpu_threads: int | None = None,
+                 beam_size: int = 5):
         super().__init__(model)
         from faster_whisper import WhisperModel
 
-        kwargs = dict(device="auto", compute_type="int8")
+        # Defaults are byte-identical to the old hard-coded call: device auto,
+        # int8, and no cpu_threads passed (CTranslate2 picks its own count).
+        self.beam_size = beam_size
+        kwargs: dict = dict(device="auto", compute_type=compute_type)
+        if cpu_threads:
+            kwargs["cpu_threads"] = int(cpu_threads)
 
         def cached():
             return WhisperModel(model, local_files_only=True, **kwargs)
@@ -159,7 +166,7 @@ class FasterWhisper(Transcriber):
     def segments(self, audio, language=None, prompt=None, vad=True, hotwords=None):
         kwargs = dict(
             language=language, initial_prompt=prompt, vad_filter=vad,
-            beam_size=5, condition_on_previous_text=False,
+            beam_size=self.beam_size, condition_on_previous_text=False,
         )
         if hotwords:
             kwargs["hotwords"] = hotwords
@@ -242,21 +249,42 @@ class OpenAIWhisper(_WindowedBackend):
 
 
 _BACKENDS = {"faster-whisper": FasterWhisper, "mlx": MlxWhisper, "openai-whisper": OpenAIWhisper}
-_cache: dict[tuple[str, str], Transcriber] = {}
+# Keyed by (backend, model, compute_type, cpu_threads, beam_size) so a knob
+# change reloads the model instead of reusing one built with the old settings.
+_cache: dict[tuple, Transcriber] = {}
 _cache_lock = threading.Lock()
 
 
 def get_transcriber(model: str, backend: str = "auto",
-                    status: Callable[[str], None] | None = None) -> Transcriber:
+                    status: Callable[[str], None] | None = None,
+                    *, compute_type: str | None = None, cpu_threads: int | None = None,
+                    beam_size: int | None = None) -> Transcriber:
+    """Build (and cache) a backend.
+
+    The performance knobs default to the effective ``Settings`` (settings.json
+    plus ``LISTN_*`` env overrides), so every caller — live capture, file
+    jobs, the ingest socket — picks them up without being changed. Pass them
+    explicitly to override. Only the faster-whisper backend uses them.
+    """
     name = resolve_backend(backend)
     if name not in _BACKENDS:
         raise ValueError(f"Unknown backend '{backend}'.")
-    key = (name, model)
+    knobs: dict = {}
+    if name == "faster-whisper":
+        if compute_type is None or cpu_threads is None or beam_size is None:
+            from listn.config import Settings
+
+            s = Settings.load()
+            compute_type = s.compute_type if compute_type is None else compute_type
+            cpu_threads = s.cpu_threads if cpu_threads is None else cpu_threads
+            beam_size = s.beam_size if beam_size is None else beam_size
+        knobs = dict(compute_type=compute_type, cpu_threads=cpu_threads, beam_size=beam_size)
+    key = (name, model, knobs.get("compute_type"), knobs.get("cpu_threads"), knobs.get("beam_size"))
     with _cache_lock:
         if key in _cache:
             return _cache[key]
         try:
-            instance = _BACKENDS[name](model, download=status)
+            instance = _BACKENDS[name](model, download=status, **knobs)
         except ImportError as exc:
             extra = {"mlx": "mlx", "openai-whisper": "openai"}.get(name, "")
             hint = f" Install it with: pip install 'listn[{extra}]'" if extra else ""
