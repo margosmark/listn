@@ -4,22 +4,28 @@
 # Stands up an ephemeral, fully private PipeWire + WirePlumber daemon,
 # creates a system sink (null adapter) and a microphone source
 # (libpipewire-module-pipe-tunnel fed by a paced FIFO writer), injects a
-# 440 Hz tone into both, runs the app's own two-track recorder:
+# 440 Hz tone into the sink and a 1000 Hz tone into the microphone FIFO
+# (different frequencies make track distinctness and target correctness
+# deterministic — two same-frequency tones correlate by phase alone), runs
+# the app's own two-track recorder:
 #
 #     $LISTN_CMD record --system-target listn.rig.system \
 #                      --mic-target listn.rig.mic --duration N --json
 #
-# then prints per-track duration/frames/peak/RMS/verdict plus the dominant
-# frequency of each WAV and tears the whole rig down (daemon, writer,
-# playback, private runtime dir). Nothing outside the private temp dir is
-# touched; no real devices are used.
+# then prints per-track duration/frames/peak/RMS/verdict plus each WAV's
+# dominant frequency, verifies the two tracks differ sample-by-sample
+# (identical share + correlation over the overlapping span — per-track
+# verdicts alone stayed green while both processes recorded one source on
+# real hardware), and tears the rig down (daemon, writer, playback,
+# private runtime dir). Nothing outside the private temp dir is touched;
+# no real devices are used.
 #
 # Usage:
 #   scripts/linux_capture_rig.sh [--duration SEC] [--out DIR] [--keep] [--list "nodes"]
 #   LISTN_CMD="uv run listn" scripts/linux_capture_rig.sh       # use a venv/uv
 #
-# Exit codes: 0 = both tracks verdict ok (with signal)
-#             1 = capture ran but a verdict is not ok
+# Exit codes: 0 = both tracks verdict ok (with signal) AND the tracks differ
+#             1 = a track verdict was not ok or the tracks did not differ
 #             3 = rig infrastructure failed (tools missing, daemon/node did
 #                 not come up, recorder refused with rc=3)
 set -u
@@ -36,7 +42,7 @@ while [ $# -gt 0 ]; do
     --out)      OUT_DIR="$2"; shift 2 ;;
     --keep)     KEEP=1; shift ;;
     --list)     LIST_ONLY=1; shift ;;
-    -h|--help)  sed -n '2,24p' "$0"; exit 0 ;;
+    -h|--help)  sed -n '2,27p' "$0"; exit 0 ;;
     *) echo "rig: unknown argument '$1' (see --help)" >&2; exit 3 ;;
   esac
 done
@@ -44,7 +50,8 @@ done
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SYSTEM_NODE=listn.rig.system
 MIC_NODE=listn.rig.mic
-TONE_HZ=440
+TONE_HZ=440        # played into the null sink → must land in system.wav
+MIC_TONE_HZ=1000   # fed to the FIFO → must land in mic.wav
 
 die() { echo "rig: $*" >&2; exit 3; }
 
@@ -82,15 +89,16 @@ export XDG_RUNTIME_DIR="$RIG/run"
 export XDG_CONFIG_HOME="$RIG/xdg"
 
 # ---- tones + node config ---------------------------------------------------
-# tone.raw: 1 s of 440 Hz s16le mono 48 kHz, looped into the mic FIFO.
+# tone.raw: 1 s of MIC_TONE_HZ s16le mono 48 kHz, looped into the mic FIFO.
 # tone.wav: DURATION+3 s stereo WAV, played into the null sink by pw-cat.
-"$LISTN_PY" - "$RIG" "$DURATION" "$TONE_HZ" <<'PYEOF'
+"$LISTN_PY" - "$RIG" "$DURATION" "$TONE_HZ" "$MIC_TONE_HZ" <<'PYEOF'
 import math, struct, sys, wave
 import numpy as np
 rig, dur, hz = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+mic_hz = float(sys.argv[4])
 rate = 48000
 t = np.arange(rate) / rate
-raw = (0.4 * 32767 * np.sin(2 * math.pi * hz * t)).astype("<i2")
+raw = (0.4 * 32767 * np.sin(2 * math.pi * mic_hz * t)).astype("<i2")
 with open(f"{rig}/tone.raw", "wb") as f:
     f.write(raw.tobytes())
 n = int((dur + 3) * rate)
@@ -220,12 +228,13 @@ if [ ! -s "$RIG/report.json" ]; then
 fi
 
 # ---- verdict ---------------------------------------------------------------
-"$LISTN_PY" - "$RIG" "$rc" "$OUT_DIR" <<'PYEOF'
+"$LISTN_PY" - "$RIG" "$rc" "$OUT_DIR" "$TONE_HZ" "$MIC_TONE_HZ" <<'PYEOF'
 import json, math, os, shutil, sys
 import numpy as np
 import wave
 
 rig, rc, out_dir = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+tone_hz, mic_tone_hz = float(sys.argv[4]), float(sys.argv[5])
 report = json.load(open(os.path.join(rig, "report.json")))
 
 def dominant(path):
@@ -245,14 +254,27 @@ def dominant(path):
     return round(float(np.fft.rfftfreq(len(seg), 1 / rate)[spec.argmax()]), 1)
 
 ok = True
+doms = {}
 for name in ("system", "mic"):
     t = report["tracks"][name]
     dom = dominant(t.get("file") or "")
+    doms[name] = dom
     dom_s = f" dominant={dom} Hz" if dom is not None else ""
     err = f" error: {t['error']}" if t.get("error") else ""
     print(f"{name}: state={t['state']} {t['duration']:.3f} s {t['frames']} frames "
           f"peak={t['peak_db']} dBFS rms={t['rms_db']} dBFS verdict={t['verdict']}{dom_s}{err}")
     if t["state"] != "stopped" or t["verdict"] != "ok":
+        ok = False
+
+# Targeting: the sink's tone must be in system.wav and the FIFO's tone in
+# mic.wav. "The tracks differ" is not enough — each track has to hold its
+# own source's content; a --target that silently re-routes breaks exactly
+# this, and per-track verdicts cannot see it.
+for name, want in (("system", tone_hz), ("mic", mic_tone_hz)):
+    got = doms.get(name)
+    if got is None or abs(got - want) > 2.0:
+        print(f"targeting: {name} dominant={got} Hz, expected {want} Hz — "
+              "this track did not record its own source")
         ok = False
 
 if out_dir:
@@ -262,10 +284,59 @@ if out_dir:
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(out_dir, os.path.basename(f)))
 
+# ---- cross-track distinctness ---------------------------------------------
+# Per-track verdicts cannot see the whole failure: on real hardware both
+# pw-record processes bound to one source while every track still read
+# "ok" (corr=1.000000, 96.6% identical samples, measured on the laptop).
+# The rig's two sources are different nodes, so near-identical output here
+# means the two-track promise broke — fail loudly.
+# The sources carry different frequencies, so genuine cross-talk cannot
+# correlate: distinct tracks measured 0.5% identical with corr near 0,
+# while the same source in both files measures ~96% identical and corr 1.
+IDENTICAL_MAX = 0.25
+CORR_MAX = 0.99
+distinct = False
+
+
+def load_mono(path):
+    with wave.open(path, "rb") as wf:
+        if wf.getsampwidth() != 2:
+            return None
+        rate = wf.getframerate()
+        data = np.frombuffer(wf.readframes(wf.getnframes()), dtype="<i2")
+    assert data.size <= rate * 3600  # keep the comparison bounded
+    return data
+
+
+try:
+    sa = load_mono(os.path.join(rig, "capture/system.wav"))
+    sb = load_mono(os.path.join(rig, "capture/mic.wav"))
+except Exception as exc:
+    print(f"cross-track: could not compare the two WAVs: {exc}")
+    ok = False
+else:
+    n = min(sa.size, sb.size) if sa is not None and sb is not None else 0
+    if n == 0:
+        print("cross-track: no overlapping samples to compare")
+        ok = False
+    else:
+        a, b = sa[:n], sb[:n]
+        ident = float(np.count_nonzero(a == b)) / n
+        corr = None
+        if a.std() > 1 and b.std() > 1:
+            corr = float(np.corrcoef(a.astype(np.float64), b.astype(np.float64))[0, 1])
+        distinct = ident <= IDENTICAL_MAX and (corr is None or corr <= CORR_MAX)
+        corr_s = f"{corr:.6f}" if corr is not None else "n/a"
+        print(f"cross-track: identical={ident * 100:.2f}% corr={corr_s} over {n} samples -> "
+              + ("distinct tracks" if distinct else "SAME SIGNAL in both tracks"))
+        if not distinct:
+            ok = False
+
 if ok and report.get("ok") and rc == 0:
-    print("rig result: OK — both tracks recorded with real signal")
+    print("rig result: OK — both tracks recorded with real signal and differ")
     sys.exit(0)
-print(f"rig result: NOT OK (report.ok={report.get('ok')}, recorder rc={rc})")
+print(f"rig result: NOT OK (report.ok={report.get('ok')}, recorder rc={rc}, "
+      f"tracks_distinct={distinct})")
 sys.exit(1)
 PYEOF
 exit $?

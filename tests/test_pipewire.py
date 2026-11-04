@@ -29,7 +29,7 @@ from listn.ipc import TRACK_MIC, TRACK_SYSTEM
 
 FAKE_PW_RECORD = r'''#!/usr/bin/env python3
 """Fake pw-record: raw int16 PCM on stdout, exit 1 on SIGINT (PW 1.4.2)."""
-import math, os, signal, struct, sys, time
+import hashlib, math, os, signal, struct, sys, time
 
 args = sys.argv[1:]
 
@@ -49,10 +49,22 @@ if log:
         fh.write(" ".join(args) + "\n")
 
 mode = "tone"
-for candidate in ("stubborn", "die", "silent"):
+for candidate in ("stubborn", "die", "silent", "fallback"):
     if candidate in target:
         mode = candidate
         break
+
+# The audio lives on the node, like the real graph: two processes aimed at
+# the same target emit the same waveform, aimed at different targets
+# different ones. "fallback" models pw-record binding to the session
+# default source whatever --target says (observed on real hardware), so
+# both tracks then carry one node's content — the two-track independence
+# check in report() has to catch that.
+key = "session-default-source" if mode == "fallback" else target
+digest = hashlib.sha256(key.encode("utf-8")).digest()
+hz = 300.0 + digest[0] * 6.0
+amp = 0.30 + (digest[1] % 90) / 450.0
+phase = digest[2] / 255.0 * 2.0 * math.pi
 
 state = {"stop": False}
 
@@ -77,7 +89,7 @@ while not state["stop"]:
         if mode == "silent":
             value = 0
         else:
-            value = int(0.5 * 32767 * math.sin(2 * math.pi * 440 * (base + i) / rate))
+            value = int(amp * 32767 * math.sin(2 * math.pi * hz * (base + i) / rate + phase))
         for _ in range(channels):
             frame.append(value)
     sys.stdout.buffer.write(struct.pack("<%dh" % len(frame), *frame))
@@ -430,6 +442,52 @@ def test_analyze_wav_levels_and_verdicts(tmp_path):
     assert silent["verdict"] == "silent" and silent["peak_db"] <= pw.SILENT_PEAK_DB
 
 
+def test_analyze_wav_flags_full_scale_clipping(tmp_path):
+    """A peak that is the format maximum across a large share of the file
+    is clipping, not a measured success.
+
+    The real-hardware failure measured 7.2% of samples pinned at full
+    scale while the peak was still reported as ``-0.0 dBFS`` and the
+    verdict said ``ok``.
+    """
+    rate, n = 48000, 48000
+    t = np.arange(n) / rate
+    pcm = (0.5 * 32767 * np.sin(2 * np.pi * 220 * t)).astype("<i2")
+    pcm[: int(n * 0.072)] = 32767          # a pinned block, like the laptop files
+    with wave.open(str(tmp_path / "clipped.wav"), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(pcm.tobytes())
+    result = pw.analyze_wav(tmp_path / "clipped.wav")
+    assert result["verdict"] == "clipped", result
+    assert result["peak_db"] == 0.0                       # the format maximum, honestly labelled
+    assert result["fs_fraction"] == pytest.approx(0.072, abs=0.001)
+    # a loud but not rail-pinned track stays ok — the threshold must not
+    # fail normal full-scale peaks
+    loud = pw.analyze_wav(write_wav(tmp_path / "loud.wav", rate=48000, amp=1.0))
+    assert loud["verdict"] == "ok", loud
+    assert loud["fs_fraction"] < pw.CLIPPED_FS_FRACTION
+
+
+def test_compare_tracks_separates_same_from_different(tmp_path):
+    a = write_wav(tmp_path / "a.wav", seconds=0.5, rate=48000, amp=0.4, freq=440.0)
+    b = write_wav(tmp_path / "b.wav", seconds=0.5, rate=48000, amp=0.4, freq=440.0)
+    c = write_wav(tmp_path / "c.wav", seconds=0.5, rate=48000, amp=0.4, freq=997.0)
+    same = pw.compare_tracks(a, b)
+    assert same["error"] is None and same["identical"] is True
+    assert same["identical_fraction"] == 1.0
+    assert same["corr"] == pytest.approx(1.0, abs=1e-6)
+    assert "corr=" in same["cause"] and "samples match" in same["cause"]
+    diff = pw.compare_tracks(a, c)
+    assert diff["identical"] is False
+    assert diff["identical_fraction"] < pw.IDENTICAL_SAMPLE_FRACTION
+    assert diff["corr"] < pw.IDENTICAL_CORR
+    # a comparison that cannot run never claims identity
+    missing = pw.compare_tracks(a, tmp_path / "absent.wav")
+    assert missing["identical"] is False and missing["error"]
+
+
 def test_analyze_wav_missing_and_not_wav(tmp_path):
     missing = pw.analyze_wav(tmp_path / "nope.wav")
     assert missing["verdict"] is None and missing["error"] == "no file was written"
@@ -510,7 +568,14 @@ def test_recorder_captures_two_independent_tracks(fake_pw):
     for track in (system, mic):
         with wave.open(track["file"], "rb") as wf:
             assert wf.getnframes() / wf.getframerate() > 0.3
+    # The feature itself: the two files must be genuinely different signals
+    comparison = pw.compare_tracks(system["file"], mic["file"])
+    assert comparison["error"] is None, comparison
+    assert comparison["identical"] is False, comparison
+    assert comparison["identical_fraction"] < pw.IDENTICAL_SAMPLE_FRACTION
+    assert comparison["corr"] is None or comparison["corr"] < pw.IDENTICAL_CORR
     assert report["targets"]["system"]["name"] == "sys.tone"
+
 
 
 def test_recorder_argv_follows_pw_record_contract(fake_pw):
@@ -528,6 +593,13 @@ def test_recorder_argv_follows_pw_record_contract(fake_pw):
         by_target[args[args.index("--target") + 1]] = args
     assert by_target["sys.tone"][by_target["sys.tone"].index("--channels") + 1] == "2"
     assert by_target["mic.tone"][by_target["mic.tone"].index("--channels") + 1] == "1"
+    # An Audio/Sink target must request monitor capture explicitly: on real
+    # hardware plain --target <sink> bound to the session default source
+    # instead (both tracks recorded the mic, corr=1.0), so the property is
+    # passed unconditionally for sinks and never for the microphone.
+    assert (by_target["sys.tone"][by_target["sys.tone"].index("--properties") + 1]
+            == "stream.capture.sink=true")
+    assert "--properties" not in by_target["mic.tone"]
 
 
 def test_recorder_never_calls_silence_a_success(fake_pw):
@@ -538,6 +610,27 @@ def test_recorder_never_calls_silence_a_success(fake_pw):
     assert report["tracks"]["mic"]["verdict"] == "silent"
     assert report["tracks"]["system"]["verdict"] == "ok"
     assert report["ok"] is False  # a silent microphone is never a successful capture
+
+
+def test_recorder_refuses_two_tracks_with_one_signal(fake_pw):
+    """Both pw-record processes bound to one source — the real-hardware
+    fallback (``pw-record --target <sink>`` binding to the session default
+    source: corr=1.000000, 96.6% identical samples measured on Mark's
+    laptop) — must never be reported as a successful capture, even though
+    each track on its own looks healthy.
+    """
+    recorder = start_recorder(fake_pw, targets=make_targets(sys_name="sys.fallback",
+                                                            mic_name="mic.fallback"))
+    time.sleep(0.35)
+    report = recorder.stop()
+    assert report["ok"] is False, report
+    for name in ("system", "mic"):
+        track = report["tracks"][name]
+        assert track["state"] == "failed", track
+        assert track["error"] and "system and mic tracks are identical" in track["error"], track
+        # per-track signal analysis alone cannot see the defect:
+        assert track["verdict"] == "ok", track
+    assert "samples match" in report["tracks"]["mic"]["error"]
 
 
 def test_recorder_silent_system_alone_stays_ok(fake_pw):
@@ -759,3 +852,20 @@ def test_cli_capture_exit_codes(monkeypatch, tmp_path, capsys):
     silence_report = json.loads(capsys.readouterr().out)
     assert rc == 1 and silence_report["ok"] is False
     assert silence_report["tracks"]["mic"]["verdict"] == "silent"
+
+    # Both tracks recording one source (session fallback) is a failure
+    # with a stated cause, never a printed success.
+    monkeypatch.setattr(
+        pw, "discover", lambda **kw: graph(sink="sys.fallback", source="mic.fallback",
+                                           default_sink="sys.fallback",
+                                           default_source="mic.fallback"))
+    rc = pw.main(["--duration", "0.35", "--out", str(tmp_path / "same"), "--json"])
+    same_report = json.loads(capsys.readouterr().out)
+    assert rc == 1 and same_report["ok"] is False
+    assert "identical" in (same_report["tracks"]["system"]["error"] or "")
+    rc = pw.main(["--duration", "0.35", "--out", str(tmp_path / "same2")])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "Capture NOT OK" in captured.out
+    assert "Capture OK:" not in captured.out
+    assert "identical" in captured.out

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=listn
+GenericName=Meeting transcription
+Comment=Local-only meeting transcription - open the web UI
+Exec=listn ui
+Icon=listn
+Terminal=false
+Categories=AudioVideo;Audio;Recorder;
+Keywords=transcription;meeting;whisper;audio;recorder;microphone;
+StartupNotify=false

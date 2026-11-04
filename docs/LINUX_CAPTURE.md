@@ -5,6 +5,14 @@ headless machine — not validated on real audio hardware or a KDE session.**
 The real-daemon verification is reproducible in one command
 (`scripts/linux_capture_rig.sh`, see
 [Reproduce the real-daemon rig](#reproduce-the-real-daemon-rig)).
+A real-hardware routing defect found through this verification path —
+both tracks recording the session default source instead of the sink
+monitor (reproduced and A/B-tested on a CachyOS/KDE laptop, see
+[observed behaviour 12](#observed-pipewire-142-behaviour-why-the-code-is-shaped-this-way))
+— is fixed in the current code: sink targets request monitor capture
+explicitly, and the report refuses to call a capture successful when the
+two tracks are the same waveform or a track is pinned at full scale.
+**The acceptance rerun of the fixed app on real hardware is pending.**
 This implements roadmap step 2 in [DECISIONS](DECISIONS.md) as a bounded
 increment; it does not ship KDE desktop support. The recorder is now wired
 into the app: `listn record` on the CLI, the Live tab of the local web UI,
@@ -24,8 +32,12 @@ independent tracks through PipeWire, the audio stack KDE Plasma uses:
   `fallback` or `explicit` in every report so a guess is never presented as
   a default.
 - `TwoTrackRecorder` runs one `pw-record` per track (raw int16 PCM on
-  stdout) into its own WAV file, and can hand each block to an `on_block`
-  callback. That callback matches the engine's
+  stdout) into its own WAV file — the system track's stream additionally
+  passes `--properties stream.capture.sink=true`, because `--target`
+  only names a node and a sink target without that property can bind to
+  the session's default source instead of the monitor (behaviour 12) —
+  and can hand each block to an `on_block` callback. That callback
+  matches the engine's
   `LiveSession.push_audio(track, sample_rate, samples)` — the same seam the
   macOS capture client uses — so the existing ingest pipeline, separate
   `Me`/`Others` tracks, pause semantics and silence detection apply
@@ -103,6 +115,7 @@ a clean checkout on any headless Linux machine with PipeWire installed — no
 
 ```sh
 scripts/linux_capture_rig.sh                 # 4 s capture; exit 0 only if both verdicts are ok
+                                             # AND the tracks differ and each holds its own tone
 scripts/linux_capture_rig.sh --duration 8 --out ./rig-artifacts   # also keep WAVs + report + log
 LISTN_CMD="uv run listn" scripts/linux_capture_rig.sh             # app CLI via uv instead of `python3 -m listn`
 scripts/linux_capture_rig.sh --list          # stand the rig up, run `listn record --list`, tear down
@@ -117,32 +130,40 @@ Everything is built inside a fresh `mktemp -d` (private `XDG_RUNTIME_DIR` +
    `pipe.filename` (a FIFO in the rig dir) as the microphone source
    (`listn.rig.mic`);
 2. headless `pipewire` + `wireplumber` start against that private config;
-3. a paced writer feeds a 440 Hz s16le/48 kHz/mono tone into the FIFO,
+3. a paced writer feeds a 1000 Hz s16le/48 kHz/mono tone into the FIFO,
    holding the write end open continuously (an empty FIFO reads as EOF and
    the source goes silent — observed behaviour 10 below);
 4. `pw-cat` plays a 440 Hz WAV into the null sink while the app's own
-   `listn record … --json` captures both tracks;
+   `listn record … --json` captures both tracks (different frequencies on
+   purpose: distinctness and target correctness become deterministic to
+   assert);
 5. per-track `state/duration/frames/peak/rms/verdict` and each WAV's
-   dominant frequency are printed, then every process is killed and the
-   private runtime dir removed.
+   dominant frequency are printed, then three cross-checks run on the
+   produced files: each track must hold its own source's tone (440 Hz in
+   `system.wav`, 1000 Hz in `mic.wav`, ±2 Hz), and the two tracks must
+   differ (identical share ≤25% **and** `|corr|` ≤ 0.99 over the
+   overlapping span). Only then does the script print `rig result: OK`;
+   then every process is killed and the private runtime dir removed.
 
-Exit codes follow the recorder's contract, passed through: `0` both tracks
-`verdict=ok` with signal, `1` a track was not ok (silent/quiet/failed — the
-script refuses instead of claiming success), `3` the rig itself could not
-start (missing tools; daemon or nodes did not appear).
+Exit codes: `0` both tracks `verdict=ok` with signal **and** distinct and
+correctly targeted, `1` a track was not ok (silent/quiet/failed), a tone
+landed in the wrong track, or the two WAVs were (nearly) identical — the
+script refuses instead of claiming success, which is exactly how the
+identical-tracks regression escaped the first time — `3` the rig itself
+could not start (missing tools; daemon or nodes did not appear).
 
 Measured on this machine (PipeWire 1.4.2, WirePlumber 0.5.8, headless
-Debian LXC, default `LISTN_CMD="python3 -m listn"`); three consecutive runs
-were byte-identical:
+Debian LXC, `LISTN_CMD=".venv/bin/python -m listn"`), 2026-10-31:
 
 ```text
-$ scripts/linux_capture_rig.sh
+$ scripts/linux_capture_rig.sh --duration 4
 rig: daemon up, nodes ready:
 rig:   listn.rig.system Audio/Sink
 rig:   listn.rig.mic Audio/Source
-system: state=stopped 4.011 s 192512 frames peak=-8.0 dBFS rms=-11.0 dBFS verdict=ok dominant=440.0 Hz
-mic: state=stopped 3.989 s 191488 frames peak=-14.0 dBFS rms=-17.0 dBFS verdict=ok dominant=440.0 Hz
-rig result: OK — both tracks recorded with real signal      # exit 0
+system: state=stopped 3.968 s 190464 frames peak=-8.0 dBFS rms=-11.0 dBFS verdict=ok dominant=440.0 Hz
+mic: state=stopped 3.989 s 191488 frames peak=-14.0 dBFS rms=-17.0 dBFS verdict=ok dominant=1000.0 Hz
+cross-track: identical=0.56% corr=-0.000044 over 190464 samples -> distinct tracks
+rig result: OK — both tracks recorded with real signal and differ   # exit 0
 ```
 
 Negative checks of the rig itself, run while writing it and reproducible by
@@ -150,15 +171,25 @@ hand: feeding digital silence into the FIFO yields
 `mic: … peak=-120.0 dBFS verdict=silent` and exit 1; removing WirePlumber
 makes both `pw-record` streams produce no audio and the script refuses with
 exit 1; `LISTN_CMD="uv run --frozen listn"` behaves identically to the
-default. The full end-to-end run is also gated into pytest:
+default. The cross-track refusal is covered under the same gate: a
+wrapper plants identical WAVs after a clean recording and the rig must
+exit 1 printing `SAME SIGNAL in both tracks` (per-track `verdict=ok`
+lines alone would still read green — that is the failure mode this check
+exists for). The full end-to-end run is also gated into pytest:
 `LISTN_RIG_IT=1 uv run pytest tests/test_capture_rig.py`.
 
 Exit codes: `0` capture succeeded with microphone signal, `1` capture failed
 or the microphone recorded only silence, `3` PipeWire/tools unavailable or
 no usable node. Reports always carry per-track `state`, `verdict`
-(`ok`/`quiet`/`silent`), `duration`, `error` and `exit_code`; silence is
-never reported as success, and a silent system track alone does not fail the
-run (nobody may have been playing anything) — the same rule the engine uses.
+(`ok`/`quiet`/`silent`/`clipped`), `duration`, `error`, `fs_fraction` and
+`exit_code`; silence is never reported as success, and a silent system
+track alone does not fail the run (nobody may have been playing anything)
+— the same rule the engine uses. Two further refusals run in the normal
+report path: a track pinned at the format maximum across ≥2% of its
+samples is marked `clipped` and failed with the measured full-scale
+fraction, and two tracks containing the same waveform fail both tracks
+with `system and mic tracks are identical: <corr and identical-share>` —
+`Capture OK` is printed only when every check passes.
 
 ## Verified on this machine
 
@@ -219,7 +250,10 @@ Measured against a headless PipeWire 1.4.2 + WirePlumber 0.5.8 daemon:
    signal as clean, escalates to SIGKILL after a grace period, and parses
    WAV headers manually so an unfinalized file is reported, not crashed on.
 6. **Sink-monitor capture works by targeting the sink node itself** (no
-   separate `.monitor` node exists in native `pw-dump` output).
+   separate `.monitor` node exists in native `pw-dump` output) — *on this
+   headless rig*. On real desktop sessions the same invocation may not
+   bind to the monitor at all; see behaviour 12, which is why the
+   recorder also passes `stream.capture.sink=true`.
 7. **`pw-dump <id>` can return more than the queried object.** Measured on a
    bare headless 1.4.2 daemon (no WirePlumber): with node ids and object
    serials drifted apart, `pw-dump 40` returned two objects — a node with
@@ -260,6 +294,22 @@ Measured against a headless PipeWire 1.4.2 + WirePlumber 0.5.8 daemon:
     even the null sink's monitor port carries no buffers. The rig starts
     WirePlumber next to the daemon; a real desktop run inherits a session
     manager anyway.
+12. **`pw-record --target <sink>` is only a *name*: without
+    `stream.capture.sink=true` it can bind to the session default source
+    with no warning.** Measured on Mark's CachyOS/KDE laptop (operator's
+    raw A/B with two simultaneous `pw-record` processes and no listn code
+    involved, 2026-10-30): with the app's exact args, the sink-targeted
+    and mic-targeted captures came back corr=1.000000, 96.6% identical
+    samples, rms(s-m)=0.000003, both `*.pw-record.log` files empty — the
+    "system" track had recorded the microphone. Adding
+    `--properties stream.capture.sink=true` to the sink-targeted
+    invocation only: corr=-0.004773, 0.0% identical samples, system peak
+    -8.77 dBFS vs mic -9.87 dBFS — two independent tracks. The headless
+    rig links the same argv *without* the property correctly (behaviour
+    6), so the routing is environment-dependent and cannot be inferred:
+    the property is passed unconditionally, the rig asserts track
+    distinctness and per-track tone placement, and `report()` refuses any
+    capture whose two tracks are the same waveform.
 
 ## Hardware limitations of this verification
 
