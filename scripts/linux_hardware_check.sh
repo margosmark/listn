@@ -219,7 +219,7 @@ In `expectfail` mode exits 0 only when the mic track failed with the
 node-disappeared contract, 1 when it kept recording (exit code not a claim
 of failure), 2 when it failed some other way.
 """
-import json, re, sys
+import json, re, shlex, sys
 
 path, rc, mode = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 out_env = sys.argv[4] if len(sys.argv) > 4 else ""
@@ -246,8 +246,8 @@ for name in ("system", "mic"):
 if out_env and out_env != "/dev/null":
     targets = report.get("targets") or {}
     with open(out_env, "w") as f:
-        f.write("SYS_TARGET=%s\n" % (targets.get("system", {}) or {}).get("name", ""))
-        f.write("MIC_TARGET=%s\n" % (targets.get("mic", {}) or {}).get("name", ""))
+        f.write("SYS_TARGET=%s\n" % shlex.quote((targets.get("system", {}) or {}).get("name", "")))
+        f.write("MIC_TARGET=%s\n" % shlex.quote((targets.get("mic", {}) or {}).get("name", "")))
 
 if mode == "capture":
     ok = bool(report.get("ok")) and int(rc) == 0
@@ -407,6 +407,7 @@ for name in ("audio-system.wav", "audio-mic.wav"):
     path = os.path.join(session_dir, name)
     if not os.path.exists(path):
         print(f"{name}: not written")
+        ok = False
         continue
     try:
         w = wave.open(path, "rb")
@@ -588,13 +589,14 @@ fi
 "$LISTN_PY" - "$TMP/devices.env" <<'PYEOF' 2>/dev/null || true
 import sys
 from listn.pipewire import CaptureError, discover, select_targets
+import shlex
 try:
     targets = select_targets(discover(), None, None)
 except CaptureError:
     targets = None
 with open(sys.argv[1], "w") as f:
-    f.write("SYS_TARGET=%s\n" % (targets.system.node.name if targets else ""))
-    f.write("MIC_TARGET=%s\n" % (targets.mic.node.name if targets else ""))
+    f.write("SYS_TARGET=%s\n" % shlex.quote(targets.system.node.name if targets else ""))
+    f.write("MIC_TARGET=%s\n" % shlex.quote(targets.mic.node.name if targets else ""))
 PYEOF
 # shellcheck disable=SC1090
 [ -f "$TMP/devices.env" ] && . "$TMP/devices.env"

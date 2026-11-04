@@ -276,3 +276,76 @@ def test_hardware_check_end_to_end():
             except subprocess.TimeoutExpired:
                 p.kill()
         shutil.rmtree(rig, ignore_errors=True)
+
+
+def _heredoc(name):
+    text = SCRIPT.read_text()
+    marker = f"cat > \"$TMP/{name}\" <<'PYEOF'"
+    start = text.index("\n", text.index(marker)) + 1
+    return text[start:text.index("\nPYEOF", start)] + "\n"
+
+
+@pytest.mark.parametrize("suffix", ["", "' space"])
+def test_capture_targets_do_not_execute_shell(tmp_path, suffix):
+    marker = tmp_path / "pwned"
+    path = _write_report(tmp_path, "stopped", None, ok=True)
+    report = json.loads(Path(path).read_text())
+    name = f"node$(touch {marker}){suffix}"
+    report["targets"]["system"]["name"] = name
+    Path(path).write_text(json.dumps(report))
+    envfile = tmp_path / "targets.env"
+    proc = _analyze([path, "0", "capture", str(envfile)])
+    assert proc.returncode == 0
+    result = subprocess.run([bash, "-c", '. "$1"; printf "%s" "$SYS_TARGET"', "bash", str(envfile)], capture_output=True, text=True)
+    assert result.returncode == 0
+    assert not marker.exists()
+    assert result.stdout == name
+
+
+@pytest.mark.parametrize("suffix", ["", "' space"])
+def test_discovery_target_names_are_shell_escaped(tmp_path, suffix):
+    import sys
+    script = SCRIPT.read_text()
+    start = script.index('import sys\nfrom listn.pipewire import CaptureError, discover, select_targets')
+    body = script[start:script.index('\nPYEOF', start)]
+    marker = tmp_path / "pwned"
+    name = f"node$(touch {marker}){suffix}"
+    wrapper = """import sys, types
+from types import SimpleNamespace as N
+m = types.ModuleType('listn.pipewire')
+m.CaptureError = type('CaptureError', (Exception,), {})
+m.discover = lambda: None
+m.select_targets = lambda *args: N(system=N(node=N(name=sys.argv[2])), mic=N(node=N(name='mic')))
+sys.modules['listn.pipewire'] = m
+""" + body
+    out = tmp_path / "devices.env"
+    subprocess.run([sys.executable, "-c", wrapper, str(out), name], check=True)
+    result = subprocess.run([bash, "-c", '. "$1"; printf "%s" "$SYS_TARGET"', "bash", str(out)], capture_output=True, text=True)
+    assert result.returncode == 0
+    assert not marker.exists()
+    assert result.stdout == name
+
+
+@pytest.mark.parametrize("tracks,expected", [(('system',), 1), (('mic',), 1), (('system', 'mic'), 0)])
+def test_pause_requires_both_wavs(tmp_path, tracks, expected):
+    import sys
+    import wave
+    session = tmp_path / "sessions" / "test"
+    session.mkdir(parents=True)
+    (session / "transcript.json").write_text(json.dumps([{"text": "[paused]"}]))
+    for track in tracks:
+        with wave.open(str(session / f"audio-{track}.wav"), "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(8000)
+            w.writeframes(b"\x00\x00" * 24000)
+    body = _heredoc("pause_phase.py")
+    start = body.index('status, body = call("POST", "/api/live/start"')
+    stub = """time.sleep = lambda _: None
+def call(method, path, payload=None):
+    if path == '/api/live/stop': return 200, {'id': 'test', 'pipewire': {'ok': True}}
+    if path == '/api/live': return 200, {'live': {'paused': True}}
+    return 200, {}
+"""
+    code = body[:start] + stub + body[start:]
+    env = dict(os.environ, HWCHECK_PORT="1", LISTN_DATA_DIR=str(tmp_path))
+    proc = subprocess.run([sys.executable, "-c", code, "sys", "mic"], env=env, capture_output=True, text=True)
+    assert proc.returncode == expected, proc.stdout + proc.stderr
