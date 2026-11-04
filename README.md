@@ -379,6 +379,35 @@ The Live page's device picker is the **legacy** path: a microphone, or BlackHole
 
 The first use of a model downloads it from Hugging Face. That request is unauthenticated unless you set `HF_TOKEN`, so the log may say `Warning: You are sending unauthenticated requests to the HF Hub` once. After the files are in `~/.cache/huggingface`, later loads set `HF_HUB_OFFLINE` and do not use the network.
 
+### Where transcription runs: `compute_device`
+
+Faster-whisper uses the **CPU by default**. On Linux a machine can expose an NVIDIA device without the CUDA 12 cuBLAS runtime CTranslate2 needs, and that failure happens inside the native library — where a missing library can end the process instead of raising a Python exception. The default never loads CUDA libraries, installs no GPU packages, and makes no network or cloud calls.
+
+| Value | Behaviour |
+|---|---|
+| `cpu` (default) | Never touches the GPU. |
+| `auto` | Probes CUDA **in a child process** first (so a broken driver or library cannot take listn down); uses the GPU only when a CUDA device is visible and its runtime libraries load, and falls back to CPU otherwise, saying why. |
+| `cuda` | Requires the GPU. If CTranslate2 cannot use it, listn stops with an actionable error — no silent fallback, exit code 1, no traceback. |
+
+The status line reports the device the model actually runs on (`device: cpu`, `device: cuda`), so a fallback is never mistaken for GPU acceleration.
+
+```fish
+# CPU only (fish, and any other shell — `env` works everywhere)
+uv run listn transcribe ./mic.wav --model tiny --backend faster-whisper --compute-device cpu
+
+# or set it for the session
+set -lx LISTN_COMPUTE_DEVICE cpu
+uv run listn transcribe ./mic.wav --model tiny --backend faster-whisper
+
+# require CUDA — fails with an actionable message if it is unavailable
+uv run listn transcribe ./mic.wav --model tiny --backend faster-whisper --compute-device cuda
+
+# let listn decide, falling back to CPU if the CUDA runtime is unusable
+uv run listn transcribe ./mic.wav --model tiny --backend faster-whisper --compute-device auto
+```
+
+The same choices live in `settings.json` as `compute_device` (`cpu`, `auto`, `cuda`) and in `LISTN_COMPUTE_DEVICE`. Precedence: `--compute-device` beats the environment, which beats the file. See [GPU_LINUX.md](docs/GPU_LINUX.md) for what CUDA validation involves; only use explicit `cuda` after your GPU stack is known to work.
+
 ## Notes
 
 When a recording or file transcription finishes, listn writes notes into `sessions/<id>/summary.json`: a summary, key points, decisions, action items (owner, task, and a due date when one was said), and open questions. Each item carries the time it was said, and the library shows them under *In the recording* with a link that plays the audio from there. Owners are **Me** (you), a renamed speaker, or someone named in the meeting. Turn this off with *Summarize when a recording ends*, or run it again from the library. The notes are editable; notes you edited are not replaced by the automatic run after a recording or speaker labelling (use *Regenerate*, or `listn summarize --force`).
@@ -585,5 +614,6 @@ This repo's tests do not open a process tap. On the Mac, check:
 - **FFmpeg / `libavutil` errors from torchcodec during speaker labelling.** Harmless: the labels still come out, because listn hands pyannote the audio itself rather than having torchcodec decode the file.
 - **`update` says you have uncommitted changes.** Commit or `git stash` them, then run it again.
 - **Port 8765 is taken.** Quit the other listn (`engine.log` will say so). The menu bar will not attach to a pre-0.3 server that has no capture socket.
+- **`Library libcublas.so.12 is not found or cannot be loaded` (or any CUDA error) on Linux.** The GPU is visible but its CUDA runtime is missing or unusable. Run on CPU with `--compute-device cpu` (fish: `set -lx LISTN_COMPUTE_DEVICE cpu` before the command, or `env LISTN_COMPUTE_DEVICE=cpu uv run listn …`), which is also the default. `--compute-device cuda` fails with the same advice instead of falling back; `--compute-device auto` probes the runtime in a child process and falls back on its own. See [Where transcription runs](#where-transcription-runs-compute_device).
 
 MIT License.
