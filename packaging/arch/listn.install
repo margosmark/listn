@@ -1,0 +1,23 @@
+post_install() {
+  echo "listn is installed. The menu entry appears as 'listn'."
+  echo "The first run builds your own environment with uv"
+  echo "(~/.local/share/listn/env, downloaded once from the locked"
+  echo "dependencies; later runs are local)."
+  echo
+  echo "Optional - start the tray at login (user scope, your choice):"
+  echo "  install -Dm644 /usr/share/listn/packaging/listn-tray.desktop \\"
+  echo "          \"\$HOME/.config/autostart/listn-tray.desktop\""
+  echo "Remove the same file to stop starting at login; the tray itself"
+  echo "has no launch-at-login control."
+}
+
+post_upgrade() {
+  post_install
+}
+
+post_remove() {
+  echo "The app menu entry, icon and /usr/bin/listn were removed with the"
+  echo "package. Your environment (~/.local/share/listn/env), data"
+  echo "(~/.local/share/listn) and any autostart file you copied into"
+  echo "~/.config/autostart/ are left in place; remove them by hand."
+}

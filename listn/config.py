@@ -7,6 +7,13 @@ private data directory outside the repository:
 * elsewhere: ``$XDG_DATA_HOME/listn`` (default ``~/.local/share/listn``)
 
 ``LISTN_DATA_DIR`` overrides both.
+
+The transcription performance knobs (``compute_type``, ``cpu_threads``,
+``beam_size``) can be set in ``settings.json`` or overridden per-run with
+``LISTN_COMPUTE_TYPE``, ``LISTN_CPU_THREADS`` and ``LISTN_BEAM_SIZE``. The
+environment wins over the file. Invalid values raise a ``SettingsError`` with
+a readable message instead of silently falling back; ``SettingsError`` is a
+``ValueError`` subclass so existing handlers keep working.
 """
 
 from __future__ import annotations
@@ -22,10 +29,27 @@ from listn.llm import DEFAULT_LLM
 
 MODELS = ["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"]
 BACKENDS = ["auto", "faster-whisper", "mlx", "openai-whisper"]
+# CTranslate2 compute types faster-whisper accepts. "int8" is the default:
+# quantised, smallest memory, fastest on CPU.
+COMPUTE_TYPES = ["default", "auto", "int8", "int8_float32", "int8_float16",
+                 "int8_bfloat16", "int16", "float16", "bfloat16", "float32"]
+DEFAULT_COMPUTE_TYPE = "int8"
+DEFAULT_BEAM_SIZE = 5
 SETTINGS_VERSION = 2
 SPEAKER_THRESHOLD = 0.55
 SPEAKER_THRESHOLD_MIN = 0.3
 SPEAKER_THRESHOLD_MAX = 0.9
+
+
+class SettingsError(ValueError):
+    """A settings value the user can fix: settings.json or a ``LISTN_*`` variable.
+
+    Kept distinct from a bare ``ValueError`` so the CLI can turn *this* into a
+    one-line ``listn: ...`` message with exit 2 while an unrelated ``ValueError``
+    raised by a bug still escapes with its traceback. It subclasses
+    ``ValueError`` on purpose: callers that already treat a bad setting as a
+    user-facing error (the web API, existing tests) keep working unchanged.
+    """
 
 
 def disable_network_telemetry() -> None:
@@ -84,6 +108,13 @@ class Settings:
     model: str = field(default_factory=default_model)
     language: str | None = None
     backend: str = "auto"
+    # Transcription performance knobs. Defaults match the values that used to
+    # be hard-coded in the faster-whisper backend, so nothing changes when
+    # they are left alone. cpu_threads=None means "don't pass it" and lets
+    # CTranslate2 pick (today's behaviour).
+    compute_type: str = DEFAULT_COMPUTE_TYPE
+    cpu_threads: int | None = None
+    beam_size: int = DEFAULT_BEAM_SIZE
     chunk_seconds: float = 6.0
     save_audio: bool = True
     # None follows the token: on when one is set (or the model is cached).
@@ -115,18 +146,60 @@ class Settings:
         try:
             raw = json.loads(cls.path().read_text())
         except (OSError, ValueError):
-            return cls()
+            raw = {}
         if not isinstance(raw, dict):
-            return cls()
+            raw = {}
         known = {f.name for f in fields(cls)}
         settings = cls(**{k: v for k, v in migrate(raw).items() if k in known})
+        settings.apply_env_overrides()
         return settings.validated()
+
+    def apply_env_overrides(self) -> None:
+        """``LISTN_*`` environment variables win over settings.json."""
+        for var, attr in (("LISTN_COMPUTE_TYPE", "compute_type"),
+                          ("LISTN_CPU_THREADS", "cpu_threads"),
+                          ("LISTN_BEAM_SIZE", "beam_size")):
+            raw = os.environ.get(var)
+            if raw is not None and raw.strip():
+                setattr(self, attr, raw.strip())
 
     def validated(self) -> "Settings":
         if self.model not in MODELS:
             self.model = "small"
         if self.backend not in BACKENDS:
             self.backend = "auto"
+        # Performance knobs fail loudly instead of silently reverting: an
+        # invalid value must be impossible to miss when tuning for speed.
+        if self.compute_type is not None:
+            self.compute_type = str(self.compute_type).strip().lower()
+        else:
+            self.compute_type = DEFAULT_COMPUTE_TYPE
+        if self.compute_type not in COMPUTE_TYPES:
+            raise SettingsError(
+                f"compute_type must be one of {', '.join(COMPUTE_TYPES)} — "
+                f"got {self.compute_type!r}.")
+        raw_threads = self.cpu_threads
+        if raw_threads is None or (isinstance(raw_threads, str) and not raw_threads.strip()):
+            self.cpu_threads = None
+        else:
+            try:
+                threads = int(str(raw_threads).strip())
+            except (TypeError, ValueError):
+                threads = 0
+            if threads < 1:
+                raise SettingsError(
+                    "cpu_threads must be a whole number of 1 or more "
+                    f"(unset it to let the backend choose) — got {raw_threads!r}.")
+            self.cpu_threads = threads
+        raw_beam = self.beam_size
+        try:
+            beam = int(str(raw_beam).strip())
+        except (TypeError, ValueError):
+            beam = 0
+        if not 1 <= beam <= 100:
+            raise SettingsError(
+                f"beam_size must be a whole number between 1 and 100 — got {raw_beam!r}.")
+        self.beam_size = beam
         try:
             self.chunk_seconds = min(30.0, max(2.0, float(self.chunk_seconds)))
         except (TypeError, ValueError):

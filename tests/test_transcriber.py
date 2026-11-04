@@ -1,7 +1,11 @@
+import sys
+import types
+
 import numpy as np
 import pytest
 
 from listn import transcriber as tr
+from listn.config import COMPUTE_TYPES, Settings
 from listn.transcriber import RawSegment, _WindowedBackend, is_hallucination
 
 from .conftest import FakeTranscriber
@@ -94,3 +98,188 @@ def test_get_transcriber_caches_and_reports_missing_backend():
 
 def test_raw_segment_defaults():
     assert RawSegment(0, 1, "x").no_speech_prob == 0.0
+
+
+class FakeWhisperModel:
+    """Stands in for faster_whisper.WhisperModel and records how it was built."""
+
+    instances = []
+
+    def __init__(self, model, **kwargs):
+        self.model = model
+        self.init_kwargs = kwargs
+        self.transcribe_kwargs = None
+        FakeWhisperModel.instances.append(self)
+
+    def transcribe(self, audio, **kwargs):
+        self.transcribe_kwargs = kwargs
+        return iter([]), types.SimpleNamespace(language="en")
+
+
+@pytest.fixture
+def fake_whisper_module(monkeypatch):
+    """Replace faster_whisper so no model is loaded and no network is touched."""
+    FakeWhisperModel.instances = []
+    tr._cache.clear()
+    monkeypatch.setitem(sys.modules, "faster_whisper",
+                        types.SimpleNamespace(WhisperModel=FakeWhisperModel))
+    yield FakeWhisperModel
+    tr._cache.clear()
+
+
+def _build(model="small", **kwargs):
+    return tr.get_transcriber(model, "faster-whisper", **kwargs)
+
+
+def _knobs(instance):
+    """The kwargs WhisperModel got, minus the cache-path marker.
+
+    ``load_local_or_download`` adds ``local_files_only=True`` on the cached
+    attempt; the knob identity we care about is everything else.
+    """
+    return {k: v for k, v in instance.init_kwargs.items() if k != "local_files_only"}
+
+
+def test_default_knobs_are_byte_identical_to_old_hardcoded_call(fake_whisper_module, data_dir):
+    """Nothing set -> exactly the old call: device auto, int8, no cpu_threads, beam 5."""
+    t = _build()
+    made = fake_whisper_module.instances[0]
+    assert _knobs(made) == {"device": "auto", "compute_type": "int8"}
+    assert "cpu_threads" not in made.init_kwargs
+    list(t.segments(np.zeros(16000, dtype=np.float32)))
+    assert made.transcribe_kwargs["beam_size"] == 5
+    # Settings defaults agree with what the backend received.
+    s = Settings.load()
+    assert (s.compute_type, s.cpu_threads, s.beam_size) == ("int8", None, 5)
+
+
+def test_settings_overrides_reach_the_backend(fake_whisper_module, data_dir):
+    """Values written to settings.json flow all the way into WhisperModel."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "settings.json").write_text(
+        '{"compute_type": "int8_float16", "cpu_threads": 3, "beam_size": 9}')
+    t = _build()
+    made = fake_whisper_module.instances[0]
+    assert _knobs(made) == {"device": "auto", "compute_type": "int8_float16",
+                            "cpu_threads": 3}
+    list(t.segments(np.zeros(16000, dtype=np.float32)))
+    assert made.transcribe_kwargs["beam_size"] == 9
+
+
+def test_env_overrides_win_over_settings_file(fake_whisper_module, data_dir, monkeypatch):
+    monkeypatch.setenv("LISTN_COMPUTE_TYPE", "float16")
+    monkeypatch.setenv("LISTN_CPU_THREADS", "2")
+    monkeypatch.setenv("LISTN_BEAM_SIZE", "7")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "settings.json").write_text('{"compute_type": "int8", "beam_size": 5}')
+    t = _build()
+    made = fake_whisper_module.instances[0]
+    assert _knobs(made) == {"device": "auto", "compute_type": "float16",
+                            "cpu_threads": 2}
+    list(t.segments(np.zeros(16000, dtype=np.float32)))
+    assert made.transcribe_kwargs["beam_size"] == 7
+
+
+def test_explicit_arguments_override_settings(fake_whisper_module, data_dir, monkeypatch):
+    monkeypatch.setenv("LISTN_COMPUTE_TYPE", "float16")
+    _build(compute_type="int8", cpu_threads=None, beam_size=1)
+    made = fake_whisper_module.instances[0]
+    assert _knobs(made) == {"device": "auto", "compute_type": "int8"}
+    assert "cpu_threads" not in made.init_kwargs
+
+
+def test_knob_change_evicts_the_cached_model(fake_whisper_module, data_dir):
+    """A different knob set must not reuse a model built with the old one."""
+    a = _build()
+    b = _build()
+    assert a is b and len(fake_whisper_module.instances) == 1
+    c = _build(compute_type="float16")
+    assert c is not a and len(fake_whisper_module.instances) == 2
+
+
+def test_non_faster_whisper_backends_ignore_the_knobs(fake_whisper_module, data_dir, monkeypatch):
+    monkeypatch.setenv("LISTN_COMPUTE_TYPE", "float16")
+    tr.register_backend("fake-knobs", lambda model, download=None: FakeTranscriber(model))
+    t = tr.get_transcriber("tiny", "fake-knobs")
+    assert isinstance(t, FakeTranscriber)
+
+
+@pytest.mark.parametrize("env,field,bad", [
+    ("LISTN_COMPUTE_TYPE=banana", "compute_type", "banana"),
+    ("LISTN_COMPUTE_TYPE=Int8 Float16", "compute_type", "int8 float16"),
+    ("LISTN_CPU_THREADS=0", "cpu_threads", "0"),
+    ("LISTN_CPU_THREADS=-2", "cpu_threads", "-2"),
+    ("LISTN_CPU_THREADS=many", "cpu_threads", "many"),
+    ("LISTN_CPU_THREADS=2.5", "cpu_threads", "2.5"),
+    ("LISTN_BEAM_SIZE=0", "beam_size", "0"),
+    ("LISTN_BEAM_SIZE=huge", "beam_size", "huge"),
+    ("LISTN_BEAM_SIZE=101", "beam_size", "101"),
+])
+def test_invalid_env_values_fail_loudly_with_a_readable_message(data_dir, monkeypatch, env, field, bad):
+    var, value = env.split("=", 1)
+    monkeypatch.setenv(var, value)
+    with pytest.raises(ValueError) as excinfo:
+        Settings.load()
+    message = str(excinfo.value)
+    assert field in message, message
+    assert bad in message, message
+
+
+def test_invalid_settings_file_values_fail_loudly(data_dir):
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "settings.json").write_text('{"beam_size": 0}')
+    with pytest.raises(ValueError, match="beam_size"):
+        Settings.load()
+    (data_dir / "settings.json").write_text('{"compute_type": "tpu"}')
+    with pytest.raises(ValueError, match="compute_type"):
+        Settings.load()
+    (data_dir / "settings.json").write_text('{"cpu_threads": "none"}')
+    with pytest.raises(ValueError, match="cpu_threads"):
+        Settings.load()
+
+
+def test_all_documented_compute_types_are_accepted(data_dir):
+    for kind in COMPUTE_TYPES:
+        assert Settings(compute_type=kind).validated().compute_type == kind
+
+
+def test_cpu_threads_and_beam_size_round_trip_through_strings(data_dir):
+    """Env vars are strings; they must parse to the right ints, not be rejected."""
+    s = Settings(**{"cpu_threads": "4", "beam_size": "5"}).validated()  # pyright: ignore[reportArgumentType]
+    assert (s.cpu_threads, s.beam_size) == (4, 5)
+    assert Settings(**{"cpu_threads": ""}).validated().cpu_threads is None  # pyright: ignore[reportArgumentType]
+
+
+def test_transcribe_help_shows_the_effective_knob_values(data_dir, capsys, monkeypatch):
+    """`listn transcribe --help` reports what this run would actually use."""
+    from listn import cli
+
+    monkeypatch.setenv("LISTN_COMPUTE_TYPE", "float16")
+    monkeypatch.setenv("LISTN_CPU_THREADS", "4")
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["transcribe", "--help"])
+    assert excinfo.value.code == 0
+    out = capsys.readouterr().out
+    assert "compute type: float16" in out
+    assert "cpu threads:  4" in out
+    assert "beam size:    5" in out
+    assert "LISTN_COMPUTE_TYPE" in out
+
+
+def test_transcribe_help_says_threads_are_auto_when_unset(data_dir, capsys):
+    from listn import cli
+
+    with pytest.raises(SystemExit):
+        cli.main(["transcribe", "--help"])
+    out = capsys.readouterr().out
+    assert "cpu threads:  auto (backend chooses)" in out
+
+
+def test_invalid_knob_exits_readably_not_with_a_traceback(data_dir, capsys, monkeypatch):
+    from listn import cli
+
+    monkeypatch.setenv("LISTN_BEAM_SIZE", "banana")
+    assert cli.main(["transcribe", "whatever.wav"]) == 2
+    err = capsys.readouterr().err
+    assert "beam_size" in err and "banana" in err
+    assert "Traceback" not in err
