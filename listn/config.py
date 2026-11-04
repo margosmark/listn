@@ -11,8 +11,9 @@ private data directory outside the repository:
 The transcription performance knobs (``compute_type``, ``cpu_threads``,
 ``beam_size``) can be set in ``settings.json`` or overridden per-run with
 ``LISTN_COMPUTE_TYPE``, ``LISTN_CPU_THREADS`` and ``LISTN_BEAM_SIZE``. The
-environment wins over the file. Invalid values raise a ``ValueError`` with a
-readable message instead of silently falling back.
+environment wins over the file. Invalid values raise a ``SettingsError`` with
+a readable message instead of silently falling back; ``SettingsError`` is a
+``ValueError`` subclass so existing handlers keep working.
 """
 
 from __future__ import annotations
@@ -38,6 +39,17 @@ SETTINGS_VERSION = 2
 SPEAKER_THRESHOLD = 0.55
 SPEAKER_THRESHOLD_MIN = 0.3
 SPEAKER_THRESHOLD_MAX = 0.9
+
+
+class SettingsError(ValueError):
+    """A settings value the user can fix: settings.json or a ``LISTN_*`` variable.
+
+    Kept distinct from a bare ``ValueError`` so the CLI can turn *this* into a
+    one-line ``listn: ...`` message with exit 2 while an unrelated ``ValueError``
+    raised by a bug still escapes with its traceback. It subclasses
+    ``ValueError`` on purpose: callers that already treat a bad setting as a
+    user-facing error (the web API, existing tests) keep working unchanged.
+    """
 
 
 def disable_network_telemetry() -> None:
@@ -163,7 +175,7 @@ class Settings:
         else:
             self.compute_type = DEFAULT_COMPUTE_TYPE
         if self.compute_type not in COMPUTE_TYPES:
-            raise ValueError(
+            raise SettingsError(
                 f"compute_type must be one of {', '.join(COMPUTE_TYPES)} — "
                 f"got {self.compute_type!r}.")
         raw_threads = self.cpu_threads
@@ -175,7 +187,7 @@ class Settings:
             except (TypeError, ValueError):
                 threads = 0
             if threads < 1:
-                raise ValueError(
+                raise SettingsError(
                     "cpu_threads must be a whole number of 1 or more "
                     f"(unset it to let the backend choose) — got {raw_threads!r}.")
             self.cpu_threads = threads
@@ -185,7 +197,7 @@ class Settings:
         except (TypeError, ValueError):
             beam = 0
         if not 1 <= beam <= 100:
-            raise ValueError(
+            raise SettingsError(
                 f"beam_size must be a whole number between 1 and 100 — got {raw_beam!r}.")
         self.beam_size = beam
         try:

@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 from listn import __version__
-from listn.config import BACKENDS, MODELS, Settings, data_dir, disable_network_telemetry
+from listn.config import BACKENDS, MODELS, Settings, SettingsError, data_dir, disable_network_telemetry
 from listn.library import EXPORT_FORMATS, Library, export, fmt_clock
 
 
@@ -43,7 +43,7 @@ def _perf_epilog() -> str:
     """
     try:
         s = Settings.load()
-    except ValueError as exc:
+    except SettingsError as exc:
         return (f"performance knobs: INVALID — {exc}\n"
                 "  Fix settings.json or the LISTN_COMPUTE_TYPE / "
                 "LISTN_CPU_THREADS / LISTN_BEAM_SIZE environment variable.")
@@ -635,8 +635,10 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except KeyboardInterrupt:
         return 130
-    except ValueError as exc:
-        # Invalid settings (e.g. a LISTN_* knob) fail loudly and readably,
-        # never silently fall back to a different value.
+    except SettingsError as exc:
+        # Only the settings validation (settings.json / LISTN_* knobs) is a
+        # user-facing error, so it alone gets the one-line treatment. Any other
+        # ValueError is a bug: let it propagate with a traceback instead of
+        # dressing it up as a usage problem.
         print(f"listn: {exc}", file=sys.stderr)
         return 2
