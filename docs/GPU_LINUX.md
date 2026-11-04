@@ -31,6 +31,54 @@ CTranslate2’s generic `compute_type` set is not a promise that every type work
 - **NVIDIA CUDA:** faster-whisper’s documented examples use `float16`, `int8_float16`, or `int8`.[1] CTranslate2 documents GPU-specific behavior by NVIDIA compute capability: FP16 optimized on capability >=7.0; BF16 >=8.0; INT8 support varies (>=7.0 or 6.1 in its documented matrix); some requested types may be converted to another type.[3] Start with `float16` for a supported NVIDIA GPU, and use `get_supported_compute_types("cuda")` to establish actual support. Do not assume BF16/INT8 support based only on the type name.
 - **AMD ROCm:** the current public Python `get_supported_compute_types` reference names only `cpu` and `cuda`, and the official PyPI/CUDA install page is not an AMD install recipe.[2][4][5] Do not claim that the CUDA device string or CUDA type list proves ROCm functionality. The released ROCm wheel must be validated against its matching runtime and queried/benchmarked using the API supported by that build; use only values actually reported/accepted by that wheel. No reliable, current official per-type faster-whisper/ROCm matrix was found in the cited sources.
 
+## How listn selects the compute device (implemented 2026-11-03)
+
+Behaviour of the shipped code, independent of any GPU claim in this document:
+
+- `compute_device` (`settings.json`), `LISTN_COMPUTE_DEVICE`, and `listn transcribe|live --compute-device`
+  accept `cpu`, `auto`, `cuda`. Precedence: CLI > environment > settings file.
+  Invalid values raise a readable `ValueError` (CLI exit 2), never a silent fallback.
+- **Default: `cpu`.** CTranslate2 is never asked for a CUDA device unless the
+  user selects one, so the missing-`libcublas.so.12` failure cannot happen by
+  default and no GPU package is ever installed by listn.
+- **`auto`:** `listn/transcriber.py:resolve_device()` first runs
+  `ctranslate2.get_cuda_device_count()` and a `ctypes.CDLL("libcublas.so.12")`
+  check — both **in a child process** (`_PROBE_SCRIPT`), because the native
+  loader and the CUDA driver API can terminate a process without a Python
+  exception. A child killed by a signal, a timeout, or unparseable output all
+  read as "not usable", with the reason shown. No visible CUDA device keeps the
+  historical `device="auto"` (CTranslate2 resolves it to CPU). A visible device
+  whose libraries do not load pins `device="cpu"` and reports why.
+- **`cuda`:** any of "no device", "library unusable", or a CTranslate2 error
+  during model construction raises `CudaUnavailable` with an actionable
+  message (install CUDA 12 libraries or use `--compute-device cpu`); the file
+  job exits 1 with no traceback and no transcript — never a false success.
+- **Construction backstop:** if CTranslate2 still raises a CUDA-shaped error
+  under `auto` (version skew the probe cannot see), listn rebuilds on CPU and
+  says so. A device failure on the cached model attempt never enters the
+  download path, so it cannot claim or trigger a network download.
+- **Truthful reporting:** after loading, the device CTranslate2 reports
+  (`model.device`) is published as a status line — `device: cpu` /
+  `device: cuda` — on every model build, cache hit included.
+
+Fish-compatible usage:
+
+```fish
+uv run listn transcribe ./mic.wav --model tiny --backend faster-whisper --compute-device cpu
+set -lx LISTN_COMPUTE_DEVICE auto; uv run listn transcribe ./mic.wav --model tiny --backend faster-whisper
+env LISTN_COMPUTE_DEVICE=cuda uv run listn transcribe ./mic.wav --model tiny --backend faster-whisper
+```
+
+Evidence from this branch on the research host (no GPU): default run on real
+speech audio exited 0 with `device: cpu` and the expected transcript;
+`LISTN_COMPUTE_DEVICE=cuda` exited 1 with `compute_device=cuda was requested, but
+CTranslate2 sees no CUDA device … Run on CPU with --compute-device cpu` and no
+traceback; `cuda_runtime_ready()` on the real installed CTranslate2 4.8.3
+returned `(False, 'libcublas.so.12: … cannot open shared object file')` from a
+surviving parent process. A real GPU-present, library-missing machine (the
+CachyOS laptop) is still the final proof for the `auto` GPU branch — that is
+QA's step, not a claim here.
+
 ## Detect the actual machine first
 
 Run these on the **CachyOS laptop itself**, in a terminal session with access to the host PCI devices (not this research container). Commands are observational; do not install drivers/packages as part of detection.
