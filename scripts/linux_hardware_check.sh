@@ -71,6 +71,7 @@ SYS_TARGET_ARG=""
 MIC_TARGET_ARG=""
 PORT=""
 LISTN_CMD="${LISTN_CMD:-python3 -m listn}"
+LISTN_ARGV=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -87,6 +88,22 @@ while [ $# -gt 0 ]; do
     *) echo "hwcheck: unknown argument '$1' (see --help)" >&2; exit 3 ;;
   esac
 done
+
+# LISTN_CMD is a convenience command string, not shell code: split it as argv
+# without evaluating substitutions, redirects, or other shell syntax.
+# Bash mapfile cannot represent NUL; use a delimiter-safe JSON-free parser.
+LISTN_ARGV=()
+while IFS= read -r -d '' arg; do LISTN_ARGV+=("$arg"); done < <("${PYTHON:-python3}" -c 'import shlex,sys; sys.stdout.buffer.write(b"\0".join(x.encode() for x in shlex.split(sys.argv[1]))+b"\0")' "$LISTN_CMD" 2>/dev/null)
+[ "${#LISTN_ARGV[@]}" -gt 0 ] || { echo "hwcheck: invalid LISTN_CMD" >&2; exit 3; }
+
+case "$DURATION" in
+  ''|*[!0-9]*) echo "hwcheck: --duration must be an integer from 1 to 3600" >&2; exit 3 ;;
+esac
+[ "$DURATION" -ge 1 ] && [ "$DURATION" -le 3600 ] || { echo "hwcheck: --duration must be an integer from 1 to 3600" >&2; exit 3; }
+if [ -n "$PORT" ]; then
+  case "$PORT" in ''|*[!0-9]*) echo "hwcheck: --port must be an integer from 1 to 65535" >&2; exit 3 ;; esac
+  [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || { echo "hwcheck: --port must be an integer from 1 to 65535" >&2; exit 3; }
+fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STARTED="$(date '+%Y-%m-%d %H:%M:%S %Z')"
@@ -546,7 +563,7 @@ verdict PASS preflight "pipewire/wireplumber/pw-dump/pw-record on PATH; session 
 
 # ---- phase 2: discovery ----------------------------------------------------
 head_ "2/5 discovery — the real session graph"
-( cd "$REPO_ROOT" && $LISTN_CMD record --list ) 2>"$TMP/discovery.log"
+( cd "$REPO_ROOT" && "${LISTN_ARGV[@]}" record --list ) 2>"$TMP/discovery.log"
 DISC_RC=$?
 [ -s "$TMP/discovery.log" ] && sed 's/^/  /' "$TMP/discovery.log"
 # Independent view: label every node with its media class straight from the
@@ -622,7 +639,7 @@ else
   TARGET_ARGS=()
   [ -n "$SYS_TARGET" ] && TARGET_ARGS+=(--system-target "$SYS_TARGET")
   [ -n "$MIC_TARGET" ] && TARGET_ARGS+=(--mic-target "$MIC_TARGET")
-  ( cd "$REPO_ROOT" && $LISTN_CMD record --duration "$DURATION" \
+  ( cd "$REPO_ROOT" && "${LISTN_ARGV[@]}" record --duration "$DURATION" \
       "${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"}" \
       --out "$TMP/capture" --json ) >"$TMP/capture.json" 2>"$TMP/capture.log"
   CAP_RC=$?
@@ -663,7 +680,7 @@ PYEOF
   if [ -n "$PORT" ]; then
     say "  keep some audio playing; the session runs ~10 s against an isolated data dir"
     say "  starting the local web UI on 127.0.0.1:$PORT (loopback only)..."
-    setsid sh -c "exec $LISTN_CMD ui --no-browser --port $PORT" >>"$TMP/ui.log" 2>&1 &
+    setsid "${LISTN_ARGV[@]}" ui --no-browser --port "$PORT" >>"$TMP/ui.log" 2>&1 &
     SERVER_PID=$!
     export HWCHECK_PORT="$PORT"
     UP=""
@@ -708,8 +725,10 @@ else
     UNPLUG_NODE="${REPLY:-$MIC_TARGET}"
     mkdir -p "$TMP/hotplug"
     say "  starting a 15 s capture on '$UNPLUG_NODE'; unplug within the first ~12 s"
-    ( cd "$REPO_ROOT" && $LISTN_CMD record --duration 15 \
-        --mic-target "$UNPLUG_NODE" ${SYS_TARGET:+--system-target "$SYS_TARGET"} \
+    HOT_TARGET_ARGS=()
+    [ -n "$SYS_TARGET" ] && HOT_TARGET_ARGS+=(--system-target "$SYS_TARGET")
+    ( cd "$REPO_ROOT" && "${LISTN_ARGV[@]}" record --duration 15 \
+        --mic-target "$UNPLUG_NODE" "${HOT_TARGET_ARGS[@]}" \
         --out "$TMP/hotplug" --json ) >"$TMP/hotplug.json" 2>"$TMP/hotplug.log" &
     REC_PID=$!
     sleep 3
@@ -734,11 +753,11 @@ else
     prompt ">>> REPLUG the mic, wait ~5 s, then press Enter..." ""
     sleep 2
     say "  re-running discovery:"
-    ( cd "$REPO_ROOT" && $LISTN_CMD record --list ) 2>/dev/null | sed 's/^/  /'
+    ( cd "$REPO_ROOT" && "${LISTN_ARGV[@]}" record --list ) 2>/dev/null | sed 's/^/  /'
     mkdir -p "$TMP/recover"
     prompt "Speak for the next 4 s — press Enter to start the recovery capture..." ""
-    ( cd "$REPO_ROOT" && $LISTN_CMD record --duration 4 \
-        --mic-target "$UNPLUG_NODE" ${SYS_TARGET:+--system-target "$SYS_TARGET"} \
+    ( cd "$REPO_ROOT" && "${LISTN_ARGV[@]}" record --duration 4 \
+        --mic-target "$UNPLUG_NODE" "${HOT_TARGET_ARGS[@]}" \
         --out "$TMP/recover" --json ) >"$TMP/recover.json" 2>"$TMP/recover.log"
     REC_RC=$?
     sed 's/^/  /' "$TMP/recover.log"
