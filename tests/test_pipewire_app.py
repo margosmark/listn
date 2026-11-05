@@ -267,6 +267,59 @@ def test_duplicate_node_names_are_refused():
         pw.select_targets(graph, APP_A, MIC)
 
 
+def _dup_name_payload(with_serial=True):
+    """QA F1's graph: a second stream sharing ``APP_B``'s node.name.
+
+    The id and application-name selectors still resolve to exactly one
+    node; only the resulting ``node.name`` collides — the case where
+    ``pw-record`` bound the first-created match and recorded the other
+    application.
+    """
+    payload = app_dump()
+    dup: dict = {"media.class": "Stream/Output/Audio",
+                 "node.name": APP_B,
+                 "application.name": "AppB2"}
+    if with_serial:
+        dup["object.serial"] = 156
+    payload.append(_node(56, dup))
+    return payload
+
+
+def test_shared_node_name_is_refused_for_targets_bound_by_name():
+    """A name-bound target whose ``node.name`` matches >1 node is refused.
+
+    ``pw-record`` would bind the first-created node of that name, so the
+    capture would hold a different node's audio than the report claims.
+    This is the post-resolution check QA F1 asked for: the *selector* is
+    unambiguous (id or application name) but the name it would be bound
+    by is not. Sinks and microphones bind by name, and an application
+    stream without a serial has nothing better to bind to.
+    """
+    # sink selected by id, two sinks share the name
+    payload = app_dump()
+    payload.append(_node(58, {"media.class": "Audio/Sink", "node.name": SINK,
+                              "object.serial": 158, "priority.session": 900}))
+    payload.append(_node(60, {"media.class": "Audio/Source", "node.name": MIC,
+                              "object.serial": 160, "priority.session": 900}))
+    graph = pw.parse_graph(payload)
+    with pytest.raises(pw.CaptureError) as excinfo:
+        pw.select_targets(graph, "58", MIC)
+    message = str(excinfo.value)
+    assert f"'{SINK}' names 2 PipeWire nodes" in message
+    assert "A capture target must be unambiguous" in message
+    assert "would record the first match" in message
+    with pytest.raises(pw.CaptureError, match="names 2 PipeWire nodes"):
+        pw.select_targets(graph, None, "60")   # mic path (_resolve)
+    # an application stream with no serial to bind to: same refusal
+    graph = pw.parse_graph(_dup_name_payload(with_serial=False))
+    with pytest.raises(pw.CaptureError) as excinfo:
+        pw.select_targets(graph, "AppB2", MIC)
+    assert f"'{APP_B}' names 2 PipeWire nodes" in str(excinfo.value)
+    # while the same graph WITH a serial is fine: binding cannot drift
+    targets = pw.select_targets(pw.parse_graph(_dup_name_payload()), "AppB2", MIC)
+    assert targets.system.node.serial == 156
+
+
 def test_missing_app_is_refused_instead_of_falling_back_to_the_sink():
     graph = pw.parse_graph(app_dump())
     with pytest.raises(pw.CaptureError) as excinfo:
@@ -303,14 +356,55 @@ def test_graph_without_application_streams_still_works():
 # Recorder: the right argv, honest failure when the stream closes
 # ---------------------------------------------------------------------------
 
-def test_app_target_argv_has_no_sink_monitor_property(fake_pw_app_env, data_dir, tmp_path):
+def test_app_target_argv_binds_by_serial_and_has_no_sink_monitor_property(
+        fake_pw_app_env, data_dir, tmp_path):
+    """The system track binds the app stream by its unique ``object.serial``.
+
+    ``pw-record --target`` resolves a name to the *first-created* node
+    carrying it, so the name must never reach the child process: with two
+    streams sharing a ``node.name`` the name would record the other one
+    (QA F1). Serials are unique and never reused.
+    """
+    app_node = pw.parse_graph(app_dump()).by_name(APP_A)
+    assert app_node is not None
+    serial = app_node.serial
     run_capture(tmp_path, APP_A, out="app")
-    app_argv = next(line for line in read_argv(fake_pw_app_env) if APP_A in line)
-    assert f"--target {APP_A}" in app_argv
+    app_argv = next(line for line in read_argv(fake_pw_app_env)
+                    if f"--target {serial}" in line)
+    assert f"--target {APP_A}" not in app_argv
     # an application stream is tapped through its own output ports: asking
     # for monitor capture would describe a target this track does not have
     assert "stream.capture.sink" not in app_argv
     assert "--rate" in app_argv and "--format s16" in app_argv
+
+
+def test_duplicate_node_name_capture_binds_the_selected_stream_by_serial(
+        fake_pw_app_env, data_dir, tmp_path):
+    """QA F1 regression: id and application-name selectors against two
+    streams that share one ``node.name``.
+
+    Both selectors resolve to the SECOND stream (id 56, serial 156), so
+    the recorder must spawn ``pw-record`` with that unique serial — never
+    with the shared name, which PipeWire resolves to the first-created
+    match and which recorded the other application while ``report.ok``
+    claimed this one (reproduced 5/5 on a real daemon before the fix).
+    """
+    payload = _dup_name_payload()
+    fake_pw_app_env["graph_file"].write_text(json.dumps(payload))
+    graph = pw.parse_graph(payload)
+    for selector in ("56", "AppB2"):
+        targets = pw.select_targets(graph, selector, MIC)
+        assert targets.system.node.id == 56
+        assert targets.system.node.serial == 156
+        recorder = pw.TwoTrackRecorder(tmp_path / f"dup-{selector}", targets)
+        recorder.start()
+        time.sleep(0.3)
+        report = recorder.stop()
+        assert cc.validate_report(report) == []
+    lines = read_argv(fake_pw_app_env)
+    assert sum("--target 156" in line for line in lines) == 2
+    # the shared name never reaches pw-record for either selection
+    assert not any(f"--target {APP_B}" in line for line in lines)
 
 
 def test_sink_target_argv_still_asks_for_monitor_capture(fake_pw_app_env, data_dir, tmp_path):
@@ -457,6 +551,23 @@ def test_record_unknown_app_exits_3_without_starting(
     assert not out_dir.exists()
 
 
+def test_record_refuses_shared_name_without_recording_dir(
+        fake_pw_app_env, data_dir, tmp_path, capsys):
+    """The post-resolution shared-name refusal (QA F1) is CLI exit 3 with
+    no recording directory — same refusal family as an ambiguous selector."""
+    payload = _dup_name_payload(with_serial=False)
+    fake_pw_app_env["graph_file"].write_text(json.dumps(payload))
+    out_dir = tmp_path / "never"
+    rc = cli.main(["record", "--system-target", "AppB2",
+                   "--mic-target", MIC, "--duration", "0.2",
+                   "--out", str(out_dir)])
+    assert rc == 3
+    err = capsys.readouterr().err
+    assert f"'{APP_B}' names 2 PipeWire nodes" in err
+    assert "A capture target must be unambiguous" in err
+    assert not out_dir.exists()
+
+
 def test_devices_endpoint_lists_application_streams(pw_client_app):
     devices = pw_client_app.get("/api/pipewire/devices").json()
     assert [n["name"] for n in devices["apps"]] == [APP_A, APP_B]
@@ -498,5 +609,22 @@ def test_live_start_rejects_a_vanished_app_without_side_effects(pw_client_app):
         "mic_target": MIC})
     assert r.status_code == 400
     assert "No PipeWire node named 'listn.test.gone'" in r.json()["detail"]
+    assert pw_client_app.get("/api/live").json()["live"] is None
+    assert pw_client_app.get("/api/sessions").json()["results"] == []
+
+
+def test_live_start_rejects_a_shared_name_without_side_effects(
+        pw_client_app, fake_pw_app_env):
+    """QA F1 over HTTP: shared ``node.name`` on a name-bound target ->
+    400 with the refusal, nothing started, no session recorded."""
+    payload = app_dump()
+    payload.append(_node(58, {"media.class": "Audio/Sink", "node.name": SINK,
+                              "object.serial": 158, "priority.session": 900}))
+    fake_pw_app_env["graph_file"].write_text(json.dumps(payload))
+    r = pw_client_app.post("/api/live/start", json={
+        "capture": "pipewire", "title": "shared name",
+        "system_target": "58", "mic_target": MIC})
+    assert r.status_code == 400
+    assert "names 2 PipeWire nodes" in r.json()["detail"]
     assert pw_client_app.get("/api/live").json()["live"] is None
     assert pw_client_app.get("/api/sessions").json()["results"] == []
