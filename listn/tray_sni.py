@@ -154,7 +154,10 @@ class StatusNotifierItem:
 
             @dbus_property(access=PropertyAccess.READ)
             def Status(self) -> "s":  # noqa: N802
-                return "NeedsAttention" if controller.status.state == FAILED else "Active"
+                prompt = getattr(controller, "meeting_prompt", None)
+                needs = (controller.status.state == FAILED
+                         or (prompt is not None and prompt.kind == "offer"))
+                return "NeedsAttention" if needs else "Active"
 
             @dbus_property(access=PropertyAccess.READ)
             def IconName(self) -> "s":  # noqa: N802
@@ -162,7 +165,11 @@ class StatusNotifierItem:
 
             @dbus_property(access=PropertyAccess.READ)
             def AttentionIconName(self) -> "s":  # noqa: N802
-                return "dialog-error"
+                # A pending meeting prompt also raises NeedsAttention; it is
+                # not an error, so it must not show the error icon.
+                if controller.status.state == FAILED:
+                    return "dialog-error"
+                return "audio-input-microphone"
 
             @dbus_property(access=PropertyAccess.READ)
             def IconThemePath(self) -> "s":  # noqa: N802
@@ -184,8 +191,15 @@ class StatusNotifierItem:
                 title = "listn — " + state.replace("-", " ").title()
                 # (icon name, pixmap array, title, description): no custom
                 # pixmap — hosts resolve IconName from the icon theme.
+                prompt = getattr(controller, "meeting_prompt", None)
+                if prompt is not None and prompt.kind == "offer":
+                    description = f"Record {prompt.label}?"
+                elif prompt is not None and prompt.kind == "end":
+                    description = f"{prompt.label} ended — stop recording?"
+                else:
+                    description = controller.status.summary()
                 return [ICONS.get(state, "audio-input-microphone"),
-                        [], title, controller.status.summary()]
+                        [], title, description]
 
             @method()
             def Activate(self, x: "i", y: "i"):  # noqa: N802
