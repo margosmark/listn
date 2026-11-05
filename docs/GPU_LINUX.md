@@ -60,6 +60,17 @@ Behaviour of the shipped code, independent of any GPU claim in this document:
 - **Truthful reporting:** after loading, the device CTranslate2 reports
   (`model.device`) is published as a status line — `device: cpu` /
   `device: cuda` — on every model build, cache hit included.
+- **Inference is process-isolated (2026-11-04).** The complete model load
+  + inference operation runs in a child process
+  (`listn/inference_worker.py`); the parent writes library/manifest files
+  only after the child answers with a complete result. A native
+  SIGSEGV/SIGABRT kills only that child: under `auto` the parent restarts
+  it pinned to CPU exactly once and appends `…; running on CPU` to the
+  status line; under explicit `cuda` it raises the actionable error with
+  no CPU retry; under `cpu` the crash is reported as an error (there is
+  nothing to fall back to). `tests/test_isolation.py` simulates SIGSEGV
+  after model load, SIGABRT mid-generator, SIGSEGV during load, and
+  verifies no partial/duplicate transcript in each case.
 
 Fish-compatible usage:
 

@@ -32,7 +32,7 @@ from listn.ipc import TRACK_MIC, TRACK_SPEAKER, TRACK_SYSTEM
 from listn.capture import open_input
 from listn.config import Settings
 from listn.library import Library, Segment, SessionMeta
-from listn.transcriber import get_transcriber, resolve_backend
+from listn.transcriber import CudaUnavailable, get_transcriber, resolve_backend
 
 log = logging.getLogger("listn")
 
@@ -444,6 +444,16 @@ class LiveSession:
                     chunk, language=self.settings.language,
                     prompt=prompt_with_vocabulary(self.settings.vocabulary, prompts.get(track)),
                     hotwords=hotword_string(self.settings.vocabulary), offset=start)
+            except CudaUnavailable as exc:
+                # compute_device=cuda was asked for by name and failed for
+                # good. Say it once, keep recording, keep the audio — and
+                # never fall back silently. The chunks drain like they do
+                # after a failed model load.
+                self._emit("live.error", message=str(exc))
+                self.state = "recording-only"
+                while self._chunks.get() is not None:
+                    self.pending_chunks -= 1
+                return
             except Exception as exc:
                 self._emit("live.error", message=f"Transcription failed for one chunk: {exc}")
                 raw = []

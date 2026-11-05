@@ -389,6 +389,8 @@ Faster-whisper uses the **CPU by default**. On Linux a machine can expose an NVI
 | `auto` | Probes CUDA **in a child process** first (so a broken driver or library cannot take listn down); uses the GPU only when a CUDA device is visible and its runtime libraries load, and falls back to CPU otherwise, saying why. |
 | `cuda` | Requires the GPU. If CTranslate2 cannot use it, listn stops with an actionable error — no silent fallback, exit code 1, no traceback. |
 
+Model load and inference for the default backend run in a **separate process**. A GPU stack that kills that process mid-run (SIGSEGV/SIGABRT from native code — the failure a Python `try` cannot catch) can never take listn down with it: `auto` restarts the work pinned to CPU, exactly once, and says so on the status line; `cuda` fails with the error above instead of retrying on CPU; and the transcript is written only after a run finishes cleanly, so a crash never leaves a half-written or duplicated transcript.
+
 The status line reports the device the model actually runs on (`device: cpu`, `device: cuda`), so a fallback is never mistaken for GPU acceleration.
 
 ```fish
