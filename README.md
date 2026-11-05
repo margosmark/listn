@@ -87,7 +87,10 @@ uv run listn tray --no-server      # only attach to an already-running engine
 ```
 
 The tray menu is exactly: recording status, Start/Stop, Pause/Resume, the two
-target pickers (radio picks, session defaults labelled as suggestions), Open
+target pickers (radio picks, session defaults labelled as suggestions),
+meeting prompts when a meeting is detected (Record / Not now / Remind me in
+5 minutes, then an end offer when it stops — see
+[Linux meeting detection](docs/LINUX_MEETINGS.md)), Open
 privacy settings (listn's own settings page — PipeWire has no macOS-style
 per-app permission list, and the tray does not pretend otherwise), and Quit
 (which stops an active recording first). Failure is shown as failure with the
@@ -100,9 +103,12 @@ exercised.
 input. A PipeWire/PulseAudio monitor may be selectable if exposed
 by PortAudio; routing, permissions, device changes and audio quality need
 verification on the target desktop. Do not interpret its labels as reliable
-speaker identity. Per-app capture, meeting detection and
-launch-at-login integration are not implemented (the tray hides those
-controls rather than faking them). Do not use the macOS
+speaker identity. Per-app capture and launch-at-login integration are not
+implemented (the tray hides those controls rather than faking them).
+Meeting detection does exist on Linux and only ever *offers*: see
+[Linux meeting detection](docs/LINUX_MEETINGS.md) for the supported
+sources (PipeWire app identity, X11 titles), the Wayland limit, and the
+consent rules (`auto_record_meetings` is off by default). Do not use the macOS
 management script on Linux. GPU acceleration is unverified; MLX-based
 notes are unavailable and the existing extractive fallback is used. See
 [operations](docs/OPERATIONS.md) for validation steps.

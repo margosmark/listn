@@ -347,8 +347,10 @@ port; `--no-server` refuses to start one and fails with a clear message.
   / paused / stopping / failed (with the recorder's own per-track cause) /
   unreachable ("listn is not answering"). A refused Start keeps the server's
   reason visible instead of pretending to record. The macOS-only or
-  unimplemented controls (meetings, auto-record, launch-at-login) are
-  absent, not greyed.
+  unimplemented controls (launch-at-login) are absent, not greyed; meeting
+  prompts now exist (offer / not now / remind later / end offer — see
+  [LINUX_MEETINGS](LINUX_MEETINGS.md)) and are consent-gated, with
+  auto-record off by default.
 - Verification: the pure state machine and controller are covered in
   `tests/test_tray.py` against the real server app with the stand-in
   `pw-dump`/`pw-record` tools; the D-Bus contract (properties, menu layout,
