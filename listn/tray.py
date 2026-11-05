@@ -18,11 +18,15 @@ Three layers, so the interesting logic needs neither Qt nor a session bus:
   D-Bus (Plasma's tray protocol), a renderer of this model.
 
 Scope honesty: the menu offers exactly start/stop, pause/resume, the target
-pickers, open privacy settings, quit. The macOS-only or unimplemented
-controls (``offer-meetings``, ``auto-record``, ``launch-at-login``) do not
-exist here — not disabled, absent. Privacy settings on Linux is listn's own
-retention/audio settings page: PipeWire has no macOS-style per-app permission
-list, and the tray does not pretend otherwise.
+pickers, open privacy settings, quit. The system-output picker covers both
+capture modes of the same track — a whole sink ("all applications") or one
+application stream — from the lists the local API returns, in one radio
+group, so what is checked is what is recorded. The macOS-only or
+unimplemented controls (``offer-meetings``, ``auto-record``,
+``launch-at-login``) do not exist here — not disabled, absent. Privacy
+settings on Linux is listn's own retention/audio settings page: PipeWire
+has no macOS-style per-app permission list, and the tray does not pretend
+otherwise.
 
 Local-first: HTTP stays on loopback, D-Bus stays on the session bus; nothing
 here opens a socket to anywhere else.
@@ -61,6 +65,10 @@ ITEM_PAUSE = 5
 ITEM_RESUME = 6
 ITEM_SYSTEM_BASE = 100   # system output entries: 100, 101, ...
 ITEM_MIC_BASE = 200      # microphone entries: 200, 201, ...
+ITEM_APP_BASE = 300      # application-stream entries: 300, 301, ...
+# Disabled section header *inside* the System output submenu. Not a
+# control: clicking it does nothing (no action branch owns this id).
+ITEM_SYSTEM_APPS_SECTION = 12
 ITEM_PRIVACY = 20
 ITEM_QUIT = 30
 
@@ -285,9 +293,18 @@ class MenuItem:
 
 
 def build_menu(status: TrayStatus, sinks: list[dict], sources: list[dict],
-               selected_system: str | None, selected_mic: str | None,
+               apps: list[dict], selected_system: str | None,
+               selected_mic: str | None,
                discovery_error: str | None = None) -> list[MenuItem]:
-    """The whole tray menu. Unimplemented macOS controls are absent, not greyed."""
+    """The whole tray menu. Unimplemented macOS controls are absent, not greyed.
+
+    ``sinks`` and ``apps`` are two halves of *one* system-track picker:
+    whole-sink capture and a single application stream are alternatives,
+    not layers, so they share the System output submenu and its radio
+    group — exactly one entry in it can be checked, and whichever one is
+    checked is exactly the selection ``start()`` sends. The section
+    header is a disabled label, never a target.
+    """
     items = [MenuItem(ITEM_STATUS, status.summary(), enabled=False)]
     if status.state == FAILED or status.state == UNREACHABLE:
         pass  # the cause is already in the summary line
@@ -313,6 +330,22 @@ def build_menu(status: TrayStatus, sinks: list[dict], sources: list[dict],
         system.children.append(MenuItem(
             ITEM_SYSTEM_BASE + index, node.get("description") or name,
             toggle="radio", toggled=(name == selected_system)))
+    if apps:
+        # One picker, one radio group: an application stream is an
+        # alternative to the whole sink for this same track, so it lives
+        # in this submenu rather than in a group of its own — the host
+        # and the controller can then never show both modes checked.
+        # The label is the application's own name (parse_graph keeps
+        # window/media titles out of it); identity stays the node name.
+        if system.children:
+            system.children.append(MenuItem(0, "", separator=True))
+        system.children.append(MenuItem(
+            ITEM_SYSTEM_APPS_SECTION, "Application streams", enabled=False))
+        for index, node in enumerate(apps):
+            name = node.get("name") or "?"
+            system.children.append(MenuItem(
+                ITEM_APP_BASE + index, node.get("description") or name,
+                toggle="radio", toggled=(name == selected_system)))
     if not system.children and not discovery_error:
         system.enabled = False
         system.label = "System output — none found"
@@ -350,6 +383,12 @@ class TrayController:
     are adopted only as a labelled suggestion the user can change, mirroring
     ``listn record``), and a refused start stays visibly failed/idle with the
     server's reason instead of pretending to record.
+
+    The system selection is a single field holding either a sink's node
+    name (whole-sink mode) or an application stream's node name (one
+    application only). It is passed to the server unchanged: the tray
+    never translates one mode into the other, and the report's
+    ``targets.system.media_class`` is what tells them apart.
     """
 
     def __init__(self, client: ServerClient, on_quit=None,
@@ -359,6 +398,7 @@ class TrayController:
         self.status = TrayStatus(state=UNREACHABLE)
         self.sinks: list[dict] = []
         self.sources: list[dict] = []
+        self.apps: list[dict] = []
         self.discovery_error: str | None = None
         self.selected_system: str | None = None
         self.selected_mic: str | None = None
@@ -411,9 +451,16 @@ class TrayController:
             return
         self.sinks = devices.get("sinks") or []
         self.sources = devices.get("sources") or []
+        self.apps = devices.get("apps") or []
         defaults = devices.get("defaults") or {}
         sink_names = {n.get("name") for n in self.sinks}
         source_names = {n.get("name") for n in self.sources}
+        # The system track can point at a whole sink *or* at one
+        # application stream; both name spaces come from one graph, so a
+        # remembered selection is valid if it is in either list. A pick
+        # that is still there is kept as the user made it — an
+        # application selection is never quietly swapped back to a sink.
+        system_names = sink_names | {n.get("name") for n in self.apps}
         # A session manager can point a default at the wrong media class —
         # observed with WirePlumber 0.5.8 on a machine without microphones,
         # where default.audio.source named an Audio/Sink. Every default is
@@ -425,17 +472,19 @@ class TrayController:
             self.selected_system = default_sink
         if self.selected_mic is None and default_mic:
             self.selected_mic = default_mic
-        if self.selected_system not in sink_names:
-            # The remembered node is gone. Re-adopt only the graph's own
-            # session default (the same label `listn record` prints); if the
-            # graph offers none, selection becomes empty and Start disables —
-            # the tray never falls back to "the first node it saw".
+        if self.selected_system not in system_names:
+            # The remembered node is gone — a sink or an application
+            # stream that left the graph. Re-adopt only the graph's own
+            # session default (the same label `listn record` prints); if
+            # the graph offers none, selection becomes empty and Start
+            # disables — the tray never falls back to "the first node it
+            # saw", and it never invents a node the graph does not list.
             self.selected_system = default_sink
         if self.selected_mic not in source_names:
             self.selected_mic = default_mic
 
     def menu(self) -> list[MenuItem]:
-        items = build_menu(self.status, self.sinks, self.sources,
+        items = build_menu(self.status, self.sinks, self.sources, self.apps,
                            self.selected_system, self.selected_mic,
                            self.discovery_error)
         if self.notice and self.status.state in (IDLE, FAILED):
@@ -465,6 +514,14 @@ class TrayController:
             index = item_id - ITEM_SYSTEM_BASE
             if 0 <= index < len(self.sinks):
                 self.selected_system = self.sinks[index].get("name")
+                self._save_targets()
+        elif ITEM_APP_BASE <= item_id < ITEM_APP_BASE + 100:
+            index = item_id - ITEM_APP_BASE
+            if 0 <= index < len(self.apps):
+                # Same field, other mode: the node name of the stream the
+                # user picked. start() sends it verbatim, so the server
+                # reports this selection — never a translated one.
+                self.selected_system = self.apps[index].get("name")
                 self._save_targets()
         elif ITEM_MIC_BASE <= item_id < ITEM_MIC_BASE + 100:
             index = item_id - ITEM_MIC_BASE

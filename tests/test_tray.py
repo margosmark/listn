@@ -23,8 +23,9 @@ from fastapi.testclient import TestClient
 from listn.engine import Engine
 from listn.server import create_app
 from listn.tray import (
-    FAILED, IDLE, ITEM_MIC_BASE, ITEM_PAUSE, ITEM_PRIVACY, ITEM_QUIT,
-    ITEM_RESUME, ITEM_START, ITEM_STATUS, ITEM_STOP, ITEM_SYSTEM_BASE,
+    FAILED, IDLE, ITEM_APP_BASE, ITEM_MIC_BASE, ITEM_PAUSE, ITEM_PRIVACY,
+    ITEM_QUIT, ITEM_RESUME, ITEM_START, ITEM_STATUS, ITEM_STOP,
+    ITEM_SYSTEM_APPS_SECTION, ITEM_SYSTEM_BASE,
     PAUSED, RECORDING, STARTING, STOPPING, UNREACHABLE, MenuItem,
     ServerClient, ServerUnreachable, TrayController, TrayStatus, build_menu,
     derive_status,
@@ -32,6 +33,8 @@ from listn.tray import (
 
 from .conftest import MAC_DEVICES, FakeSD
 from .test_pipewire import sample_dump
+from .test_pipewire_app import (APP_A, APP_B, CONTENT_NEEDLES,
+                                fake_pw_app_env)
 # Importing the fixture function registers it for this module too.
 from .test_pipewire_wiring import (FAKE_PW_DUMP, MIC, SINK, fake_pw_env,
                                    wait_status)
@@ -74,6 +77,30 @@ def tray_server(data_dir, fake_factory, fake_pw_env):
         while time.monotonic() < end and engine.live.state not in ("done", "error"):
             time.sleep(0.05)
         time.sleep(0.2)   # trailing retention/notes writes after the state flips
+
+
+@pytest.fixture
+def tray_server_apps(data_dir, fake_factory, fake_pw_app_env):
+    """The same real server, with a graph that holds application streams.
+
+    ``fake_pw_app_env`` serves ``app_dump()``: two ``Stream/Output/Audio``
+    nodes (labelled with the applications' own names, carrying titles the
+    tray must never show), a sink, a microphone and listn's own capture
+    stream.
+    """
+    sd = FakeSD(MAC_DEVICES, default=(0, 3), speed=40.0)
+    engine = Engine(sd=sd, transcriber_factory=fake_factory)
+    app = create_app(engine=engine, sd=sd)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        controller = TrayController(
+            ServerClient(transport=ClientTransport(c)),
+            targets_file=data_dir / "tray-targets.json")
+        yield controller, c
+    if engine.live is not None:
+        end = time.monotonic() + 15
+        while time.monotonic() < end and engine.live.state not in ("done", "error"):
+            time.sleep(0.05)
+        time.sleep(0.2)
 
 
 def wait_state(controller, want, timeout=15):
@@ -191,6 +218,12 @@ def recording_status() -> TrayStatus:
 
 SINKS = [{"name": SINK, "description": "Speakers", "media_class": "Audio/Sink", "id": 41}]
 SOURCES = [{"name": MIC, "description": "USB Mic", "media_class": "Audio/Source", "id": 47}]
+# As `GET /api/pipewire/devices` returns them: node name is the identity,
+# description is the application's own name (never a window/media title).
+APPS = [
+    {"name": APP_A, "description": "AppA", "media_class": "Stream/Output/Audio", "id": 50},
+    {"name": APP_B, "description": "AppB", "media_class": "Stream/Output/Audio", "id": 52},
+]
 
 
 def all_labels(items):
@@ -202,7 +235,7 @@ def all_labels(items):
 
 
 def test_menu_offers_exactly_the_supported_controls():
-    items = build_menu(recording_status(), SINKS, SOURCES, SINK, MIC)
+    items = build_menu(recording_status(), SINKS, SOURCES, APPS, SINK, MIC)
     ids = {i.id for i in items if not i.separator}
     assert ids == {ITEM_STATUS, ITEM_START, ITEM_STOP, ITEM_PAUSE, ITEM_RESUME,
                    10, 11, ITEM_PRIVACY, ITEM_QUIT}
@@ -218,23 +251,26 @@ def menu_ids(items):
 
 
 def test_menu_recording_enabled_flags():
-    items = menu_ids(build_menu(recording_status(), SINKS, SOURCES, SINK, MIC))
+    items = menu_ids(build_menu(recording_status(), SINKS, SOURCES, APPS,
+                                SINK, MIC))
     assert not items[ITEM_START].enabled          # already recording
     assert items[ITEM_STOP].enabled
     assert items[ITEM_PAUSE].enabled
     assert not items[ITEM_RESUME].enabled
     assert items[ITEM_STATUS].enabled is False    # status line is never clickable
-    # radio picks reflect the selection
+    # radio picks reflect the selection: the whole-sink entry is checked
+    # and no application stream is — one system track, one checked mode
     system = items[10]
-    assert [c.toggled for c in system.children] == [True]
+    radios = [c for c in system.children if c.toggle == "radio"]
+    assert [c.toggled for c in radios] == [True, False, False]
     assert system.children[0].toggle == "radio"
 
 
 def test_menu_idle_enables_start_only_with_both_targets():
     idle = TrayStatus(state=IDLE)
-    without = menu_ids(build_menu(idle, SINKS, SOURCES, None, MIC))
+    without = menu_ids(build_menu(idle, SINKS, SOURCES, [], None, MIC))
     assert not without[ITEM_START].enabled
-    with_both = menu_ids(build_menu(idle, SINKS, SOURCES, SINK, MIC))
+    with_both = menu_ids(build_menu(idle, SINKS, SOURCES, [], SINK, MIC))
     assert with_both[ITEM_START].enabled
     assert not with_both[ITEM_STOP].enabled
     assert not with_both[ITEM_PAUSE].enabled
@@ -242,27 +278,69 @@ def test_menu_idle_enables_start_only_with_both_targets():
 
 def test_menu_failed_and_unreachable_keep_start_and_say_why():
     failed = TrayStatus(state=FAILED, detail="system: node vanished")
-    items = menu_ids(build_menu(failed, SINKS, SOURCES, SINK, MIC))
+    items = menu_ids(build_menu(failed, SINKS, SOURCES, [], SINK, MIC))
     assert items[ITEM_START].enabled              # a failed run can be retried
     assert "node vanished" in items[ITEM_STATUS].label
     unreachable = TrayStatus(state=UNREACHABLE, detail="listn is not answering.")
-    items = menu_ids(build_menu(unreachable, [], [], None, None))
+    items = menu_ids(build_menu(unreachable, [], [], [], None, None))
     assert not items[ITEM_START].enabled          # nothing to start against
     assert "not answering" in items[ITEM_STATUS].label
 
 
 def test_menu_discovery_error_disables_the_pickers():
-    items = menu_ids(build_menu(TrayStatus(state=IDLE), [], [], None, None,
+    items = menu_ids(build_menu(TrayStatus(state=IDLE), [], [], [], None, None,
                                 discovery_error="pw-dump not found"))
     assert not items[10].enabled and not items[11].enabled
     assert "pw-dump not found" in items[10].label
 
 
 def test_menu_quit_label_warns_while_recording():
-    active = menu_ids(build_menu(recording_status(), SINKS, SOURCES, SINK, MIC))
+    active = menu_ids(build_menu(recording_status(), SINKS, SOURCES, [], SINK, MIC))
     assert "stops the recording" in active[ITEM_QUIT].label.lower()
-    idle = menu_ids(build_menu(TrayStatus(state=IDLE), SINKS, SOURCES, SINK, MIC))
+    idle = menu_ids(build_menu(TrayStatus(state=IDLE), SINKS, SOURCES, [], SINK, MIC))
     assert idle[ITEM_QUIT].label == "Quit listn"
+
+
+def test_menu_application_streams_are_a_section_of_the_system_picker():
+    """The streams live inside the System output submenu, as one radio group."""
+    top = build_menu(recording_status(), SINKS, SOURCES, APPS, SINK, MIC)
+    items = menu_ids(top)
+    # the section is not a new top-level control
+    assert {i.id for i in top if not i.separator} == \
+        {ITEM_STATUS, ITEM_START, ITEM_STOP, ITEM_PAUSE, ITEM_RESUME,
+         10, 11, ITEM_PRIVACY, ITEM_QUIT}
+    system = items[10]
+    assert [c.label for c in system.children] == \
+        ["Speakers", "", "Application streams", "AppA", "AppB"]
+    header = [c for c in system.children if c.id == ITEM_SYSTEM_APPS_SECTION]
+    assert len(header) == 1
+    assert header[0].enabled is False and header[0].toggle is None
+    radios = [c for c in system.children if c.toggle == "radio"]
+    assert [c.id for c in radios] == \
+        [ITEM_SYSTEM_BASE, ITEM_APP_BASE, ITEM_APP_BASE + 1]
+    # exactly one entry of the whole picker is checked: the sink
+    assert [c.toggled for c in radios] == [True, False, False]
+
+
+def test_menu_checking_an_application_unchecks_the_whole_sink():
+    items = menu_ids(build_menu(recording_status(), SINKS, SOURCES, APPS,
+                                APP_B, MIC))
+    radios = [c for c in items[10].children if c.toggle == "radio"]
+    assert [(c.label, c.toggled) for c in radios] == \
+        [("Speakers", False), ("AppA", False), ("AppB", True)]
+
+
+def test_menu_without_application_streams_has_no_empty_section():
+    items = menu_ids(build_menu(TrayStatus(state=IDLE), SINKS, SOURCES, [],
+                                SINK, MIC))
+    assert [c.label for c in items[10].children] == ["Speakers"]
+    assert ITEM_SYSTEM_APPS_SECTION not in \
+        {c.id for c in items[10].children}
+    # neither sinks nor streams: the picker says so instead of offering
+    # a submenu with nothing to choose
+    empty = menu_ids(build_menu(TrayStatus(state=IDLE), [], [], [], None, None))
+    assert empty[10].enabled is False
+    assert empty[10].label == "System output — none found"
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +525,149 @@ def test_tray_target_selection_via_menu_ids(tray_server):
     controller.action(ITEM_MIC_BASE + 50)
     assert controller.selected_system == SINK
     assert controller.selected_mic == MIC
+
+
+# ---------------------------------------------------------------------------
+# Application streams: the tray's system picker covers both modes
+# ---------------------------------------------------------------------------
+
+
+def wait_frames(controller, timeout=10):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        controller.refresh()
+        if (controller.status.system_frames or 0) > 0 \
+                and (controller.status.mic_frames or 0) > 0:
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"no frames on both tracks: {controller.status}")
+
+
+def test_tray_application_stream_selection_is_the_one_reported(tray_server_apps):
+    """Pick a stream in the tray: the recorded target is that stream."""
+    controller, client = tray_server_apps
+    assert controller.refresh().state == IDLE
+    assert [n["name"] for n in controller.apps] == [APP_A, APP_B]
+    # the session default is still a whole sink: an application stream is
+    # offered, never adopted on the user's behalf
+    assert controller.selected_system == SINK and controller.selected_mic == MIC
+
+    controller.action(ITEM_APP_BASE + 0)
+    assert controller.selected_system == APP_A
+    saved = json.loads(controller._targets_file.read_text())
+    assert saved["system"] == APP_A
+
+    controller.action(ITEM_START)
+    wait_state(controller, RECORDING)
+    wait_frames(controller)
+    targets = client.get("/api/live").json()["pipewire"]["targets"]
+    assert targets["system"]["name"] == APP_A
+    assert targets["system"]["media_class"] == "Stream/Output/Audio"
+    assert targets["system"]["selection"] == "explicit"
+    # the microphone is untouched: an independent Audio/Source track
+    assert targets["mic"]["name"] == MIC
+    assert targets["mic"]["media_class"] == "Audio/Source"
+    assert controller.status.system_target == APP_A   # the tray says the same
+
+    controller.action(ITEM_STOP)
+    wait_state(controller, IDLE)
+    report = client.get("/api/live").json()["pipewire"]["report"]
+    assert report["ok"] is True
+    assert report["targets"]["system"]["media_class"] == "Stream/Output/Audio"
+    # metadata only: the titles the application publishes never appear
+    blob = json.dumps(report, ensure_ascii=False)
+    for needle in CONTENT_NEEDLES:
+        assert needle not in blob
+
+
+def test_tray_whole_sink_selection_reports_a_sink_while_streams_exist(
+        tray_server_apps):
+    """The same picker, other mode: choosing the sink must not become
+    per-application just because streams are on offer."""
+    controller, client = tray_server_apps
+    controller.refresh()
+    controller.action(ITEM_SYSTEM_BASE + 0)
+    assert controller.selected_system == SINK
+
+    controller.action(ITEM_START)
+    wait_state(controller, RECORDING)
+    wait_frames(controller)
+    targets = client.get("/api/live").json()["pipewire"]["targets"]
+    assert targets["system"]["name"] == SINK
+    assert targets["system"]["media_class"] == "Audio/Sink"
+    controller.action(ITEM_STOP)
+    wait_state(controller, IDLE)
+
+
+def test_tray_vanished_application_selection_readopts_only_the_graph_default(
+        tray_server_apps):
+    """A remembered pick that left the graph: only the graph's own default.
+
+    Never the first node in the list, and a stream that is still there is
+    kept exactly as the user made it.
+    """
+    controller, _ = tray_server_apps
+    controller.refresh()
+    controller.action(ITEM_APP_BASE + 1)                 # AppB
+    assert controller.selected_system == APP_B
+    sink_graph = {"sinks": SINKS, "sources": SOURCES, "apps": [],
+                  "defaults": {"sink": SINK, "source": MIC}}
+
+    controller.client = type("G", (), {
+        "devices": lambda self: dict(sink_graph)})()
+    controller._load_devices()
+    assert controller.selected_system == SINK            # graph default only
+
+    controller.selected_system = APP_B
+    controller.client = type("G", (), {
+        "devices": lambda self: {**sink_graph,
+                                 "defaults": {"sink": None, "source": None}}})()
+    controller._load_devices()
+    assert controller.selected_system is None            # no default offered
+    assert not menu_items(controller)[ITEM_START].enabled
+
+    # still in the graph → kept; an app pick is never quietly swapped back
+    controller.selected_system = APP_B
+    controller.client = type("G", (), {
+        "devices": lambda self: {**sink_graph, "apps": [APPS[1]]}})()
+    controller._load_devices()
+    assert controller.selected_system == APP_B
+
+
+def test_tray_start_with_a_gone_application_stream_is_refused_not_replaced(
+        tray_server_apps, fake_pw_app_env):
+    """A stream that closed before Start: the server's refusal, not a sink."""
+    controller, client = tray_server_apps
+    controller.refresh()
+    controller.action(ITEM_APP_BASE + 0)
+    payload = [obj for obj in json.loads(fake_pw_app_env["graph_file"].read_text())
+               if (obj.get("info", {}).get("props") or {}).get("node.name") != APP_A]
+    fake_pw_app_env["graph_file"].write_text(json.dumps(payload))
+
+    controller.action(ITEM_START)
+    status = controller.refresh()
+    assert status.state == IDLE                          # nothing is recording
+    assert client.get("/api/live").json()["live"] is None
+    assert controller.notice and "No PipeWire node named" in controller.notice
+    assert "Application output streams" in controller.notice
+    assert "No PipeWire node named" in menu_items(controller)[ITEM_STATUS].label
+    # and the refused pick was not replaced by some other target
+    assert controller.selected_system == APP_A
+
+
+def test_tray_app_menu_labels_the_application_and_never_a_title(
+        tray_server_apps):
+    """Labels are the applications' own names — never what they are playing."""
+    controller, _ = tray_server_apps
+    controller.refresh()
+    labels = " ".join(all_labels(controller.menu()))
+    assert "Application streams" in labels
+    assert "AppA" in labels and "AppB" in labels
+    for needle in CONTENT_NEEDLES:
+        assert needle not in labels
+    blob = json.dumps({"apps": controller.apps}, ensure_ascii=False)
+    for needle in CONTENT_NEEDLES:
+        assert needle not in blob
 
 
 def test_tray_privacy_opens_listns_own_settings_page(tray_server, monkeypatch):
