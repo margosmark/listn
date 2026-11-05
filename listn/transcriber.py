@@ -14,15 +14,20 @@ only when ``HF_TOKEN`` is unset.
 
 Where the default backend runs is the ``compute_device`` setting: ``cpu``
 (the safe default, never touch the GPU), ``auto`` (GPU when this machine's
-CUDA runtime is really usable, CPU otherwise), or ``cuda`` (require the GPU
-and fail with a readable message instead of falling back). See
-:func:`resolve_device`.
+CUDA *or ROCm* runtime is really usable, CPU otherwise, said out loud),
+``cuda`` (require NVIDIA and fail with a readable message instead of
+falling back) or ``rocm`` (require AMD's HIP build the same way). Which of
+those this machine can actually run — and the exact remedy for the piece
+that is missing — is answered by the vendor-neutral probe in
+:mod:`listn.compute_backend` (:func:`probe_capabilities`); see
+:func:`resolve_device` for the selection policy.
 
 Model load and inference for the faster-whisper backend run in a child
 process (:class:`IsolatedTranscriber`, worker: ``listn.inference_worker``)
-so a native crash — SIGSEGV/SIGABRT from the CUDA path — can never kill
-the caller or leave a partial transcript behind. ``auto`` then falls back
-to CPU truthfully; explicit ``cuda`` fails with an actionable message.
+so a native crash — SIGSEGV/SIGABRT from the CUDA or HIP path — can never
+kill the caller or leave a partial transcript behind. ``auto`` then falls
+back to CPU truthfully; explicit ``cuda``/``rocm`` fails with an actionable
+message.
 """
 
 from __future__ import annotations
@@ -45,7 +50,13 @@ from pathlib import Path
 
 import numpy as np
 
+from listn import compute_backend
 from listn.audio import TARGET_RATE, rms
+from listn.compute_backend import (  # re-exported: callers and the isolation
+    # worker import these from this module.
+    CUDA_RUNTIME_LIBS, Capability, CudaUnavailable, DeviceUnavailable, Plan,
+    format_report, probe_capabilities,
+)
 from listn.hub import load_local_or_download
 
 log = logging.getLogger("listn")
@@ -126,58 +137,10 @@ def available_backends() -> dict[str, bool]:
     return out
 
 
-class CudaUnavailable(RuntimeError):
-    """``compute_device=cuda`` was asked for and this machine cannot run it.
-
-    Raised before any model is built, so the user gets one readable line
-    instead of a CTranslate2 failure (or a native crash) half-way through
-    loading.
-    """
-
-
-# Shared libraries CTranslate2 dlopens by soname when a model is built for
-# CUDA. On a machine with an NVIDIA driver but without the CUDA runtime
-# libraries the load fails with "Library libcublas.so.12 is not found or
-# cannot be loaded" — the failure seen on the CachyOS laptop.
-CUDA_RUNTIME_LIBS = ("libcublas.so.12",)
-
-# Runs in a child process. Loading a CUDA library, or anything CTranslate2
-# would do with it, can terminate a process without ever raising a Python
-# exception; the child takes that risk and the parent only reads one line of
-# JSON back, so a broken GPU can never take listn down with it. Even the
-# CTranslate2 device-count API is isolated because it calls the CUDA driver.
-_PROBE_SCRIPT = """
-import ctypes, json, sys
-result = {"missing": [], "devices": 0}
-try:
-    import ctranslate2
-    result["devices"] = int(ctranslate2.get_cuda_device_count())
-except Exception as exc:
-    result["device_error"] = str(exc)
-for soname in sys.argv[1:]:
-    try:
-        ctypes.CDLL(soname)
-    except OSError as exc:
-        result["missing"].append("%s: %s" % (soname, exc))
-print(json.dumps(result))
-"""
-
-
-def _run_cuda_probe(sonames: tuple[str, ...], timeout: float) -> tuple[dict | None, str | None]:
-    """Run the native CUDA checks out-of-process; ``None`` means unsafe/unavailable."""
-    try:
-        done = subprocess.run([sys.executable, "-c", _PROBE_SCRIPT, *sonames],
-                              capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return None, f"the CUDA library probe timed out after {timeout:g}s"
-    if done.returncode != 0:
-        how = (f"signal {-done.returncode}" if done.returncode < 0
-               else f"exit code {done.returncode}")
-        return None, f"the CUDA library probe terminated with {how}"
-    try:
-        return json.loads(done.stdout.strip().splitlines()[-1]), None
-    except (IndexError, ValueError):
-        return None, "the CUDA library probe returned no usable answer"
+# The child-process probe itself lives in compute_backend; this module-level
+# name is the seam tests patch to drive timeouts, signal deaths and library
+# failures through a real child (tests/test_transcriber.py).
+_PROBE_SCRIPT = compute_backend.PROBE_SCRIPT
 
 
 def cuda_device_count() -> int:
@@ -187,7 +150,8 @@ def cuda_device_count() -> int:
     The actionable reason is emitted by :func:`cuda_runtime_ready` when a GPU
     device was requested explicitly.
     """
-    result, _reason = _run_cuda_probe((), timeout=30.0)
+    result, _reason = compute_backend.run_probe(
+        script=_PROBE_SCRIPT, sonames=(), timeout=30.0)
     return int(result.get("devices", 0)) if result else 0
 
 
@@ -200,7 +164,8 @@ def cuda_runtime_ready(sonames: tuple[str, ...] = CUDA_RUNTIME_LIBS,
     Python exception. A child that dies by signal, times out, or prints
     nothing means "not ready" — returned as a reason, never as a crash.
     """
-    result, error = _run_cuda_probe(sonames, timeout)
+    result, error = compute_backend.run_probe(
+        script=_PROBE_SCRIPT, sonames=sonames, timeout=timeout)
     if error or result is None:
         return False, error or "the CUDA library probe returned no usable answer"
     missing = result.get("missing", [])
@@ -214,50 +179,41 @@ def cuda_runtime_ready(sonames: tuple[str, ...] = CUDA_RUNTIME_LIBS,
 def _is_cuda_error(exc: BaseException) -> bool:
     """True when an exception is CTranslate2 refusing (or failing) to use the GPU."""
     text = str(exc).lower()
-    return any(word in text for word in ("cuda", "cublas", "cudnn", "nccl", "libcuda", "gpu"))
+    return any(word in text for word in
+               ("cuda", "cublas", "cudnn", "nccl", "libcuda", "gpu", "rocm"))
+
+
+def _resolve_plan(requested: str) -> Plan:
+    """The full selection plan: device, truthful note, and GPU truth.
+
+    Delegates to :func:`listn.compute_backend.resolve` with this module's
+    probe seams, so tests that pin ``cuda_device_count``/``cuda_runtime_ready``
+    (and ``compute_backend.rocm_capability``) drive the real policy.
+    """
+    return compute_backend.resolve(
+        requested, cuda_count=cuda_device_count, cuda_ready=cuda_runtime_ready,
+        rocm=compute_backend.rocm_capability)
 
 
 def resolve_device(requested: str) -> tuple[str, str | None]:
     """Turn the ``compute_device`` setting into a WhisperModel device.
 
-    Returns ``(device, note)``. ``note`` explains a CPU fallback when there is
-    one and is ``None`` otherwise. Raises :class:`CudaUnavailable` when CUDA
-    was requested by name and this machine cannot run it — checked before any
-    model is built, so the answer is a message rather than a failure inside
-    CTranslate2.
+    Returns ``(device, note)``. ``note`` explains a CPU fallback (or a ROCm
+    resolution) when there is one and is ``None`` otherwise. Raises
+    :class:`CudaUnavailable` when ``cuda``/``rocm`` was requested by name and
+    this machine cannot run it — checked before any model is built, so the
+    answer is one readable message with the missing piece and the remedy
+    rather than a failure inside CTranslate2.
 
     ``auto`` means GPU only when a CUDA device is visible *and* the runtime
-    libraries load; otherwise it stays on the historical behaviour (``auto``,
-    which CTranslate2 resolves to CPU) or pins ``cpu`` when a GPU is visible
-    but unusable.
+    libraries load (or a ROCm build with a visible device); otherwise it
+    stays on the historical behaviour (``auto``, which CTranslate2 resolves
+    to CPU) or pins ``cpu`` when a GPU is visible but unusable. The full
+    plan (including which GPU backend resolved, for compute-type mapping)
+    is :func:`_resolve_plan`.
     """
-    want = (requested or "auto").strip().lower() or "auto"
-    if want == "cpu":
-        return "cpu", None
-    if sys.platform == "darwin":
-        # macOS has no CUDA; "auto" has always meant CPU for faster-whisper here.
-        if want == "cuda":
-            raise CudaUnavailable(
-                "compute_device=cuda was requested, but macOS has no CUDA. "
-                "Use compute_device=cpu, or leave it on auto.")
-        return "auto", None
-    if cuda_device_count() <= 0:
-        if want == "cuda":
-            raise CudaUnavailable(
-                "compute_device=cuda was requested, but CTranslate2 sees no CUDA "
-                "device (no NVIDIA driver, or none exposed to this process). "
-                "Run on CPU with --compute-device cpu, or leave it on auto.")
-        return "auto", None
-    ready, detail = cuda_runtime_ready()
-    if not ready:
-        reason = f"CUDA is visible but the CUDA runtime cannot be used ({detail})"
-        if want == "cuda":
-            raise CudaUnavailable(
-                f"compute_device=cuda was requested, but {reason}. Install the "
-                "CUDA 12 libraries (docs/GPU_LINUX.md), or run on CPU with "
-                "--compute-device cpu.")
-        return "cpu", f"{reason}; see docs/GPU_LINUX.md"
-    return ("cuda" if want == "cuda" else "auto"), None
+    plan = _resolve_plan(requested)
+    return plan.device, plan.note
 
 
 def _reported_device(model: object, asked: str) -> str:
@@ -313,14 +269,21 @@ class FasterWhisper(Transcriber):
 
         # Defaults stay byte-identical to the old hard-coded call: int8, no
         # cpu_threads passed (CTranslate2 picks its own count), and "auto" on
-        # any machine without a usable CUDA runtime.
+        # any machine without a usable GPU runtime. A GPU build left at the
+        # default compute type gets float16 via compute_type_for().
         self.beam_size = beam_size
-        device, note = resolve_device(compute_device)
+        plan = _resolve_plan(compute_device)
+        device, note = plan.device, plan.note
         notes = [note] if note else []
+        base_compute_type = compute_type
+        compute_type = compute_backend.compute_type_for(
+            compute_type, device, gpu_active=plan.gpu_active)
         kwargs: dict = dict(device=device, compute_type=compute_type)
         if cpu_threads:
             kwargs["cpu_threads"] = int(cpu_threads)
-        want_cuda = (compute_device or "auto").strip().lower() == "cuda"
+        want = (compute_device or "auto").strip().lower() or "auto"
+        explicit_gpu = want in ("cuda", "rocm")
+        gpu_label = "ROCm" if plan.kind == "rocm" else "CUDA"
         failures: list[Exception] = []
 
         def load(dev: str):
@@ -331,7 +294,11 @@ class FasterWhisper(Transcriber):
             model, and retrying it over the network would both waste a round
             trip and claim a download that is not happening.
             """
-            kw: dict = dict(kwargs, device=dev)
+            kw: dict = dict(
+                kwargs, device=dev,
+                compute_type=compute_backend.compute_type_for(
+                    base_compute_type, dev,
+                    gpu_active=plan.gpu_active and dev != "cpu"))
             failures.clear()
 
             def cached():
@@ -357,16 +324,27 @@ class FasterWhisper(Transcriber):
         try:
             self._model = load(device)
         except Exception as exc:
-            if not failures and not _is_cuda_error(exc):
+            device_failure = bool(failures) or _is_cuda_error(exc)
+            # auto + a probe-usable GPU may still fail for a reason the
+            # cuda-wording check cannot see (a compute type the build
+            # rejects, an OOM): "auto" means GPU when it works, CPU
+            # otherwise — never a hard failure the user must fix by hand.
+            if not device_failure and not (want == "auto" and plan.gpu_active):
                 raise  # genuinely not a device problem: bad files, no memory, ...
-            if want_cuda:
+            if explicit_gpu:
+                if want == "rocm":
+                    raise CudaUnavailable(
+                        "compute_device=rocm was requested, but the model could "
+                        f"not be built on the ROCm GPU: {exc}. Check the ROCm "
+                        "setup (docs/GPU_LINUX.md), or run on CPU with "
+                        "--compute-device cpu.") from exc
                 raise CudaUnavailable(
                     "compute_device=cuda was requested, but the model could not "
                     f"be built on the GPU: {exc}. Install the CUDA 12 libraries "
                     "(docs/GPU_LINUX.md), or run on CPU with "
                     "--compute-device cpu.") from exc
             # auto: a broken GPU must not stop transcription.
-            notes.append(f"CUDA unusable ({exc}); running on CPU")
+            notes.append(f"{gpu_label} unusable ({exc}); running on CPU")
             self._model = load("cpu")
 
         self.device = _reported_device(self._model, device)
@@ -678,8 +656,9 @@ class IsolatedTranscriber(Transcriber):
       the status line: a truthful fallback, never a silent one. A crash
       that was already on CPU, or a second crash after the fallback, is
       an error.
-    * ``cuda`` — any crash or CUDA refusal raises :class:`CudaUnavailable`
-      with the CPU advice; the worker is never restarted on CPU.
+    * ``cuda``/``rocm`` — any crash or GPU refusal raises
+      :class:`CudaUnavailable` with the per-backend advice (CUDA libraries
+      or ROCm setup); the worker is never restarted on CPU.
     * ``cpu`` — a crash is an error: there is no other device to fall
       back to.
 
@@ -822,11 +801,14 @@ class IsolatedTranscriber(Transcriber):
     def _on_death(self, detail: str, phase: str, retried: bool) -> BaseException | _Retry:
         want = self._requested_device
         gpu_suspect = self._device != "cpu"  # None = died before reporting
-        if want == "cuda":
-            message = (f"compute_device=cuda was requested, but the transcription "
-                       f"process {detail} while {phase}. Install the CUDA 12 "
-                       "libraries (docs/GPU_LINUX.md), or run on CPU with "
-                       "--compute-device cpu.")
+        if want in ("cuda", "rocm"):
+            advice = (
+                "Check the ROCm setup (docs/GPU_LINUX.md), or run on CPU with "
+                "--compute-device cpu." if want == "rocm" else
+                "Install the CUDA 12 libraries (docs/GPU_LINUX.md), or run on "
+                "CPU with --compute-device cpu.")
+            message = (f"compute_device={want} was requested, but the transcription "
+                       f"process {detail} while {phase}. {advice}")
             self._set_fatal(CudaUnavailable, message)
             self._kill_worker()
             return CudaUnavailable(message)
@@ -851,11 +833,17 @@ class IsolatedTranscriber(Transcriber):
         if want == "auto" and not retried:
             self._pin_cpu(f"failed ({detail})", phase)
             return _RETRY
-        if want == "cuda":
-            message = detail if "--compute-device cpu" in detail else (
-                f"{detail} (compute_device=cuda was requested). Install the "
-                "CUDA 12 libraries (docs/GPU_LINUX.md), or run on CPU with "
-                "--compute-device cpu.")
+        if want in ("cuda", "rocm"):
+            if "--compute-device cpu" in detail:
+                message = detail
+            elif want == "rocm":
+                message = (f"{detail} (compute_device=rocm was requested). Check "
+                           "the ROCm setup (docs/GPU_LINUX.md), or run on CPU "
+                           "with --compute-device cpu.")
+            else:
+                message = (f"{detail} (compute_device=cuda was requested). Install "
+                           "the CUDA 12 libraries (docs/GPU_LINUX.md), or run on "
+                           "CPU with --compute-device cpu.")
         else:
             message = f"{detail} (compute device: {self._device or self._effective_device})"
         self._set_fatal(CudaUnavailable, message)
@@ -939,10 +927,16 @@ def get_transcriber(model: str, backend: str = "auto",
     ``device: …`` line once the model reports where it is actually running.
 
     ``isolate`` says where the work runs. ``None`` (the default) isolates
-    the faster-whisper backend — the one whose CUDA path can die on a
+    the faster-whisper backend — the one whose CUDA/HIP path can die on a
     native signal — in a child process (:class:`IsolatedTranscriber`), and
     runs every other backend in-process. ``False`` forces in-process (the
     unit tests inspect the constructed model); ``True`` forces a child.
+
+    ``compute_device`` accepts ``cpu``/``auto``/``cuda``/``rocm``. The
+    ``rocm`` name works through this API today; letting it through
+    ``settings.json``/``LISTN_COMPUTE_DEVICE``/``--compute-device`` also
+    needs ``COMPUTE_DEVICES`` in ``listn/config.py`` (owned by the CLI/config
+    card — spelled out in this branch's PR description).
     """
     name = resolve_backend(backend)
     if name not in _BACKENDS:

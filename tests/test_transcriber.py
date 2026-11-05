@@ -4,6 +4,7 @@ import types
 import numpy as np
 import pytest
 
+from listn import compute_backend as cb
 from listn import transcriber as tr
 from listn.config import COMPUTE_TYPES, Settings
 from listn.transcriber import RawSegment, _WindowedBackend, is_hallucination
@@ -145,13 +146,18 @@ def fake_whisper_module(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def no_cuda_by_default(monkeypatch):
-    """Pin device resolution to a machine without a GPU.
+    """Pin device resolution to a machine without a GPU or ROCm.
 
     The knob tests below assert the exact ``WhisperModel`` kwargs, and a GPU
     test host resolves ``auto`` differently — that is the new behaviour. Tests
-    that want a visible GPU opt in by re-patching ``cuda_device_count``.
+    that want a visible GPU (or a usable ROCm build) opt in by re-patching
+    ``cuda_device_count`` / ``compute_backend.rocm_capability``.
     """
     monkeypatch.setattr(tr, "cuda_device_count", lambda: 0)
+    monkeypatch.setattr(cb, "rocm_capability", lambda: cb.Capability(
+        "rocm", False,
+        "no AMD GPU and no ROCm runtime are visible on this machine",
+        "use --compute-device cpu or auto"))
 
 
 def _build(model="small", **kwargs):
@@ -533,3 +539,86 @@ def test_invalid_compute_device_env_exits_readably_not_with_a_traceback(data_dir
     err = capsys.readouterr().err
     assert "compute_device" in err and "gpu" in err
     assert "Traceback" not in err
+
+
+# --- vendor-neutral backends: ROCm selection and per-device compute type ----
+
+def _pin_rocm(monkeypatch, usable: bool, *, missing: str = "", remedy: str = ""):
+    monkeypatch.setattr(cb, "rocm_capability", lambda: cb.Capability(
+        "rocm", usable, None if usable else missing, None if usable else remedy,
+        "CTranslate2 is a ROCm/HIP build and sees 2 device(s)"))
+
+
+def test_auto_uses_rocm_when_only_the_rocm_build_works(fake_whisper_module, data_dir, monkeypatch):
+    """AMD machine: no CUDA device, ROCm build usable -> GPU via auto, said out loud."""
+    monkeypatch.setattr(tr, "cuda_device_count", lambda: 0)
+    _pin_rocm(monkeypatch, True)
+    fake_whisper_module.device_report = "cuda"
+    seen = []
+    t = _build(compute_device="auto", status=seen.append)
+    made = fake_whisper_module.instances[0]
+    assert made.init_kwargs["device"] == "auto"
+    # Left at the default compute type: float16 on the GPU, int8 on CPU.
+    assert made.init_kwargs["compute_type"] == "float16"
+    assert t.device == "cuda"
+    assert "rocm" in seen[-1] and "HIP" in seen[-1]
+
+
+def test_explicit_rocm_builds_on_the_gpu_device_with_float16(fake_whisper_module, data_dir, monkeypatch):
+    monkeypatch.setattr(tr, "cuda_device_count", lambda: 0)
+    _pin_rocm(monkeypatch, True)
+    fake_whisper_module.device_report = "cuda"
+    seen = []
+    t = _build(compute_device="rocm", status=seen.append)
+    made = fake_whisper_module.instances[0]
+    assert made.init_kwargs["device"] == "cuda"       # CTranslate2's API device
+    assert made.init_kwargs["compute_type"] == "float16"
+    assert t.device == "cuda"
+    assert seen == ["device: cuda — rocm (CTranslate2 HIP build)"]
+
+
+def test_explicit_rocm_unusable_fails_before_any_model_build(fake_whisper_module, data_dir, monkeypatch):
+    monkeypatch.setattr(tr, "cuda_device_count", lambda: 0)
+    _pin_rocm(monkeypatch, False,
+              missing="an AMD GPU is visible but neither the ROCm runtime nor "
+                      "a ROCm-built CTranslate2 was found",
+              remedy="install ROCm per AMD's current system-requirements "
+                     "matrix (docs/GPU_LINUX.md)")
+    with pytest.raises(tr.CudaUnavailable) as excinfo:
+        _build(compute_device="rocm")
+    message = str(excinfo.value)
+    assert "ROCm runtime" in message and "docs/GPU_LINUX.md" in message
+    assert fake_whisper_module.instances == []  # failed before any build
+
+
+def test_explicit_rocm_failure_never_retries_on_cpu(fake_whisper_module, data_dir, monkeypatch):
+    monkeypatch.setattr(tr, "cuda_device_count", lambda: 0)
+    _pin_rocm(monkeypatch, True)
+    fake_whisper_module.fail_devices = {"cuda"}
+    with pytest.raises(tr.CudaUnavailable) as excinfo:
+        _build(compute_device="rocm")
+    message = str(excinfo.value)
+    assert "compute_device=rocm" in message and "--compute-device cpu" in message
+    # No silent CPU retry when the GPU was asked for by name.
+    assert [m.init_kwargs["device"] for m in fake_whisper_module.instances] == ["cuda"]
+
+
+def test_auto_rocm_failure_falls_back_to_cpu_with_int8(fake_whisper_module, data_dir, monkeypatch):
+    monkeypatch.setattr(tr, "cuda_device_count", lambda: 0)
+    _pin_rocm(monkeypatch, True)
+    fake_whisper_module.fail_devices = {"auto"}
+    seen = []
+    t = _build(compute_device="auto", status=seen.append)
+    attempts = fake_whisper_module.instances
+    assert [m.init_kwargs["device"] for m in attempts] == ["auto", "cpu"]
+    assert attempts[0].init_kwargs["compute_type"] == "float16"  # the GPU attempt
+    assert attempts[1].init_kwargs["compute_type"] == "int8"      # the CPU retry
+    assert t.device == "cpu"
+    assert "ROCm unusable" in seen[-1] and "running on CPU" in seen[-1]
+
+
+def test_explicit_compute_type_wins_on_a_gpu(fake_whisper_module, data_dir, monkeypatch):
+    monkeypatch.setattr(tr, "cuda_device_count", lambda: 1)
+    monkeypatch.setattr(tr, "cuda_runtime_ready", lambda *a, **k: (True, ""))
+    _build(compute_device="auto", compute_type="float32")
+    assert fake_whisper_module.instances[0].init_kwargs["compute_type"] == "float32"
