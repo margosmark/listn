@@ -349,3 +349,38 @@ def call(method, path, payload=None):
     env = dict(os.environ, HWCHECK_PORT="1", LISTN_DATA_DIR=str(tmp_path))
     proc = subprocess.run([sys.executable, "-c", code, "sys", "mic"], env=env, capture_output=True, text=True)
     assert proc.returncode == expected, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("option,payload", [
+    ("--port", "1$(touch {marker})"),
+    ("--duration", "5$(touch {marker})"),
+    ("--out", "$(touch {marker})"),
+    ("--system-target", "node$(touch {marker})"),
+    ("--mic-target", "node$(touch {marker})"),
+])
+def test_external_argument_payloads_never_execute(tmp_path, option, payload):
+    marker = tmp_path / "injected"
+    value = payload.format(marker=marker)
+    proc = run_script(option, value, "--list",
+                      env={"XDG_RUNTIME_DIR": "/nonexistent-hwcheck-runtime"})
+    assert not marker.exists(), proc.stdout + proc.stderr
+    assert proc.returncode == 3
+
+
+def test_listn_cmd_shell_metacharacters_are_not_evaluated(tmp_path):
+    marker = tmp_path / "injected"
+    command = f"python3 -m listn $(touch {marker})"
+    proc = run_script("--list", env={"LISTN_CMD": command,
+                                       "XDG_RUNTIME_DIR": "/nonexistent-hwcheck-runtime"})
+    assert not marker.exists(), proc.stdout + proc.stderr
+    assert proc.returncode == 3
+
+
+def test_valid_duration_and_port_are_accepted_by_argument_validation():
+    # Validation precedes environment preflight, so a valid value reaches the
+    # expected missing-session error rather than being rejected as malformed.
+    proc = run_script("--duration", "5", "--port", "8801", "--list",
+                      env={"XDG_RUNTIME_DIR": "/nonexistent-hwcheck-runtime"})
+    assert proc.returncode == 3
+    assert "--port must" not in proc.stderr
+    assert "--duration must" not in proc.stderr
