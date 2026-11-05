@@ -38,8 +38,8 @@ from dbus_next.service import ServiceInterface, method  # noqa: E402
 from listn.engine import Engine  # noqa: E402
 from listn.server import create_app  # noqa: E402
 from listn.tray import (  # noqa: E402
-    ITEM_PAUSE, ITEM_QUIT, ITEM_RESUME, ITEM_START, ITEM_STATUS, ITEM_STOP,
-    ServerClient, TrayController,
+    ITEM_APP_BASE, ITEM_PAUSE, ITEM_QUIT, ITEM_RESUME, ITEM_START,
+    ITEM_STATUS, ITEM_STOP, ITEM_SYSTEM_BASE, ServerClient, TrayController,
 )
 from listn.tray_sni import (  # noqa: E402
     StatusNotifierItem, WATCHER_NAME, WATCHER_PATH, service_name,
@@ -47,6 +47,7 @@ from listn.tray_sni import (  # noqa: E402
 
 from .conftest import MAC_DEVICES, FakeSD  # noqa: E402
 from .test_pipewire import sample_dump  # noqa: E402
+from .test_pipewire_app import APP_A, APP_B, CONTENT_NEEDLES, app_dump  # noqa: E402
 from .test_pipewire_wiring import MIC, SINK, fake_pw_env  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
@@ -161,6 +162,27 @@ def node_labels(root) -> list[str]:
     for child in children:
         out.extend(node_labels(child.value))
     return out
+
+
+def find_id_by_label(root, label):
+    """The dbusmenu id of the node carrying exactly this label, else None."""
+    node_id, props, children = root
+    if props.get("label") is not None and props["label"].value == label:
+        return node_id
+    for child in children:
+        found = find_id_by_label(child.value, label)
+        if found is not None:
+            return found
+    return None
+
+
+async def group_props(bus, name, ids) -> dict[int, dict]:
+    """GetGroupProperties for the wanted ids, keyed by id."""
+    reply = await bus.call(Message(
+        destination=name, path="/Menu", interface=DBUSMENU,
+        member="GetGroupProperties", signature="aias", body=[list(ids), []]))
+    assert reply is not None and reply.message_type != 3, reply
+    return {row[0]: row[1] for row in reply.body[0]}
 
 
 async def wait_prop(bus, name, prop, want, timeout=20, path="/StatusNotifierItem",
@@ -286,6 +308,75 @@ def test_sni_idle_properties_and_menu(session_bus, live_server):
                 body=[[ITEM_STATUS], []]))
             props = reply.body[0][0][1]
             assert props["enabled"].value is False
+        finally:
+            client.disconnect()
+            await shutdown(sni, task, watcher_bus)
+
+    asyncio.run(scenario())
+
+
+def test_sni_system_picker_offers_application_streams_and_records_the_pick(
+        session_bus, live_server, fake_pw_env):
+    """The whole D-Bus path for the new section: layout → click → report.
+
+    The graph holds two application streams; the section is part of the
+    System output submenu (one radio group), the click selects by node
+    name, and the started capture reports *that* stream — mode readable
+    from ``targets.system.media_class`` — with no title anywhere.
+    """
+    fake_pw_env["graph_file"].write_text(json.dumps(app_dump()))
+    port, engine, app = live_server
+
+    async def scenario():
+        sni, task, watcher, watcher_bus = await run_tray(port)
+        client = await MessageBus().connect()
+        try:
+            name = service_name()
+            await wait_prop(client, name, "IconName", "audio-input-microphone")
+            end = time.monotonic() + 10
+            while time.monotonic() < end and not sni.controller.apps:
+                await asyncio.sleep(0.1)
+            assert [n["name"] for n in sni.controller.apps] == [APP_A, APP_B]
+
+            root = await get_layout(client, name)
+            labels = node_labels(root)
+            for wanted in ("System output", "Application streams",
+                           "AppA", "AppB"):
+                assert wanted in labels, labels
+            for needle in CONTENT_NEEDLES:
+                assert needle not in " ".join(labels), labels
+
+            app_id = find_id_by_label(root, "AppA")
+            sink_id = find_id_by_label(root, "Speakers")
+            assert app_id is not None and sink_id is not None
+            # the ids belong to the system picker's ranges: a stream is a
+            # system-track target, never a microphone entry
+            assert app_id == ITEM_APP_BASE and sink_id == ITEM_SYSTEM_BASE
+
+            await click(client, name, app_id)
+            end = time.monotonic() + 10
+            while time.monotonic() < end \
+                    and sni.controller.selected_system != APP_A:
+                await asyncio.sleep(0.05)
+            assert sni.controller.selected_system == APP_A
+            props = await group_props(client, name, [sink_id, app_id])
+            assert props[sink_id]["toggle-state"].value == 0
+            assert props[app_id]["toggle-state"].value == 1   # exactly one
+
+            await click(client, name, ITEM_START)
+            await wait_prop(client, name, "IconName", "media-record")
+            await wait_frames(port)
+            pw = api(port, "/api/live")["pipewire"]
+            targets = pw["targets"]
+            assert targets["system"]["name"] == APP_A
+            assert targets["system"]["media_class"] == "Stream/Output/Audio"
+            for needle in CONTENT_NEEDLES:
+                assert needle not in json.dumps(pw, ensure_ascii=False)
+
+            await click(client, name, ITEM_STOP)
+            await wait_prop(client, name, "IconName", "audio-input-microphone")
+            report = api(port, "/api/live")["pipewire"]["report"]
+            assert report["ok"] is True, report
         finally:
             client.disconnect()
             await shutdown(sni, task, watcher_bus)
