@@ -19,6 +19,14 @@ record it from the tray menu:
   ever *offers*. Recording starts from an explicit click, or from
   `auto_record_meetings` — which is **off by default** and, when on, is
   the user's own setting. There is no other start path.
+* **Settings are re-read every poll** (`GET /api/settings`, the same
+  route macOS re-reads on every `menuWillOpen`), so turning
+  `auto_record_meetings` off while the tray runs stops later
+  auto-starts, and `offer_meetings=off` stops new prompts — no restart.
+  A failed fetch keeps the **last known** values, never the defaults, so
+  a dead server can never resurrect auto-record after it was revoked;
+  before the first successful read the watcher's own defaults apply
+  (offer on, auto-record off).
 * **Dismiss** stays quiet for the rest of that meeting; if the same app
   starts a *new* meeting later, it asks again.
 * **Snooze** asks again after five minutes while the meeting continues.
@@ -74,14 +82,18 @@ app label (e.g. `Zoom`), not window text. No calendar data is read.
 ## Verification
 
 ```sh
-uv run pytest tests/test_meeting_watch.py   # 21 fixture tests
+uv run pytest tests/test_meeting_watch.py   # 25 fixture tests
 uv run pytest tests/test_tray.py tests/test_tray_sni.py tests/test_meetings.py
 ```
 
 Covered: supported apps from PipeWire fixtures, browser meetings and
 Slack huddles with/without title hints, false positives (playback-only,
 ordinary titles), polling dedup, no start without consent, auto-record
-default off, dismiss/snooze/end offer, prompt metadata without titles.
+default off, dismiss/snooze/end offer, prompt metadata without titles,
+and settings read as server truth *over time* — a mid-run toggle
+honoured (auto-record revoked ⇒ no later auto-start; offers off ⇒ no
+prompt, pending offer cleared) and a failed fetch keeping the last known
+values instead of the defaults.
 
 **Not covered / needs a real session:** a real meeting app on real
 hardware, a real plasmashell panel rendering the prompt, and XWayland

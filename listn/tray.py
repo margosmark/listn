@@ -407,7 +407,6 @@ class TrayController:
         self.meeting_watcher = meeting_watcher
         self.meeting_source = meeting_source
         self.meeting_prompt = None
-        self._settings_loaded = meeting_watcher is None
         self._targets_file = targets_file or (data_dir() / "tray-targets.json")
         self._load_targets()
 
@@ -453,22 +452,14 @@ class TrayController:
         """Advance the watcher with one poll's worth of hits.
 
         Never raises: an unavailable source means "no meeting seen", and
-        a server that will not answer settings keeps the defaults (offer
-        on, auto-record off — the consent-safe direction).
+        a server that will not answer settings keeps the last values it
+        did give us (boot defaults: offer on, auto-record off — the
+        consent-safe direction).
         """
         watcher = self.meeting_watcher
         if watcher is None or self.status.state == UNREACHABLE:
             return
-        if not self._settings_loaded:
-            try:
-                settings = self.client.settings()
-            except (ServerUnreachable, RequestRefused):
-                settings = None
-            if isinstance(settings, dict):
-                watcher.offer = bool(settings.get("offer_meetings", True))
-                watcher.auto_record = bool(
-                    settings.get("auto_record_meetings", False))
-                self._settings_loaded = True
+        self._sync_meeting_settings(watcher)
         source = self.meeting_source
         if source is None:
             from listn.meeting_sources import collect_hits
@@ -491,6 +482,33 @@ class TrayController:
                 and self.meeting_prompt.kind == "offer"
                 and self.meeting_prompt.meeting_id
                 not in watcher.present_ids()):
+            self.meeting_prompt = None
+
+    def _sync_meeting_settings(self, watcher) -> None:
+        """Re-read ``GET /api/settings`` on every poll — macOS parity.
+
+        ``MenuBarController.refreshPrefs()`` re-reads the flags at start
+        **and on every ``menuWillOpen``**, so toggling a setting takes
+        effect without restarting the app; the tray polls at the same
+        rate it already fetches ``/api/live``, so a second small loopback
+        GET per tick keeps that parity continuously — including for a
+        toggle made while no menu is open. Server truth wins: a failed
+        fetch keeps the **last known** values (never the defaults), so a
+        dead server can never resurrect auto-record after the user
+        revoked it.
+        """
+        try:
+            settings = self.client.settings()
+        except Exception:  # a poll must never take the tray down
+            return
+        if not isinstance(settings, dict):
+            return
+        watcher.offer = bool(settings.get("offer_meetings", True))
+        watcher.auto_record = bool(settings.get("auto_record_meetings", False))
+        if (not watcher.offer and self.meeting_prompt is not None
+                and self.meeting_prompt.kind == "offer"):
+            # Offers were switched off while one was pending: it goes
+            # away with them instead of surviving until the meeting ends.
             self.meeting_prompt = None
 
     def _load_devices(self) -> None:

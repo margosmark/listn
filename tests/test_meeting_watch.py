@@ -21,7 +21,8 @@ from listn.meeting_sources import Hit, detect, normalize_identity, x11_window_ti
 from listn.meeting_watch import MeetingPrompt, MeetingWatcher
 from listn.tray import (
     ITEM_MEETING_DISMISS, ITEM_MEETING_END, ITEM_MEETING_RECORD,
-    ITEM_MEETING_SNOOZE, ITEM_START, TrayController, build_menu,
+    ITEM_MEETING_SNOOZE, ITEM_START, ServerUnreachable, TrayController,
+    build_menu,
 )
 
 
@@ -197,6 +198,7 @@ class FakeClient:
         self.stops = 0
         self.settings_data = {"offer_meetings": True,
                               "auto_record_meetings": False}
+        self.settings_error: Exception | None = None  # fetch failure path
 
     def live(self):
         return {"live": None, "pipewire": None}
@@ -207,6 +209,8 @@ class FakeClient:
                 "defaults": {"sink": "sink", "source": "mic"}}
 
     def settings(self):
+        if self.settings_error is not None:
+            raise self.settings_error
         return dict(self.settings_data)
 
     def start(self, system, mic, title=None):
@@ -263,15 +267,33 @@ def test_record_click_starts_with_the_meeting_title(tmp_path):
 
 
 def test_dismiss_and_snooze_clear_the_prompt_without_starting(tmp_path):
-    ctl, client, _ = controller_for([hit()], tmp_path)
+    now = [0.0]
+    hits = [hit()]
+    ctl, client, _ = controller_for(
+        hits, tmp_path, watcher=MeetingWatcher(clock=lambda: now[0]))
     ctl.refresh()
+    assert ctl.meeting_prompt is not None and ctl.meeting_prompt.kind == "offer"
     ctl.action(ITEM_MEETING_DISMISS)
     assert ctl.meeting_prompt is None and client.starts == []
     ctl.refresh()
     assert ctl.meeting_prompt is None       # dismissed: stays quiet
 
+    # A fresh occurrence of the same app: this time snooze, which needs a
+    # *pending* prompt (snoozing after a dismiss would be a no-op).
+    hits.clear()
+    ctl.refresh()
+    hits.append(hit())
+    ctl.refresh()
+    assert ctl.meeting_prompt is not None and ctl.meeting_prompt.kind == "offer"
     ctl.action(ITEM_MEETING_SNOOZE)
     assert ctl.meeting_prompt is None and client.starts == []
+    ctl.refresh()
+    assert ctl.meeting_prompt is None       # still inside the snooze window
+    now[0] = 301.0                          # the 5-minute window expires
+    ctl.refresh()
+    assert ctl.meeting_prompt is not None   # asks again, still no start
+    assert ctl.meeting_prompt.kind == "offer"
+    assert client.starts == []
 
 
 def test_end_offer_appears_when_the_meeting_goes_away(tmp_path):
@@ -303,6 +325,91 @@ def test_auto_record_setting_starts_without_a_prompt(tmp_path):
     ctl.refresh()
     assert client.starts == [("sink", "mic", "Zoom")]
     assert ctl.meeting_prompt is None       # auto-record is not an offer
+
+
+# ---------------------------------------------------------------------------
+# Settings are server truth *over time*: a mid-run toggle must take effect
+# (macOS re-reads on every menuWillOpen; the tray re-reads every poll)
+# ---------------------------------------------------------------------------
+
+def test_auto_record_revoked_mid_run_stops_future_auto_starts(tmp_path):
+    hits = [hit()]
+    client = FakeClient()
+    client.settings_data["auto_record_meetings"] = True
+    ctl, _, watcher = controller_for(hits, tmp_path, client=client)
+    ctl.refresh()
+    assert client.starts == [("sink", "mic", "Zoom")]   # enabled: auto-start
+
+    # The user revokes auto-record in the web UI while the tray runs.
+    client.settings_data["auto_record_meetings"] = False
+    hits.clear()
+    ctl.refresh()                                       # that meeting ends
+    assert watcher.auto_record is False                 # re-read, not latched
+
+    hits.append(hit())                                  # a NEW meeting
+    ctl.refresh()
+    assert watcher.auto_record is False
+    assert len(client.starts) == 1                      # no second auto-start
+    # ...and with auto-record off the new meeting is an offer instead.
+    assert ctl.meeting_prompt is not None
+    assert ctl.meeting_prompt.kind == "offer"
+
+
+def test_offer_disabled_mid_run_stops_prompting(tmp_path):
+    hits = [hit()]
+    client = FakeClient()
+    ctl, _, watcher = controller_for(hits, tmp_path, client=client)
+    ctl.refresh()
+    assert ctl.meeting_prompt is not None
+    assert ctl.meeting_prompt.kind == "offer"
+
+    client.settings_data["offer_meetings"] = False
+    ctl.refresh()
+    assert watcher.offer is False
+    assert ctl.meeting_prompt is None     # the pending offer goes with it
+    assert client.starts == []
+
+    hits.clear()
+    ctl.refresh()
+    hits.append(hit())                    # a brand-new meeting afterwards
+    ctl.refresh()
+    assert ctl.meeting_prompt is None     # offer off ⇒ no prompt
+    assert client.starts == []
+
+
+def test_settings_fetch_failure_keeps_last_known_values(tmp_path):
+    """A dead server keeps what it last said — it never resurrects the
+    defaults (and in particular never auto-record from a stale True)."""
+    hits = [hit()]
+    client = FakeClient()
+    client.settings_data["auto_record_meetings"] = True
+    ctl, _, watcher = controller_for(hits, tmp_path, client=client)
+    ctl.refresh()
+    assert client.starts and watcher.auto_record is True
+
+    client.settings_error = ServerUnreachable("server gone")
+    hits.clear()
+    ctl.refresh()                        # meeting ends while server is down
+    assert watcher.auto_record is True   # last known value, not the default
+
+    hits.append(hit())
+    ctl.refresh()
+    assert len(client.starts) == 2       # last known (True) still honoured
+    assert ctl.meeting_prompt is None
+
+
+def test_settings_unreachable_at_boot_never_auto_starts(tmp_path):
+    """Boot with no server answering: the watcher's own defaults apply —
+    offer on, auto-record off — so nothing can start without consent."""
+    client = FakeClient()
+    client.settings_error = ServerUnreachable("no server yet")
+    ctl, _, watcher = controller_for([hit()], tmp_path, client=client)
+    ctl.refresh()
+    assert client.starts == []
+    assert watcher.auto_record is False
+    assert watcher.offer is True
+    assert ctl.meeting_prompt is not None
+    assert ctl.meeting_prompt.kind == "offer"
 
 
 def test_menu_without_a_prompt_has_no_meeting_controls(tmp_path):
