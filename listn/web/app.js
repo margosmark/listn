@@ -149,7 +149,7 @@ function renderSettings() {
   let diarHint = diar.message || "";
   if (diar.installed && diar.ready) {
     diarHint = s.diarize_after
-      ? `After you stop, Others is split into Speaker 1, Speaker 2… Me stays Me. ${diar.cached || diar.loaded ? "The model loads offline." : diar.message}`
+      ? `After you stop, Others is split into Speaker 1, Speaker 2… Me stays Me. ${diar.needs_download ? diar.message : "The model loads offline."}`
       : "Speaker labels are off. You can still label a saved session from the library.";
     if (s.diarize_after_auto) diarHint += " (Automatic: on while a token is set or the model is cached.)";
   }
@@ -193,6 +193,24 @@ $("#reenroll-btn").addEventListener("click", async () => {
   } catch (err) { toast(err.message, "error"); }
 });
 $("#file-diarize").addEventListener("change", e => { e.target.dataset.touched = "1"; });
+$("#export-voices-btn").addEventListener("click", async () => {
+  try {
+    const res = await fetch("/api/speakers/export");
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.detail || "Could not export the voice prints.");
+    }
+    const url = URL.createObjectURL(await res.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "listn-voices.json";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    toast("Voice prints exported");
+  } catch (err) { toast(err.message, "error"); }
+});
 
 async function saveSetting(key, value) {
   try {

@@ -14,6 +14,7 @@ from listn.speakers import (
     SPECTRUM,
     SPECTRUM_KEY,
     SpeakerBook,
+    correct_segment,
     name_speaker,
     threshold_for,
 )
@@ -120,6 +121,16 @@ def test_identify_gives_each_known_person_to_one_speaker(data_dir, neural):
     assert out["SPEAKER_03"]["name"] is None
 
 
+def test_identify_keeps_an_ambiguous_speaker_generic(data_dir, neural):
+    """Above the threshold but no clear lead: the label stays "Speaker N", never a guess."""
+    book = SpeakerBook(data_dir / "speakers", embedder=neural)
+    book.enroll("Priya", _voice(140))
+    book.enroll("Sam", _voice(200))
+    out = book.identify({"SPEAKER_00": neural.embed(_voice(400))})
+    assert out["SPEAKER_00"]["name"] is None
+    assert out["SPEAKER_00"]["score"] is not None and out["SPEAKER_00"]["score"] >= SPEAKER_THRESHOLD
+
+
 def test_vectors_from_different_methods_are_never_compared(data_dir, neural):
     root = data_dir / "speakers"
     SpeakerBook(root).enroll("Priya", _voice(140))
@@ -212,6 +223,38 @@ def test_naming_refuses_me_and_does_not_learn_from_the_whole_others_track(data_d
     result = name_speaker(library, book, sid, "Others", "Team")
     assert result["profile"] is None and "several people" in result["note"]
     assert book.list() == []
+
+
+def test_correction_refuses_a_session_that_only_has_the_microphone(data_dir, neural):
+    """The Me track is never a voice to learn from, even when it is the only audio."""
+    library = Library(data_dir / "sessions")
+    meta = library.create("Call", "live", speakers={"Me": "Me", "SPEAKER_00": "Speaker 1"})
+    root = library.session_path(meta.id)
+    _write(root / "audio-mic.wav", _voice(140, 3.0))
+    library.update(meta.id, audio_file="audio-mic.wav")
+    library.save_segments(meta.id, [Segment(0.0, 2.0, "hello", "SPEAKER_00")])
+    book = SpeakerBook(data_dir / "speakers", embedder=neural)
+    with pytest.raises(ValueError) as err:
+        correct_segment(library, book, meta.id, 0.0, "Priya")
+    assert "microphone track" in str(err.value)
+    assert book.list() == []
+    assert library.segments(meta.id)[0].speaker == "SPEAKER_00"
+
+
+def test_correction_learns_from_the_others_track_not_the_microphone(data_dir, neural):
+    """Two tracks: the profile comes from the system track even if audio_file points at the mic."""
+    library = Library(data_dir / "sessions")
+    meta = library.create("Call", "live", speakers={"Me": "Me", "SPEAKER_00": "Speaker 1"})
+    root = library.session_path(meta.id)
+    _write(root / "audio-system.wav", _voice(140, 3.0))
+    _write(root / "audio-mic.wav", _voice(300, 3.0))
+    library.update(meta.id, audio_file="audio-mic.wav")
+    library.save_segments(meta.id, [Segment(0.0, 2.0, "hello", "SPEAKER_00")])
+    book = SpeakerBook(data_dir / "speakers", embedder=neural)
+    result = correct_segment(library, book, meta.id, 0.0, "Priya")
+    assert result["profile"] == {"name": "Priya", "clips": 1}
+    assert book.match(_voice(140))[0] == "Priya"
+    assert book.match(_voice(300))[0] is None
 
 
 def test_live_chunks_use_the_voice_model_without_downloading(data_dir, neural, monkeypatch):

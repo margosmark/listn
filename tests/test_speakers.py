@@ -7,7 +7,7 @@ from listn.audio import TARGET_RATE, to_int16
 from listn.engine import Engine
 from listn.library import Library, Segment
 from listn.server import create_app
-from listn.speakers import SpeakerBook, correct_segment, embed_speaker
+from listn.speakers import SPECTRUM_KEY, SpeakerBook, correct_segment, embed_speaker
 
 from .conftest import MAC_DEVICES, FakeSD
 
@@ -81,6 +81,35 @@ def test_correction_renames_the_line_and_grows_the_profile(data_dir):
     assert library.get(meta.id).speakers["Sam"] == "Sam"
     name, _score = book.match(_voice(180), 0.72)
     assert name == "Sam"
+
+
+def test_voice_export_is_a_download_of_the_users_own_profiles(data_dir, fake_factory):
+    import json
+
+    sd = FakeSD(MAC_DEVICES, speed=40.0)
+    app = create_app(engine=Engine(sd=sd, transcriber_factory=fake_factory), sd=sd)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        clip = data_dir / "clip.wav"
+        _write(clip, _voice(160))
+        with clip.open("rb") as handle:
+            saved = client.post("/api/speakers/enroll", data={"name": "Ada"}, files={"file": ("clip.wav", handle, "audio/wav")})
+        assert saved.status_code == 200, saved.text
+
+        export = client.get("/api/speakers/export")
+        assert export.status_code == 200, export.text
+        assert export.headers["content-disposition"] == 'attachment; filename="listn-voices.json"'
+        assert export.headers["content-type"].startswith("application/json")
+        payload = json.loads(export.content)
+        [profile] = payload["profiles"]
+        assert profile["name"] == "Ada"
+        assert len(profile["vectors"][SPECTRUM_KEY]) == 1
+        assert len(profile["vectors"][SPECTRUM_KEY][0]) == 64
+        # The export is the numbers only: no local paths and no audio bytes.
+        assert str(data_dir) not in export.text
+        assert "RIFF" not in export.text and "base64" not in export.text
+
+        assert client.delete("/api/speakers/Ada").json() == {"ok": True}
+        assert json.loads(client.get("/api/speakers/export").content)["profiles"] == []
 
 
 def test_embedding_is_stable_and_local(data_dir):
