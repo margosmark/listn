@@ -26,8 +26,11 @@ How it fits together
   recording the wrong audio.
 * **Per-application capture (L1).** ``select_targets()`` also accepts an
   output-producing application stream (``Stream/Output/Audio``) as the
-  *system* track. ``pw-record --target <stream>`` taps that one stream's
-  own output ports, so only that application's audio is recorded while it
+  *system* track. The recorder binds that stream by its unique
+  ``object.serial`` — ``pw-record --target`` takes "serial or name", and
+  two streams may share a ``node.name``, which PipeWire resolves to the
+  first-created match — so the tap lands on the selected stream's own
+  output ports and only that application's audio is recorded while it
   keeps playing to the sink — measured on a headless PipeWire 1.4.2 daemon
   with two simultaneous playback streams carrying different tones (700 Hz
   and 1300 Hz): each capture held exactly its own stream's tone. Without a
@@ -59,7 +62,11 @@ Honesty rules
   matches nothing, matches more than one node, or names a stream that
   closes or vanishes fails the run (or that track, mid-run) with the
   cause: falling back to the session default sink would record a
-  different, unrequested mix of applications and call it a success.
+  different, unrequested mix of applications and call it a success. The
+  same refusal covers an *explicitly selected* target that would be
+  bound *by name* while its ``node.name`` is shared with another node in
+  the graph — the name is what ``pw-record`` would match, and it matches
+  the first-created one.
 * What has actually been measured where: the tests fake ``pw-record``
   with per-target synthetic content; the headless rig asserts real-daemon
   capture *and* track distinctness; the identical-track failure and the
@@ -69,9 +76,10 @@ Honesty rules
 
 Limitations: no pause of its own (pause belongs to the engine session
 that consumes ``on_block``) and no GPU or model changes. Per-app capture
-is reachable from the CLI and the local API; the web UI and tray target
-pickers still offer whole-sink targets only (they never *select* an app by
-accident, they just cannot choose one yet).
+is reachable from the CLI, the local API and the web UI's Live tab target
+picker, which shares the application-stream list; the tray target picker
+still offers whole-sink targets only — it never *selects* an app by
+accident, it just cannot choose one yet.
 """
 
 from __future__ import annotations
@@ -389,6 +397,48 @@ def _ambiguous(selector, matches: list[Node]) -> CaptureError:
         "target must be unambiguous; pick one by its node name.")
 
 
+def _binds_by_serial(node: Node) -> bool:
+    """True when the recorder must bind this node by ``object.serial``.
+
+    ``pw-record --target`` takes "serial or name" and digits are resolved
+    as *serials* (measured on PipeWire 1.4.2: an unknown serial silently
+    falls back to the whole sink, a registry id does not resolve at all).
+    A *name* that matches several nodes binds the first-created match —
+    that is how one application's audio used to land in another's report
+    while ``report.ok`` claimed the selected node. Serials are unique and
+    never reused, so an application stream always binds by serial.
+
+    Sinks and microphones keep the measured name-based binding (the real
+    laptop A/B in docs/LINUX_CAPTURE.md was taken with a name), so a
+    shared ``node.name`` among those is refused instead — see
+    :func:`_refuse_shared_name`.
+    """
+    return node.is_app_stream and node.serial not in (None, 0)
+
+
+def _refuse_shared_name(selector, node: Node, graph: Graph) -> None:
+    """Refuse a name-bound target whose ``node.name`` matches >1 node.
+
+    ``pw-record`` would bind the first-created match, so the capture
+    would hold a different node's audio while the report claimed the
+    selected one. Same refusal family as :func:`_ambiguous` — raised from
+    ``select_targets()`` before anything starts: CLI exit 3, HTTP 400,
+    no recording directory. Targets bound by serial are unaffected: their
+    binding cannot drift, so a shared name is not a reason to refuse.
+    """
+    if _binds_by_serial(node):
+        return
+    matches = [n for n in graph.nodes if n.name == node.name]
+    if len(matches) < 2:
+        return
+    seen = ", ".join(sorted(f"{n.name} (id {n.id})" for n in matches))
+    raise CaptureError(
+        f"'{selector}' resolved to node id {node.id}, but '{node.name}' names "
+        f"{len(matches)} PipeWire nodes: {seen}. A capture target must be "
+        "unambiguous; pw-record binds by name and would record the first "
+        "match, not the selected node.")
+
+
 def _unknown_selector(selector, graph: Graph, *, apps: bool = False) -> CaptureError:
     available = ", ".join(sorted(n.name for n in graph.nodes if n.media_class)) or "none"
     message = f"No PipeWire node named '{selector}'. Nodes seen: {available}."
@@ -405,6 +455,7 @@ def _resolve(selector: str | None, graph: Graph) -> Node | None:
     if len(matches) > 1:
         raise _ambiguous(selector, matches)
     if matches:
+        _refuse_shared_name(selector, matches[0], graph)
         return matches[0]
     raise _unknown_selector(selector, graph)
 
@@ -421,6 +472,11 @@ def _resolve_system(selector: str | None, graph: Graph) -> Node | None:
     the session default sink: the caller asked for something specific and
     gets a refusal, because a fallback would record a different, larger
     mix of applications and report it as the requested capture.
+
+    A resolved node whose ``node.name`` is shared with another node is
+    refused too when it would be bound by name — ``pw-record`` matches
+    the first-created node of that name, which is a different node than
+    the one this selector resolved to.
     """
     if selector is None:
         return None
@@ -428,6 +484,7 @@ def _resolve_system(selector: str | None, graph: Graph) -> Node | None:
     if len(matches) > 1:
         raise _ambiguous(selector, matches)
     if matches:
+        _refuse_shared_name(selector, matches[0], graph)
         return matches[0]
     wanted = str(selector).lower()
     by_app = [n for n in graph.app_streams
@@ -435,6 +492,7 @@ def _resolve_system(selector: str | None, graph: Graph) -> Node | None:
     if len(by_app) > 1:
         raise _ambiguous(selector, by_app)
     if by_app:
+        _refuse_shared_name(selector, by_app[0], graph)
         return by_app[0]
     raise _unknown_selector(selector, graph, apps=True)
 
@@ -807,9 +865,19 @@ class TwoTrackRecorder:
                     raise CaptureError(
                         f"The {track.target.track} target '{track.target.node.name}' is already "
                         "gone from the PipeWire graph. Re-run discovery.")
+                node = track.target.node
+                # Application streams bind by their unique object.serial:
+                # a node.name may match several nodes and pw-record binds
+                # the first-created match (measured — with two same-named
+                # streams, id and application-name selectors recorded the
+                # other application while the report claimed this one).
+                # Sinks and microphones keep name binding, and
+                # select_targets() has already refused a shared name for
+                # explicit selections of them (see _binds_by_serial).
+                target = str(node.serial) if _binds_by_serial(node) else node.name
                 argv = [
                     self.pw_record, "--raw",
-                    "--target", track.target.node.name,
+                    "--target", target,
                 ]
                 if track.target.node.is_sink:
                     # --target only *names* a node. For an Audio/Sink the

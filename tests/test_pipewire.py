@@ -43,6 +43,23 @@ target = option("--target", "")
 rate = int(option("--rate", "48000"))
 channels = int(option("--channels", "2"))
 
+# listn binds application streams by their unique object.serial (the real
+# pw-record resolves digits as serials too). Resolve serial -> node.name
+# through the fake graph so the audio still "lives on the node": mode
+# keywords (silent/die/...) and the content key follow the node, exactly
+# like the daemon, instead of following the digits.
+if target.isdigit():
+    try:
+        import json as _json
+        with open(os.environ["FAKE_PW_DUMP_FILE"]) as _fh:
+            for _obj in _json.load(_fh):
+                _props = (_obj.get("info") or {}).get("props") or {}
+                if str(_props.get("object.serial")) == target:
+                    target = _props.get("node.name") or target
+                    break
+    except (OSError, ValueError, KeyError):
+        pass
+
 log = os.environ.get("FAKE_PW_ARGV_FILE")
 if log:
     with open(log, "a") as fh:

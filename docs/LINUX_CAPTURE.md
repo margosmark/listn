@@ -151,6 +151,13 @@ application therefore **excludes** every other application: there is no
   `application.name` (case-insensitive). That last step is taken only
   when **exactly one** stream carries the name; ids and PIDs churn, so
   neither is ever the identity.
+* *Binding* is separate from identity: an application stream is handed
+  to `pw-record` as its unique **`object.serial`** (`--target` accepts
+  "serial or name", and digits resolve as serials — measured below),
+  because a `node.name` may be carried by several nodes and PipeWire
+  binds the first-created match. Sinks and microphones keep the measured
+  name-based binding, so a shared name among *those* is refused instead
+  (matrix below).
 * The user-visible label is the application's own name
   (`application.name`, falling back to `application.process.binary`).
   **Window, media and stream titles are never read**: a stream node's
@@ -163,16 +170,23 @@ application therefore **excludes** every other application: there is no
 
 ### Refusals — a target is never silently replaced
 
-`pw-record --target` only *names* a node, and PipeWire 1.4.2 does not
-fail on a name it cannot find: it records something else instead
-(observed behaviour 1, re-measured for streams below — an unknown target
-here captured the **whole sink**). So:
+`pw-record --target` accepts a **serial or a name**, and digits resolve
+as *serials*: an unknown serial is not an error either — PipeWire 1.4.2
+records something else instead (observed behaviour 1, re-measured for
+streams below — an unknown target here captured the **whole sink**; a
+registry *id* passed as digits does not resolve and falls back the same
+way). A *name* it cannot match uniquely behaves the same: it binds the
+first-created node carrying that name. listn therefore binds application
+streams by their unique `object.serial` and refuses any name-bound
+target whose name is shared. So:
 
 | Situation | Behaviour |
 |---|---|
 | Selector matches nothing | `CaptureError`: CLI exit 3, HTTP 400, no recording directory. The refusal lists the nodes seen *and* the application streams available. The default sink is **not** adopted. |
 | Selector matches several nodes (duplicate `node.name`) | Refused as ambiguous, naming every match. |
 | Application name matches several streams | Refused as ambiguous, naming each node — one application holding several streams is a common case, and taking the first would be a guess. |
+| Resolved node's `node.name` is shared with another node, and the target is **name-bound** (sink, microphone, or an application stream without a serial) | Refused *after* resolution of an explicit selector: the selector was unique but the name `pw-record` would bind is not, and it binds the first-created match. CLI exit 3, HTTP 400, no recording directory. (A default/fallback target with no selector is the session's own metadata choice and is not re-checked here.) |
+| Application stream target with a duplicated `node.name` | **Not** a refusal: bound by the node's unique `object.serial`, so id and application-name selectors record exactly the selected stream — measured below ("duplicated `node.name`" lines). |
 | Selected stream gone before the spawn | `TwoTrackRecorder.start()`'s liveness probe fails; start is all-or-nothing (L0 §5), nothing runs. |
 | Selected stream closes mid-recording | That track goes `failed` with *"the application stream '…' closed while recording (its node left the PipeWire graph)"*, the **microphone keeps recording**, partial audio is retained and `ok` is false (L0 §5 partial-failure matrix). Falling back to the whole sink is forbidden. |
 | Selector names a sink | Whole-sink mode with `selection: explicit` — a visible choice, not a fallback. |
@@ -208,7 +222,34 @@ pw-record --target listn.probe.nothing   # a name that does not exist
   2.97 s  dominant 1300.0 Hz  top=[1300Hz x1.00, 700Hz x1.00, 690Hz x0.00]
 ```
 
+Duplicated `node.name` — two streams, both `node.name=qa.f1.dup`,
+`application.name=DupAppA` 700 Hz created first, `DupAppB` 1300 Hz
+second, mic tunnel 1000 Hz; DupAppB was `id=58 serial=59`:
+
+```text
+listn record --system-target 58 --mic-target <mic> …      # id of DupAppB
+  system dominant 1300.0 Hz   700 Hz and the mic >40 dB below   (rc 0, report ok)
+listn record --system-target DupAppB --mic-target <mic> …  # application name
+  system dominant 1300.0 Hz   700 Hz >40 dB below              (rc 0, report ok)
+listn record --system-target qa.f1.dup …                   # the shared name itself
+  rc 3  "'qa.f1.dup' names 2 PipeWire nodes: …"  no recording directory
+raw pw-record --target 59   # DupAppB's serial → 1300 Hz only, 700 >40 dB below
+raw pw-record --target 58   # DupAppB's *id*    → both tones: ids do not resolve,
+                            # an unknown serial falls back to the whole sink
+raw pw-record --target qa.f1.dup → 700 Hz only: the first-created match,
+                            which is exactly the capture the pre-fix listn
+                            reported as DupAppB's (QA F1, 5/5)
+```
+
 Reading:
+
+* **duplicated `node.names` no longer redirect the capture** — before
+  the fix the id and application-name selectors recorded DupAppA's
+  700 Hz while `report.ok` claimed DupAppB; binding by the unique
+  `object.serial` puts the selected stream's 1300 Hz in the WAV (both
+  selectors, both >40 dB rejection of the other tone), and a selector
+  that *is* the shared name still refuses with exit 3 and no recording
+  directory;
 
 * **per-app isolation is real** — the selected stream's capture holds
   only its own tone (the other tone's bin is `x0.00`, i.e. below the
