@@ -29,7 +29,7 @@ from pydantic import BaseModel
 from listn import __version__, diarize
 from listn import devices as devmod
 from listn.capture import DeviceError, measure_levels
-from listn.config import BACKENDS, MODELS, Settings, data_dir
+from listn.config import BACKENDS, MODELS, Settings, SettingsError, data_dir
 from listn.engine import Engine
 from listn.library import AUDIO_EXTS, EXPORT_FORMATS, export
 from listn.transcriber import available_backends, resolve_backend
@@ -61,6 +61,11 @@ class SettingsIn(BaseModel):
     audio_retention_days: int | None = None
     min_free_gb: float | None = None
     battery_saver: bool | None = None
+    # Linux desktop extras (listn tray). Inert on macOS, whose caption
+    # window and hotkeys are the native menu bar app's own.
+    captions_enabled: bool | None = None
+    hotkey_start_stop: str | None = None
+    hotkey_bookmark: str | None = None
 
 
 class DeviceTestIn(BaseModel):
@@ -94,6 +99,17 @@ class NotesIn(BaseModel):
 
 class PrivacyIn(BaseModel):
     pane: str = "microphone"
+
+
+# Provenance for a bookmark. The tray and the global shortcut both write
+# through the same route; the source is stored with the bookmark so the
+# transcript shows where a marker came from.
+BOOKMARK_SOURCES = {"api", "tray", "hotkey", "web"}
+
+
+class BookmarkIn(BaseModel):
+    note: str = ""
+    source: str = "api"
 
 
 class AskIn(BaseModel):
@@ -258,9 +274,17 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
             raise HTTPException(400, f"Unknown model. Choose one of {', '.join(MODELS)}.")
         if "backend" in changes and changes["backend"] not in BACKENDS:
             raise HTTPException(400, f"Unknown backend. Choose one of {', '.join(BACKENDS)}.")
+        before = {key: getattr(current, key) for key in changes}
         for key, value in changes.items():
             setattr(current, key, value)
-        current.validated().save()
+        try:
+            current.validated().save()
+        except SettingsError as exc:
+            # An unfixable value (a malformed shortcut, say) is a 400 the
+            # user can act on, and the previous settings stay in effect.
+            for key, value in before.items():
+                setattr(current, key, value)
+            raise HTTPException(400, str(exc)) from None
         return current.public()
 
     @app.post("/api/live/start")
@@ -340,6 +364,17 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
             return {"live": None, "pipewire": pw_status}
         return {"live": e.live.status(), "segments": [s.to_dict() for s in e.live.segments],
                 "pipewire": pw_status}
+
+    @app.post("/api/live/bookmark")
+    def live_bookmark(body: BookmarkIn = BookmarkIn()):
+        source = (body.source or "api").strip().lower()
+        if source not in BOOKMARK_SOURCES:
+            raise HTTPException(400, f"Unknown bookmark source. Choose one of "
+                                     f"{', '.join(sorted(BOOKMARK_SOURCES))}.")
+        item = eng().add_bookmark(body.note, source=source)
+        if item is None:
+            raise HTTPException(409, "Nothing is recording.")
+        return item
 
     @app.post("/api/files")
     async def upload(file: UploadFile = File(...), title: str = Form(""), diarize_speakers: bool = Form(False)):

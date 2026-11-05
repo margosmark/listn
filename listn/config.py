@@ -132,6 +132,13 @@ class Settings:
     speaker_threshold: float = SPEAKER_THRESHOLD
     # Only used by the spectrum fallback when pyannote is not installed.
     spectrum_threshold: float = 0.72
+    # Linux desktop extras (listn tray), opt-in and inert elsewhere:
+    # captions render only while a recording runs and are never logged or
+    # copied; the shortcut pair is registered with the desktop's own
+    # global-shortcut portal, which reports what it actually granted.
+    captions_enabled: bool = False
+    hotkey_start_stop: str = "Ctrl+Alt+R"
+    hotkey_bookmark: str = "Ctrl+Alt+B"
     audio_retention_days: int = 0
     min_free_gb: float = 2.0
     battery_saver: bool = True
@@ -204,6 +211,14 @@ class Settings:
             self.chunk_seconds = min(30.0, max(2.0, float(self.chunk_seconds)))
         except (TypeError, ValueError):
             self.chunk_seconds = 6.0
+        from listn.shortcuts import ShortcutError, normalize_chord
+
+        self.captions_enabled = bool(self.captions_enabled)
+        for attr in ("hotkey_start_stop", "hotkey_bookmark"):
+            try:
+                setattr(self, attr, normalize_chord(getattr(self, attr)))
+            except ShortcutError as exc:
+                raise SettingsError(f"{attr}: {exc}") from None
         self.language = (self.language or "").strip().lower() or None
         self.device = self.device or None
         self.hf_token = (self.hf_token or "").strip() or None
