@@ -23,11 +23,11 @@ from fastapi.testclient import TestClient
 from listn.engine import Engine
 from listn.server import create_app
 from listn.tray import (
-    FAILED, IDLE, ITEM_MIC_BASE, ITEM_PAUSE, ITEM_PRIVACY, ITEM_QUIT,
-    ITEM_RESUME, ITEM_START, ITEM_STATUS, ITEM_STOP, ITEM_SYSTEM_BASE,
-    PAUSED, RECORDING, STARTING, STOPPING, UNREACHABLE, MenuItem,
-    ServerClient, ServerUnreachable, TrayController, TrayStatus, build_menu,
-    derive_status,
+    FAILED, IDLE, ITEM_BOOKMARK, ITEM_CAPTIONS, ITEM_MIC_BASE, ITEM_PAUSE,
+    ITEM_PRIVACY, ITEM_QUIT, ITEM_RESUME, ITEM_SHORTCUTS, ITEM_START,
+    ITEM_STATUS, ITEM_STOP, ITEM_SYSTEM_BASE, PAUSED, RECORDING, STARTING,
+    STOPPING, UNREACHABLE, MenuItem, ServerClient, ServerUnreachable,
+    TrayController, TrayStatus, build_menu, derive_status,
 )
 
 from .conftest import MAC_DEVICES, FakeSD
@@ -204,8 +204,11 @@ def all_labels(items):
 def test_menu_offers_exactly_the_supported_controls():
     items = build_menu(recording_status(), SINKS, SOURCES, SINK, MIC)
     ids = {i.id for i in items if not i.separator}
+    # 7/8 are the Linux desktop extras (bookmark, captions toggle); the
+    # shortcut status line (9) only exists when a status object is passed.
     assert ids == {ITEM_STATUS, ITEM_START, ITEM_STOP, ITEM_PAUSE, ITEM_RESUME,
-                   10, 11, ITEM_PRIVACY, ITEM_QUIT}
+                   ITEM_BOOKMARK, ITEM_CAPTIONS, 10, 11, ITEM_PRIVACY,
+                   ITEM_QUIT}
     labels = " ".join(all_labels(items)).lower()
     for forbidden in ("meeting", "auto-record", "auto record",
                       "launch at login", "launch-at-login", "per-app",
