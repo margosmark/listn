@@ -1,0 +1,88 @@
+{
+  "description": "A track pinned at the format maximum across >=2% of its samples is clipping, not a capture: the track fails and the run cannot claim ok.",
+  "expect": {
+    "ok": false,
+    "failed_tracks": [
+      "system"
+    ]
+  },
+  "report": {
+    "ok": false,
+    "out_dir": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok",
+    "rate": 48000,
+    "targets": {
+      "system": {
+        "id": 32,
+        "serial": 32,
+        "name": "sys.tone",
+        "media_class": "Audio/Sink",
+        "description": "Built-in Audio Analog Stereo",
+        "track": "system",
+        "selection": "default"
+      },
+      "mic": {
+        "id": 34,
+        "serial": 34,
+        "name": "mic.tone",
+        "media_class": "Audio/Source",
+        "description": "USB Microphone",
+        "track": "mic",
+        "selection": "default"
+      }
+    },
+    "tracks": {
+      "system": {
+        "track": "system",
+        "track_id": 0,
+        "target": {
+          "id": 32,
+          "serial": 32,
+          "name": "sys.tone",
+          "media_class": "Audio/Sink",
+          "description": "Built-in Audio Analog Stereo",
+          "track": "system",
+          "selection": "default"
+        },
+        "state": "failed",
+        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/system.wav",
+        "duration": 2.9,
+        "samplerate": 48000,
+        "channels": 1,
+        "frames": 139200,
+        "rms_db": -3.4,
+        "peak_db": 0.0,
+        "fs_fraction": 0.072,
+        "verdict": "ok",
+        "error": "peak 0.0 dBFS with 7.2% of samples at full scale: this track is clipping, not a clean capture of its source",
+        "exit_code": 1,
+        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/system.pw-record.log"
+      },
+      "mic": {
+        "track": "mic",
+        "track_id": 1,
+        "target": {
+          "id": 34,
+          "serial": 34,
+          "name": "mic.tone",
+          "media_class": "Audio/Source",
+          "description": "USB Microphone",
+          "track": "mic",
+          "selection": "default"
+        },
+        "state": "stopped",
+        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/mic.wav",
+        "duration": 3.0,
+        "samplerate": 48000,
+        "channels": 1,
+        "frames": 144000,
+        "rms_db": -9.3,
+        "peak_db": -6.3,
+        "fs_fraction": 0.0,
+        "verdict": "ok",
+        "error": null,
+        "exit_code": 1,
+        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/mic.pw-record.log"
+      }
+    }
+  }
+}

@@ -21,6 +21,12 @@ the same code paths.
 
 ## What it is
 
+The normative contract for this capture path — source kinds and stable
+identity, per-track states/errors, the `ok` policy, pause/stop and
+partial-failure rules, and the L1/L7 extension points — is
+[CAPTURE_CONTRACT.md](CAPTURE_CONTRACT.md); its executable form is
+`listn/capture_contract.py`, pinned by `tests/test_capture_contract.py`.
+
 `listn/pipewire.py` records the system output and the microphone as two
 independent tracks through PipeWire, the audio stack KDE Plasma uses:
 

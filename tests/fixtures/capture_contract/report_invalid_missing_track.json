@@ -1,0 +1,56 @@
+{
+  "description": "A report without the microphone track cannot describe a two-track capture.",
+  "report": {
+    "ok": true,
+    "out_dir": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok",
+    "rate": 48000,
+    "targets": {
+      "system": {
+        "id": 32,
+        "serial": 32,
+        "name": "sys.tone",
+        "media_class": "Audio/Sink",
+        "description": "Built-in Audio Analog Stereo",
+        "track": "system",
+        "selection": "default"
+      },
+      "mic": {
+        "id": 34,
+        "serial": 34,
+        "name": "mic.tone",
+        "media_class": "Audio/Source",
+        "description": "USB Microphone",
+        "track": "mic",
+        "selection": "default"
+      }
+    },
+    "tracks": {
+      "system": {
+        "track": "system",
+        "track_id": 0,
+        "target": {
+          "id": 32,
+          "serial": 32,
+          "name": "sys.tone",
+          "media_class": "Audio/Sink",
+          "description": "Built-in Audio Analog Stereo",
+          "track": "system",
+          "selection": "default"
+        },
+        "state": "stopped",
+        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/system.wav",
+        "duration": 2.9,
+        "samplerate": 48000,
+        "channels": 1,
+        "frames": 139200,
+        "rms_db": -9.6,
+        "peak_db": -6.6,
+        "fs_fraction": 0.0,
+        "verdict": "ok",
+        "error": null,
+        "exit_code": 1,
+        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/system.pw-record.log"
+      }
+    }
+  }
+}
