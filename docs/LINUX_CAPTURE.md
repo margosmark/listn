@@ -37,6 +37,11 @@ independent tracks through PipeWire, the audio stack KDE Plasma uses:
   / `--mic` selectors are validated, and selection is labelled `default`,
   `fallback` or `explicit` in every report so a guess is never presented as
   a default.
+- The system track can instead point at **one application's output stream**
+  (`Stream/Output/Audio`) — see
+  [Per-application capture (L1)](#per-application-capture-l1). The
+  microphone is a separate track either way, and the whole-sink default is
+  unchanged.
 - `TwoTrackRecorder` runs one `pw-record` per track (raw int16 PCM on
   stdout) into its own WAV file — the system track's stream additionally
   passes `--properties stream.capture.sink=true`, because `--target`
@@ -63,6 +68,8 @@ uv run python -m listn.pipewire --duration 5 --json > report.json
 
 uv run listn record --list                         # discovered nodes, app CLI
 uv run listn record --system-target <node> --mic-target <node> --duration 5
+uv run listn record --system-target <app-stream> --mic-target <node> --duration 5
+                                                   # ^ one application only (L1)
 uv run listn ui --no-browser                       # web UI: pick both targets in
                                                    # the Live tab, then Start
 
@@ -71,6 +78,7 @@ scripts/linux_capture_rig.sh                       # the whole headless rig, one
 
 uv run pytest tests/test_pipewire.py               # module tests
 uv run pytest tests/test_pipewire_wiring.py        # CLI/server wiring tests
+uv run pytest tests/test_pipewire_app.py           # L1 per-application tests
 LISTN_RIG_IT=1 uv run pytest tests/test_capture_rig.py  # full daemon rig
 ```
 
@@ -112,6 +120,174 @@ peak/RMS, error) — never a bare "saved".
   audio-mic.wav 198738 B; transcripts empty (a pure tone carries no speech —
   expected). Starts without both explicit targets are refused with 400.
   ```
+
+## Per-application capture (L1)
+
+The system track has two modes, and which one a run used is never a guess
+— it is `targets.system.media_class` in every report:
+
+| Mode | Target node | Records | `media_class` → source kind |
+|---|---|---|---|
+| **All applications** (default) | an `Audio/Sink` | everything mixed at that sink: every application, system sounds, notifications | `Audio/Sink` → `sink_monitor` |
+| **One application** | one `Stream/Output/Audio` | that application's output stream and nothing else | `Stream/Output/Audio` → `app` |
+
+With no `--system-target` / `system_target` the whole-sink default
+applies, unchanged — that *is* the "all applications" mode. The
+microphone is an independent track in both modes (`Audio/Source`, kind
+`mic`) and is not affected by which mode is chosen. Selecting one
+application therefore **excludes** every other application: there is no
+"the selected app plus whatever else is playing" state.
+
+### Enumerating and selecting
+
+* `discover()` parses the graph; `Graph.app_streams` returns **only**
+  `Stream/Output/Audio` nodes. Sinks, sources, monitor sources and
+  `Stream/Input/Audio` capture streams (listn's own `pw-record` among
+  them) are excluded by construction, so a capture stream can never be
+  mistaken for application audio.
+* The stable identity is the **node name** — L0
+  [capture contract](CAPTURE_CONTRACT.md) §2.2. An explicit selector
+  resolves in order: node id → exact node name → the application's own
+  `application.name` (case-insensitive). That last step is taken only
+  when **exactly one** stream carries the name; ids and PIDs churn, so
+  neither is ever the identity.
+* The user-visible label is the application's own name
+  (`application.name`, falling back to `application.process.binary`).
+  **Window, media and stream titles are never read**: a stream node's
+  `node.description`, `media.name` and `window.title` routinely carry
+  what is playing (VLC publishes the track title there), and
+  `parse_graph()` deliberately does not copy them into the node or the
+  report.
+* The same list everywhere: `listn record --list`,
+  `GET /api/pipewire/devices` (`apps`), and the Live tab's target picker.
+
+### Refusals — a target is never silently replaced
+
+`pw-record --target` only *names* a node, and PipeWire 1.4.2 does not
+fail on a name it cannot find: it records something else instead
+(observed behaviour 1, re-measured for streams below — an unknown target
+here captured the **whole sink**). So:
+
+| Situation | Behaviour |
+|---|---|
+| Selector matches nothing | `CaptureError`: CLI exit 3, HTTP 400, no recording directory. The refusal lists the nodes seen *and* the application streams available. The default sink is **not** adopted. |
+| Selector matches several nodes (duplicate `node.name`) | Refused as ambiguous, naming every match. |
+| Application name matches several streams | Refused as ambiguous, naming each node — one application holding several streams is a common case, and taking the first would be a guess. |
+| Selected stream gone before the spawn | `TwoTrackRecorder.start()`'s liveness probe fails; start is all-or-nothing (L0 §5), nothing runs. |
+| Selected stream closes mid-recording | That track goes `failed` with *"the application stream '…' closed while recording (its node left the PipeWire graph)"*, the **microphone keeps recording**, partial audio is retained and `ok` is false (L0 §5 partial-failure matrix). Falling back to the whole sink is forbidden. |
+| Selector names a sink | Whole-sink mode with `selection: explicit` — a visible choice, not a fallback. |
+
+A selected application that is simply **not playing yet** produces a
+system track with `verdict: "silent"` and `state: "stopped"` — never
+`verdict: "ok"`. The run itself stays `ok` because the microphone
+carries signal: L0 §5 keeps a silent *system* track from failing the run
+("nobody may have been playing anything"), and the contract validator
+refuses any other combination. The honest claim is the per-track
+verdict.
+
+### What was measured for this increment
+
+Headless Debian LXC, PipeWire 1.4.2 + WirePlumber 0.5.8, no `/dev/snd`.
+Two `pw-cat --playback` processes stand in for two applications, each
+publishing a real `Stream/Output/Audio` node, playing 700 Hz and 1300 Hz
+into a null sink; each line below is the dominant-bin analysis of the
+produced WAV with its three strongest 10 Hz-spaced bins:
+
+```text
+pw-dump → listn.probe.sink   Audio/Sink
+           listn.probe.appA  Stream/Output/Audio
+           listn.probe.appB  Stream/Output/Audio
+
+pw-record --target listn.probe.appA → recA.wav
+  4.01 s  dominant 700.0 Hz   top=[700Hz x1.00, 710Hz x0.00, 690Hz x0.00]
+pw-record --target listn.probe.appB → recB.wav
+  4.01 s  dominant 1300.0 Hz  top=[1300Hz x1.00, 1290Hz x0.00, 1310Hz x0.00]
+pw-record --target listn.probe.sink --properties stream.capture.sink=true
+  2.99 s  dominant 700.0 Hz   top=[700Hz x1.00, 1300Hz x1.00, 690Hz x0.00]
+pw-record --target listn.probe.nothing   # a name that does not exist
+  2.97 s  dominant 1300.0 Hz  top=[1300Hz x1.00, 700Hz x1.00, 690Hz x0.00]
+```
+
+Reading:
+
+* **per-app isolation is real** — the selected stream's capture holds
+  only its own tone (the other tone's bin is `x0.00`, i.e. below the
+  noise floor), while the whole-sink capture holds **both** tones. That
+  is the "all applications" vs "one application" distinction measured,
+  not asserted;
+* **an unknown target silently becomes whole-sink capture** — the last
+  line recorded the sink's mix without a word. This is exactly the
+  failure listn must not ship: it is why an explicit selector is
+  validated before anything spawns and re-checked every second while
+  recording, and why a vanished stream fails the track instead of
+  carrying on.
+
+This is *mechanism* evidence on a headless daemon with synthetic tones.
+It is **not** the hardware acceptance below, and it used no private or
+production audio.
+
+### Acceptance on a real Plasma session (not yet run)
+
+Required for the L1 release gate; the headless rig above does not
+substitute for it. Run on the CachyOS/KDE laptop with a real microphone
+and audible output, using two **desktop applications** (not `pw-cat`),
+each playing a generated tone:
+
+```sh
+# tones only — no recordings, no copyrighted/private audio
+python - <<'EOF'
+import math, wave, numpy as np
+for name, hz in (("tone440", 440.0), ("tone1300", 1300.0)):
+    n = int(30 * 48000); t = np.arange(n) / 48000
+    s = (0.4 * 32767 * np.sin(2 * math.pi * hz * t)).astype("<i2")
+    w = wave.open(f"/tmp/{name}.wav", "wb")
+    w.setnchannels(2); w.setsampwidth(2); w.setframerate(48000)
+    w.writeframes(np.column_stack([s, s]).tobytes()); w.close()
+EOF
+ffplay -nodisp -autoexit /tmp/tone440.wav   &   # app A
+mpv --no-video /tmp/tone1300.wav            &   # app B
+pw-dump | jq -r '.[] | select(.info.props["media.class"]=="Stream/Output/Audio")
+                 | .info.props["node.name"]'         # expect both streams
+```
+
+Criteria — record distro/kernel, Plasma, PipeWire and WirePlumber
+versions and the pass/fail of each; record outcomes, never audio:
+
+1. **Enumeration.** `listn record --list` shows both streams under
+   *Application output streams*, labelled with the application name, and
+   shows no window or media title anywhere.
+2. **Isolation A.** `listn record --system-target <appA-node>
+   --mic-target <default mic> --duration 8 --json` exits 0;
+   `targets.system.media_class == "Stream/Output/Audio"`,
+   `selection == "explicit"`; the produced `system.wav` has its dominant
+   frequency within ±2 Hz of 440 Hz **and** no 1300 Hz peak above the
+   noise floor (same check `scripts/linux_capture_rig.sh` performs).
+   Both applications stay audible on the speakers during the capture —
+   the tap is passive, not a reroute.
+3. **Isolation B.** Repeat targeting app B: dominant within ±2 Hz of
+   1300 Hz, no 440 Hz peak.
+4. **Mic stays separate.** In both runs the `mic` track is an independent
+   `Audio/Source` capture: identical-sample share ≤ 25 % and |corr| ≤ 0.99
+   against `system.wav`, and speaking into the microphone appears only in
+   `mic.wav`.
+5. **App closed mid-run.** Quit app A while recording: within one watch
+   interval the `system` track reads `state: failed` with the
+   "application stream … closed" cause, the `mic` track keeps
+   recording, `ok` is false, and both WAVs are retained.
+6. **Ambiguous selection.** With two streams sharing an application name
+   (e.g. two browser tabs), selecting by that name refuses with
+   "names N PipeWire nodes" and does not pick the first.
+7. **Stale selection.** After app A quits, re-running with its node name
+   exits 3, creates no recording directory, and does not adopt the sink.
+8. **Whole-sink regression.** With no `--system-target`, the report says
+   `Audio/Sink` / `sink_monitor` and `system.wav` contains **both** tones.
+9. **Privacy.** No window/media title appears in the report, the CLI
+   output, the logs or the session metadata; nothing is written outside
+   the local data directory; no network calls.
+
+None of 1–9 has been run on real hardware yet — the synthetic graph
+tests in `tests/test_pipewire_app.py` and the headless measurements above
+cover the mechanism only.
 
 ## Reproduce the real-daemon rig
 
@@ -366,11 +542,14 @@ port; `--no-server` refuses to start one and fails with a clear message.
 
 ## Not in this increment
 
-Per-app capture, pause inside the capture layer (pause
-stays with the engine session consuming `on_block`), packaging, GPU/model
-changes, and any change to macOS behaviour or to the ingest socket protocol.
-Web-UI/server wiring now exists (this increment): `listn record`,
-`GET /api/pipewire/devices`, `POST /api/live/start` with
-`capture: "pipewire"` plus explicit `system_target`/`mic_target`, the report
-on `GET /api/live` and in the `POST /api/live/stop` response. The KDE tray
-controls now exist (this increment): `listn tray` with the menu above.
+Pause inside the capture layer (pause stays with the engine session
+consuming `on_block`), an application-stream picker in the **KDE tray**
+(`listn tray` still offers whole-sink targets only — the CLI, the local
+API and the web UI's Live tab do offer application streams), packaging,
+GPU/model changes, and any change to macOS behaviour or to the ingest
+socket protocol. Web-UI/server wiring now exists (this increment):
+`listn record`, `GET /api/pipewire/devices` (with `apps`),
+`POST /api/live/start` with `capture: "pipewire"` plus explicit
+`system_target`/`mic_target`, the report on `GET /api/live` and in the
+`POST /api/live/stop` response. The KDE tray controls now exist (this
+increment): `listn tray` with the menu above.

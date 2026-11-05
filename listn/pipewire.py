@@ -24,6 +24,14 @@ How it fits together
   headless PipeWire daemon, see docs/LINUX_CAPTURE.md). A vanished target
   therefore fails that track and stops its process instead of quietly
   recording the wrong audio.
+* **Per-application capture (L1).** ``select_targets()`` also accepts an
+  output-producing application stream (``Stream/Output/Audio``) as the
+  *system* track. ``pw-record --target <stream>`` taps that one stream's
+  own output ports, so only that application's audio is recorded while it
+  keeps playing to the sink — measured on a headless PipeWire 1.4.2 daemon
+  with two simultaneous playback streams carrying different tones (700 Hz
+  and 1300 Hz): each capture held exactly its own stream's tone. Without a
+  selector nothing changes: the whole-sink mode above is the default.
 
 Honesty rules
 -------------
@@ -47,6 +55,11 @@ Honesty rules
   while the headless rig on PipeWire 1.4.2 links the same argv
   correctly. The routing is environment-dependent, so the property is
   passed unconditionally.
+* An application target is **never silently replaced**. A selector that
+  matches nothing, matches more than one node, or names a stream that
+  closes or vanishes fails the run (or that track, mid-run) with the
+  cause: falling back to the session default sink would record a
+  different, unrequested mix of applications and call it a success.
 * What has actually been measured where: the tests fake ``pw-record``
   with per-target synthetic content; the headless rig asserts real-daemon
   capture *and* track distinctness; the identical-track failure and the
@@ -54,9 +67,11 @@ Honesty rules
   acceptance rerun of the fixed app on that laptop is pending — use
   ``python -m listn.pipewire`` or ``scripts/linux_capture_rig.sh``.
 
-Limitations of this increment: no KDE tray, no web-UI wiring, no per-app
-capture, no pause of its own (pause belongs to the engine session that
-consumes ``on_block``), and no GPU or model changes.
+Limitations: no pause of its own (pause belongs to the engine session
+that consumes ``on_block``) and no GPU or model changes. Per-app capture
+is reachable from the CLI and the local API; the web UI and tray target
+pickers still offer whole-sink targets only (they never *select* an app by
+accident, they just cannot choose one yet).
 """
 
 from __future__ import annotations
@@ -121,6 +136,7 @@ class Node:
     description: str | None = None
     priority: int | None = None
     monitor_of: int | None = None  # set for *.monitor source nodes
+    application_name: str | None = None  # app label; never a window/media title
 
     @property
     def is_sink(self) -> bool:
@@ -133,6 +149,16 @@ class Node:
     @property
     def is_monitor(self) -> bool:
         return self.monitor_of is not None or self.name.endswith(".monitor")
+
+    @property
+    def is_app_stream(self) -> bool:
+        """An output-producing application stream — L1's per-app target.
+
+        Only ``Stream/Output/Audio`` qualifies. ``Stream/Input/Audio`` is a
+        *capture* stream (listn's own ``pw-record`` among them) and never a
+        source of application audio, so it is never enumerated here.
+        """
+        return self.media_class == "Stream/Output/Audio"
 
     def to_dict(self) -> dict:
         return {
@@ -157,6 +183,18 @@ class Graph:
     @property
     def sources(self) -> list[Node]:
         return [n for n in self.nodes if n.is_source and not n.is_monitor]
+
+    @property
+    def app_streams(self) -> list[Node]:
+        """Every output-producing application stream in the graph.
+
+        This is the L1 enumeration: only these nodes are per-app capture
+        candidates, and they are offered as the *system* track's
+        alternative to whole-sink capture. Capture streams
+        (``Stream/Input/Audio``), sinks, sources and monitors are excluded
+        by construction.
+        """
+        return [n for n in self.nodes if n.is_app_stream]
 
     def by_name(self, name: str) -> Node | None:
         for node in self.nodes:
@@ -201,6 +239,24 @@ class CommandRunner:
         return subprocess.Popen(argv, **kwargs)
 
 
+def _application_label(props: dict) -> str | None:
+    """The application's own name — never a window, media or stream title.
+
+    Only ``application.name`` and ``application.process.binary`` identify
+    the *program* the user picked. ``media.name``, ``window.title`` and a
+    stream node's ``node.description`` describe what is playing or which
+    window has focus, and are deliberately never read: the capture report
+    is metadata about the selection, not about its content.
+    """
+    for key in ("application.name", "application.process.binary"):
+        value = props.get(key)
+        if value:
+            text = str(value).strip()
+            if text:
+                return text
+    return None
+
+
 def parse_graph(payload) -> Graph:
     """Parse ``pw-dump`` JSON into nodes and default node names.
 
@@ -223,15 +279,28 @@ def parse_graph(payload) -> Graph:
                 continue
             serial = props.get("object.serial")
             priority = props.get("priority.session")
+            media_class_str = str(media_class) if media_class else None
+            application = _application_label(props)
+            # A *stream* node's ``node.description`` is published by the
+            # application and routinely carries what is playing or which
+            # window has focus (VLC puts the track title there). The report
+            # and the picker carry the application's own name instead;
+            # titles are never read into listn.
+            if media_class_str and media_class_str.startswith("Stream/"):
+                description = application
+            else:
+                description = (str(props["node.description"])
+                               if props.get("node.description") else None)
             try:
                 node = Node(
                     id=int(obj.get("id", -1)),
                     name=str(name),
                     serial=int(serial) if serial is not None else None,
-                    media_class=str(media_class) if media_class else None,
-                    description=(str(props["node.description"]) if props.get("node.description") else None),
+                    media_class=media_class_str,
+                    description=description,
                     priority=int(priority) if priority is not None else None,
                     monitor_of=int(props["monitor.sink"]) if props.get("monitor.sink") is not None else None,
+                    application_name=application,
                 )
             except (TypeError, ValueError):
                 continue
@@ -297,18 +366,77 @@ def discover(runner=None, timeout: float = 10.0) -> Graph:
     return parse_graph(payload)
 
 
+def _matching_nodes(selector, graph: Graph) -> list[Node]:
+    """Every node the selector names, id first, then exact node name.
+
+    More than one match means the selector is ambiguous and the caller
+    must refuse: ``by_name`` used to return whichever node came first,
+    which is exactly the silent guess listn does not make.
+    """
+    if selector is None:
+        return []
+    if isinstance(selector, int) or str(selector).isdigit():
+        by_id = [n for n in graph.nodes if n.id == int(selector)]
+        if by_id:
+            return by_id
+    return [n for n in graph.nodes if n.name == str(selector)]
+
+
+def _ambiguous(selector, matches: list[Node]) -> CaptureError:
+    seen = ", ".join(sorted(f"{n.name} (id {n.id})" for n in matches))
+    return CaptureError(
+        f"'{selector}' names {len(matches)} PipeWire nodes: {seen}. A capture "
+        "target must be unambiguous; pick one by its node name.")
+
+
+def _unknown_selector(selector, graph: Graph, *, apps: bool = False) -> CaptureError:
+    available = ", ".join(sorted(n.name for n in graph.nodes if n.media_class)) or "none"
+    message = f"No PipeWire node named '{selector}'. Nodes seen: {available}."
+    if apps:
+        names = ", ".join(sorted(n.name for n in graph.app_streams)) or "none"
+        message += f" Application output streams: {names}."
+    return CaptureError(message)
+
+
 def _resolve(selector: str | None, graph: Graph) -> Node | None:
     if selector is None:
         return None
-    if isinstance(selector, int) or str(selector).isdigit():
-        node = graph.by_id(int(selector))
-        if node is not None:
-            return node
-    node = graph.by_name(str(selector))
-    if node is None:
-        available = ", ".join(sorted(n.name for n in graph.nodes if n.media_class)) or "none"
-        raise CaptureError(f"No PipeWire node named '{selector}'. Nodes seen: {available}.")
-    return node
+    matches = _matching_nodes(selector, graph)
+    if len(matches) > 1:
+        raise _ambiguous(selector, matches)
+    if matches:
+        return matches[0]
+    raise _unknown_selector(selector, graph)
+
+
+def _resolve_system(selector: str | None, graph: Graph) -> Node | None:
+    """Resolve an explicit *system-track* selector: a sink or one app stream.
+
+    A selector that is not a node name/id may still be an application's
+    own name; that match is taken only when exactly one output-producing
+    stream carries it, and refused as ambiguous when several do (one app
+    holding several streams is a common, real case).
+
+    A selector that matches nothing is refused. It is never replaced by
+    the session default sink: the caller asked for something specific and
+    gets a refusal, because a fallback would record a different, larger
+    mix of applications and report it as the requested capture.
+    """
+    if selector is None:
+        return None
+    matches = _matching_nodes(selector, graph)
+    if len(matches) > 1:
+        raise _ambiguous(selector, matches)
+    if matches:
+        return matches[0]
+    wanted = str(selector).lower()
+    by_app = [n for n in graph.app_streams
+              if n.application_name and n.application_name.lower() == wanted]
+    if len(by_app) > 1:
+        raise _ambiguous(selector, by_app)
+    if by_app:
+        return by_app[0]
+    raise _unknown_selector(selector, graph, apps=True)
 
 
 def _best(nodes: list[Node]) -> Node | None:
@@ -320,6 +448,17 @@ def _best(nodes: list[Node]) -> Node | None:
 def select_targets(graph: Graph, system: str | None = None, mic: str | None = None) -> Targets:
     """Choose the two capture targets, refusing to guess silently.
 
+    The system track resolves to an ``Audio/Sink`` (whole-sink mode: every
+    application's output plus system sounds, captured through the sink's
+    monitor ports) **or** to a single output-producing application stream
+    (``Stream/Output/Audio``: exactly that application, nothing else).
+    Which one the caller asked for is never guessed — an explicit selector
+    that matches nothing, matches several nodes, or names an input device
+    raises instead of falling back to the default sink.
+
+    Without a ``system`` selector the whole-sink default applies, which is
+    the documented "all applications" mode.
+
     The default source recorded by the session manager can point at a sink
     (observed with WirePlumber 0.5.8 on a machine without microphones), so
     every default is re-checked against the node's media class before use.
@@ -327,12 +466,13 @@ def select_targets(graph: Graph, system: str | None = None, mic: str | None = No
     sinks = graph.sinks
     sources = graph.sources
 
-    chosen = _resolve(system, graph)
+    chosen = _resolve_system(system, graph)
     if chosen is not None:
-        if not chosen.is_sink:
+        if chosen.is_sink or chosen.is_app_stream:
+            system_target = TrackTarget("system", TRACK_SYSTEM, chosen, "explicit")
+        else:
             raise CaptureError(f"System target '{chosen.name}' is a {chosen.media_class or 'unknown'} "
-                               "node, not an Audio/Sink.")
-        system_target = TrackTarget("system", TRACK_SYSTEM, chosen, "explicit")
+                               "node, not an Audio/Sink or an application output stream.")
     else:
         by_default = graph.by_name(graph.default_sink) if graph.default_sink else None
         if by_default is not None and by_default.is_sink and not by_default.is_monitor:
@@ -682,6 +822,12 @@ class TwoTrackRecorder:
                     # environment-dependent, so monitor capture is asked
                     # for unconditionally instead of relying on it.
                     argv += ["--properties", "stream.capture.sink=true"]
+                # An application stream (L1) gets no such property: it is
+                # tapped through its own output ports, no sink is involved,
+                # and asking for monitor capture would describe a target
+                # this track does not have. The application keeps playing
+                # to the sink anyway — one output port may carry several
+                # links — so this is a passive tap, never a reroute.
                 argv += [
                     "--rate", str(self.rate),
                     "--channels", str(track.channels),
@@ -867,9 +1013,7 @@ class TwoTrackRecorder:
                     last_probe = now
                     if not self.probe(track.target.node):
                         track.target_lost = True
-                        track.error = (f"target node '{track.target.node.name}' disappeared from "
-                                       "the PipeWire graph while recording; stopped this track "
-                                       "instead of recording another source")
+                        track.error = self._loss_message(track.target.node)
                         self._terminate(proc)
                 ready, _, _ = select.select([stdout], [], [], 0.2)
                 if not ready:
@@ -933,6 +1077,24 @@ class TwoTrackRecorder:
                 track.error += f": {tail}"
             return
         track.state = "stopped"
+
+    @staticmethod
+    def _loss_message(node: Node) -> str:
+        """Why a track stopped because its target left the graph.
+
+        An application stream that leaves the graph is the application
+        closing it (or going away). The track fails with that cause —
+        ``pw-record`` itself would keep running and silently re-target,
+        which is exactly what must not be reported as a capture of the
+        selected application.
+        """
+        if node.is_app_stream:
+            return (f"the application stream '{node.name}' closed while recording "
+                    "(its node left the PipeWire graph); stopped this track "
+                    "instead of recording another source")
+        return (f"target node '{node.name}' disappeared from "
+                "the PipeWire graph while recording; stopped this track "
+                "instead of recording another source")
 
     @staticmethod
     def _terminate(proc: subprocess.Popen) -> None:
@@ -1022,7 +1184,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", metavar="DIR",
                         help="Directory for system.wav/mic.wav (default: a fresh temp directory)")
     parser.add_argument("--system", metavar="NODE",
-                        help="System track target: PipeWire node name or id (default: session default sink)")
+                        help="System track target: PipeWire node name, id, or application name for "
+                             "one app's output stream (default: session default sink)")
     parser.add_argument("--mic", metavar="NODE",
                         help="Microphone target: PipeWire node name or id (default: session default source)")
     parser.add_argument("--rate", type=int, default=DEFAULT_RATE, metavar="HZ",
