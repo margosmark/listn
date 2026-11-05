@@ -1,0 +1,89 @@
+{
+  "description": "Both pw-record processes bound to one source (the measured real-hardware fallback): both tracks fail with the measured cause, even though each per-track verdict looks ok.",
+  "expect": {
+    "ok": false,
+    "failed_tracks": [
+      "mic",
+      "system"
+    ]
+  },
+  "report": {
+    "ok": false,
+    "out_dir": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/identical",
+    "rate": 48000,
+    "targets": {
+      "system": {
+        "id": 32,
+        "serial": 32,
+        "name": "sys.fallback",
+        "media_class": "Audio/Sink",
+        "description": null,
+        "track": "system",
+        "selection": "default"
+      },
+      "mic": {
+        "id": 34,
+        "serial": 34,
+        "name": "mic.fallback",
+        "media_class": "Audio/Source",
+        "description": null,
+        "track": "mic",
+        "selection": "default"
+      }
+    },
+    "tracks": {
+      "system": {
+        "track": "system",
+        "track_id": 0,
+        "target": {
+          "id": 32,
+          "serial": 32,
+          "name": "sys.fallback",
+          "media_class": "Audio/Sink",
+          "description": null,
+          "track": "system",
+          "selection": "default"
+        },
+        "state": "failed",
+        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/identical/system.wav",
+        "duration": 3.2,
+        "samplerate": 48000,
+        "channels": 1,
+        "frames": 153600,
+        "rms_db": -12.5,
+        "peak_db": -9.5,
+        "fs_fraction": 0.0,
+        "verdict": "ok",
+        "error": "system and mic tracks are identical: corr=1.000000, 100.0% of 148800 samples match",
+        "exit_code": 1,
+        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/identical/system.pw-record.log"
+      },
+      "mic": {
+        "track": "mic",
+        "track_id": 1,
+        "target": {
+          "id": 34,
+          "serial": 34,
+          "name": "mic.fallback",
+          "media_class": "Audio/Source",
+          "description": null,
+          "track": "mic",
+          "selection": "default"
+        },
+        "state": "failed",
+        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/identical/mic.wav",
+        "duration": 3.1,
+        "samplerate": 48000,
+        "channels": 1,
+        "frames": 148800,
+        "rms_db": -12.5,
+        "peak_db": -9.5,
+        "fs_fraction": 0.0,
+        "verdict": "ok",
+        "error": "system and mic tracks are identical: corr=1.000000, 100.0% of 148800 samples match",
+        "exit_code": 1,
+        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/identical/mic.pw-record.log"
+      }
+    }
+  }
+}
