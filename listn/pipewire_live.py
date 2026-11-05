@@ -26,6 +26,7 @@ machine; no network, no telemetry.
 
 from __future__ import annotations
 
+import queue
 import shutil
 import tempfile
 import threading
@@ -33,13 +34,21 @@ import time
 from pathlib import Path
 
 from listn.config import Settings, data_dir
+from listn.device_lifecycle import (CAUSE_NODE_LOST, CAUSE_PROCESS_EXIT,
+                                    DeviceLifecycle)
 from listn.ipc import TRACK_MIC, TRACK_SYSTEM
-from listn.pipewire import DEFAULT_RATE, CaptureError, TwoTrackRecorder, discover, select_targets
+from listn.pipewire import (DEFAULT_RATE, CaptureError, Graph,
+                            TwoTrackRecorder, discover, select_targets)
 
 TRACK_NAMES = {TRACK_SYSTEM: "system", TRACK_MIC: "mic"}
 TRACK_ORDER = ("system", "mic")
 MONITOR_INTERVAL = 1.0
+# How often the graph itself is re-read while capturing: hotplug, a
+# replugged device, a changed session default and a daemon that went away
+# are all only visible in a fresh ``pw-dump``.
+GRAPH_WATCH_INTERVAL = 2.0
 PIPEWIRE_DIR_NAME = "pipewire"
+STREAM_MEDIA_CLASS = "Stream/Output/Audio"
 
 
 def tools_missing() -> list[str]:
@@ -105,6 +114,16 @@ class PipeWireLive:
         self._stop_lock = threading.Lock()
         self._frames: dict[str, int] = {"system": 0, "mic": 0}
         self._dead_reported: set[str] = set()
+        self._device_noted: set[str] = set()
+        self._last_graph: Graph | None = None
+        self.lifecycle = DeviceLifecycle(stream_alive=self._stream_alive)
+        # Armed from the first instant the object exists: the status may be
+        # read between construction and the recorder's start, and it must
+        # never disagree with the capture's own activity flag.
+        self.lifecycle.start({})
+        bus = getattr(engine, "bus", None)
+        self._events = bus.subscribe() if bus is not None else None
+        self._graph_due = 0.0
         self._watcher = threading.Thread(
             target=self._watch, name="listn-pw-watch", daemon=True)
         self._watcher.start()
@@ -112,6 +131,14 @@ class PipeWireLive:
     @property
     def targets(self):
         return self.recorder.targets if self.recorder is not None else None
+
+    def _stream_alive(self, name: str) -> bool:
+        """True only when this track really has a live ``pw-record``."""
+        track = getattr(self.recorder, "_tracks", {}).get(name) \
+            if self.recorder is not None else None
+        if track is None or track.proc is None:
+            return False
+        return track.state == "recording" and track.proc.poll() is None
 
     # -- audio seam ---------------------------------------------------------
 
@@ -176,6 +203,7 @@ class PipeWireLive:
             "rate": self.rate,
             "targets": self.targets.to_dict() if self.targets is not None else None,
             "tracks": tracks,
+            "devices": self.lifecycle.status(),
             "report": self.report,
         }
 
@@ -189,10 +217,27 @@ class PipeWireLive:
         """
         with self._stop_lock:
             self.active = False
+            report = None
             if self.recorder is not None and self.recorder.state != "idle" \
                     and self.report is None:
-                self.report = self.recorder.stop()
+                report = self.recorder.stop()
+            # The final report is the last word on each track: fold its
+            # verdicts/causes in and retire the lifecycle *before* the
+            # report is published, so a status can never claim "stopped"
+            # while the device block still says the capture is running.
+            # A partial (node-lost) track keeps its cause after the stop.
+            self.lifecycle.observe_report(report if report is not None
+                                          else self.report)
+            self.lifecycle.stop()
+            if report is not None:
+                self.report = report
             meta = self.engine.stop_live(wait=wait)
+        if self._events is not None:
+            try:
+                self.engine.bus.unsubscribe(self._events)
+            except Exception:
+                pass
+            self._events = None
         return {"id": meta.id if meta is not None else None,
                 "pipewire": self.report}
 
@@ -207,12 +252,101 @@ class PipeWireLive:
         except Exception:
             pass  # a status event must never break the capture
 
+    def _drain_bus(self) -> None:
+        """Fold engine events (silence verdicts) into the device state."""
+        events = self._events
+        if events is None:
+            return
+        while True:
+            try:
+                event = events.get_nowait()
+            except queue.Empty:
+                return
+            except Exception:
+                self._events = None
+                return
+            if isinstance(event, dict) and event.get("type") == "live.silent":
+                track = event.get("track")
+                if track in TRACK_ORDER:
+                    self.lifecycle.observe_signal(track, True)
+
+    def _observe_devices(self) -> None:
+        """Read the graph (or its failure) for hotplug/default/daemon state."""
+        try:
+            graph = discover()
+        except Exception as exc:  # missing tool, daemon down, bad payload
+            self.lifecycle.observe_graph(None, error=str(exc))
+            self._last_graph = None
+            return
+        self._last_graph = graph
+        self.lifecycle.observe_graph({
+            "sinks": [n.to_dict() for n in graph.sinks],
+            "sources": [n.to_dict() for n in graph.sources],
+            "streams": [n.to_dict() for n in graph.nodes
+                        if n.media_class == STREAM_MEDIA_CLASS],
+            "defaults": {"sink": graph.default_sink,
+                         "source": graph.default_source},
+        })
+
+    def _note_dead_tracks(self) -> None:
+        """Tell the lifecycle why a track's stream is gone (once each)."""
+        for name in TRACK_ORDER:
+            if name in self._device_noted:
+                continue
+            state, error = self._track_state(name)
+            if state != "failed":
+                continue
+            self._device_noted.add(name)
+            track = getattr(self.recorder, "_tracks", {}).get(name)
+            cause = CAUSE_NODE_LOST if getattr(track, "target_lost", False) \
+                else CAUSE_PROCESS_EXIT
+            self.lifecycle.note_stream_dead(name, cause, error)
+
+    def replace_track(self, track: str, node_name: str) -> dict:
+        """Resume a dead track on the node the user explicitly chose.
+
+        L7's only retarget path: the graph is re-read, the lifecycle
+        validates the request (right kind, not the sibling's target,
+        recovery budget, no second stream, sibling still recording) and
+        only then does the recorder spawn the replacement. Any refusal
+        raises :class:`CaptureError` with the reason — nothing is
+        retried or substituted automatically.
+        """
+        if track not in TRACK_ORDER:
+            raise CaptureError(f"Unknown track '{track}'.")
+        self._observe_devices()
+        decision = self.lifecycle.begin_replacement(track, node_name)
+        if not decision["ok"]:
+            raise CaptureError(decision["reason"])
+        node = self._last_graph.by_name(node_name) if self._last_graph else None
+        if node is None:
+            self.lifecycle.note_recovery_failed(
+                track, f"'{node_name}' is not in the PipeWire graph.")
+            raise CaptureError(f"'{node_name}' is not in the PipeWire graph.")
+        if self.recorder is None:
+            self.lifecycle.note_recovery_failed(track, "no recorder is attached.")
+            raise CaptureError("No recorder is attached to this capture.")
+        try:
+            self.recorder.replace_track(track, node)
+        except CaptureError as exc:
+            self.lifecycle.note_recovery_failed(track, str(exc))
+            raise
+        self.lifecycle.commit_replacement(track, node.name)
+        # It may die again: allow the next death to be noted and reported.
+        self._device_noted.discard(track)
+        self._dead_reported.discard(track)
+        return self.status()
+
     def _watch(self) -> None:
         """Surface capture failures truthfully instead of recording on.
 
         * A track that dies on its own (``pw-record`` exited, target node
           vanished) is reported once via ``live.error`` while the other
           track keeps going — the recorder already failed that track.
+        * The graph itself is re-read while capturing so a hotplugged or
+          replugged device, a changed session default and a daemon that
+          went away show up as explicit device state (never as a silent
+          re-target).
         * When every track is dead, or the engine session ended first,
           the capture is stopped so the UI never shows "recording" for a
           dead pipeline, and the stored session carries the real cause.
@@ -221,6 +355,12 @@ class PipeWireLive:
             time.sleep(MONITOR_INTERVAL)
             if not self.active:
                 return
+            self._drain_bus()
+            now = time.monotonic()
+            if now >= self._graph_due:
+                self._graph_due = now + GRAPH_WATCH_INTERVAL
+                self._observe_devices()
+            self._note_dead_tracks()
             if self.session is None:
                 continue
             if not self.engine.live_active():
@@ -290,14 +430,17 @@ def start_live(engine, settings: Settings, system: str | None, mic: str | None,
         recorder.start()
     except CaptureError:
         # Nothing else was started; do not leave an empty run directory behind.
+        capture.lifecycle.stop()
         capture.active = False
         shutil.rmtree(out_dir, ignore_errors=True)
         raise
+    capture.lifecycle.start(targets.to_dict())
     try:
         session = engine.start_ingest(
             settings, {"source": "system", "mic": True}, title)
     except Exception:
         recorder.stop()  # finalize whatever was captured before failing
+        capture.lifecycle.stop()
         capture.active = False
         raise
     source_name = (f"PipeWire · {targets.system.node.name} "
