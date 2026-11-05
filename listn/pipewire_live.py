@@ -32,6 +32,7 @@ import threading
 import time
 from pathlib import Path
 
+from listn.capture_contract import KIND_APP, source_kind
 from listn.config import Settings, data_dir
 from listn.ipc import TRACK_MIC, TRACK_SYSTEM
 from listn.pipewire import DEFAULT_RATE, CaptureError, TwoTrackRecorder, discover, select_targets
@@ -52,14 +53,20 @@ def discover_devices(runner=None) -> dict:
 
     Always returns a report — ``available`` is false with a readable
     ``error`` when the tools or the graph are unusable, and ``usable``
-    says whether an ``Audio/Sink`` / ``Audio/Source`` pair exists at all.
-    Nothing here selects a target.
+    says whether each track has something to point at.
+
+    ``apps`` lists the output-producing application streams
+    (``Stream/Output/Audio``): each is an alternative to the whole sink
+    for the *system* track, so ``usable.system`` is true when either a
+    sink or at least one application stream exists. Nothing here selects a
+    target.
     """
     missing = tools_missing()
     base = {
         "available": not missing,
         "sinks": [],
         "sources": [],
+        "apps": [],
         "defaults": {"sink": None, "source": None},
         "usable": {"system": False, "mic": False},
         "error": None,
@@ -79,8 +86,10 @@ def discover_devices(runner=None) -> dict:
         return base
     base["sinks"] = [n.to_dict() for n in graph.sinks]
     base["sources"] = [n.to_dict() for n in graph.sources]
+    base["apps"] = [n.to_dict() for n in graph.app_streams]
     base["defaults"] = {"sink": graph.default_sink, "source": graph.default_source}
-    base["usable"] = {"system": bool(base["sinks"]), "mic": bool(base["sources"])}
+    base["usable"] = {"system": bool(base["sinks"]) or bool(base["apps"]),
+                      "mic": bool(base["sources"])}
     if not base["usable"]["system"] or not base["usable"]["mic"]:
         missing_kinds = [k for k in ("system", "mic") if not base["usable"][k]]
         base["error"] = (
@@ -293,15 +302,25 @@ def start_live(engine, settings: Settings, system: str | None, mic: str | None,
         capture.active = False
         shutil.rmtree(out_dir, ignore_errors=True)
         raise
+    # The ingest source enum already reserves "app"; L1 declares it when the
+    # system track points at one application's stream, so the stored session
+    # says which *kind* of source this was. The label is the application's
+    # own name (never a window or media title) — the user-visible selection.
+    system_node = targets.system.node
+    if source_kind(targets.system.to_dict()) == KIND_APP:
+        app_label = system_node.description or system_node.name
+        source = {"source": "app", "app_name": app_label, "mic": True}
+        source_name = f"PipeWire · {app_label} + {targets.mic.node.name}"
+    else:
+        source = {"source": "system", "mic": True}
+        source_name = (f"PipeWire · {system_node.name} "
+                       f"+ {targets.mic.node.name}")
     try:
-        session = engine.start_ingest(
-            settings, {"source": "system", "mic": True}, title)
+        session = engine.start_ingest(settings, source, title)
     except Exception:
         recorder.stop()  # finalize whatever was captured before failing
         capture.active = False
         raise
-    source_name = (f"PipeWire · {targets.system.node.name} "
-                   f"+ {targets.mic.node.name}")
     session.meta.source_name = source_name
     info = dict(session.device_info or {})
     info["name"] = source_name
