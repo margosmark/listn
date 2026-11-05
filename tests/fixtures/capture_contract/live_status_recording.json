@@ -1,0 +1,49 @@
+{
+  "description": "GET /api/live -> pipewire while capturing: both tracks recording, no final report yet. There is no paused variant of this object.",
+  "expect": {
+    "state": "recording"
+  },
+  "status": {
+    "active": true,
+    "state": "recording",
+    "out_dir": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok",
+    "rate": 48000,
+    "targets": {
+      "system": {
+        "id": 32,
+        "serial": 32,
+        "name": "sys.tone",
+        "media_class": "Audio/Sink",
+        "description": "Built-in Audio Analog Stereo",
+        "track": "system",
+        "selection": "default"
+      },
+      "mic": {
+        "id": 34,
+        "serial": 34,
+        "name": "mic.tone",
+        "media_class": "Audio/Source",
+        "description": "USB Microphone",
+        "track": "mic",
+        "selection": "default"
+      }
+    },
+    "tracks": {
+      "system": {
+        "state": "recording",
+        "frames": 139200,
+        "seconds": 2.9,
+        "error": null,
+        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/system.wav"
+      },
+      "mic": {
+        "state": "recording",
+        "frames": 144000,
+        "seconds": 3.0,
+        "error": null,
+        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/mic.wav"
+      }
+    },
+    "report": null
+  }
+}
