@@ -113,8 +113,19 @@ TRACK_KEYS = ("track", "track_id", "target", "state", "file", "duration",
               "samplerate", "channels", "frames", "rms_db", "peak_db",
               "fs_fraction", "verdict", "error", "exit_code", "log")
 LIVE_STATUS_KEYS = ("active", "state", "out_dir", "rate", "targets", "tracks",
-                    "report")
+                    "devices", "report")
 LIVE_TRACK_STATUS_KEYS = ("state", "frames", "seconds", "error", "file")
+# L7 device lifecycle: the additive ``devices`` block of the live status.
+# The state/cause/event *strings* are produced by ``listn.device_lifecycle``
+# (validated below); these are the shapes they must have.
+LIVE_DEVICES_KEYS = ("active", "tracks", "defaults", "events", "retargets")
+LIVE_DEVICE_TRACK_KEYS = ("state", "cause", "node", "media_class", "signal",
+                          "reconnectable", "recovery_attempts",
+                          "max_recovery_attempts", "replacement_candidates",
+                          "detail")
+LIVE_DEVICE_DEFAULT_KEYS = ("observed", "remembered")
+DEVICE_EVENT_KEYS = ("t", "kind", "track", "node", "detail")
+DEVICE_CANDIDATE_KEYS = ("name", "media_class", "description")
 
 
 # ---------------------------------------------------------------------------
@@ -462,7 +473,119 @@ def validate_live_status(status) -> list[str]:
         file_path = track["file"]
         if file_path is not None and not isinstance(file_path, str):
             violations.append(f"{prefix}.file: must be a path string or null")
+    violations += _validate_devices(status.get("devices"), state)
     if isinstance(report, dict):
         violations += [f"status.report.{item}" if not item.startswith("report")
                        else item for item in validate_report(report)]
+    return violations
+
+
+def _validate_devices(devices, state: str) -> list[str]:
+    """Check the L7 ``devices`` block: shape, vocabulary, coherence.
+
+    The state/cause/event strings come from the producer
+    (``listn.device_lifecycle``), imported lazily so the contract module
+    stays importable on its own and no import cycle is created.
+    """
+    from listn import device_lifecycle as dl
+    if not isinstance(devices, dict):
+        return ["status.devices: must be an object"]
+    missing = [key for key in LIVE_DEVICES_KEYS if key not in devices]
+    if missing:
+        return [f"status.devices: missing keys {missing}"]
+    violations: list[str] = []
+    active = devices["active"]
+    if not isinstance(active, bool):
+        violations.append("status.devices.active: must be a bool")
+    # Coherence with the capture itself: a finished capture must not keep
+    # claiming live device tracking, and a recording one must be tracking.
+    if state in ("stopped", "failed") and active is not False:
+        violations.append(
+            f"status.devices.active: must be false once the capture is {state}")
+    if state == "recording" and active is not True:
+        violations.append(
+            "status.devices.active: must be true while the capture is recording")
+    tracks = devices["tracks"]
+    if not isinstance(tracks, dict):
+        violations.append("status.devices.tracks: must be an object")
+        tracks = {}
+    for name in TRACK_ORDER:
+        if name not in tracks:
+            violations.append(f"status.devices.tracks: missing {name!r}")
+    for name, track in tracks.items():
+        if not isinstance(track, dict):
+            violations.append(f"status.devices.tracks.{name}: must be an object")
+            continue
+        prefix = f"status.devices.tracks.{name}"
+        missing = [key for key in LIVE_DEVICE_TRACK_KEYS if key not in track]
+        if missing:
+            violations.append(f"{prefix}: missing keys {missing}")
+            continue
+        if track["state"] not in dl.DEVICE_STATES:
+            violations.append(
+                f"{prefix}.state: {track['state']!r} not in {dl.DEVICE_STATES}")
+        if track["cause"] not in dl.DEVICE_CAUSES:
+            violations.append(
+                f"{prefix}.cause: {track['cause']!r} not in the device causes")
+        signal = track["signal"]
+        if signal is not None and signal not in VERDICTS:
+            violations.append(
+                f"{prefix}.signal: {signal!r} not in {VERDICTS} or null")
+        if not isinstance(track["reconnectable"], bool):
+            violations.append(f"{prefix}.reconnectable: must be a bool")
+        attempts = track["recovery_attempts"]
+        budget = track["max_recovery_attempts"]
+        for key, value in (("recovery_attempts", attempts),
+                           ("max_recovery_attempts", budget)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                violations.append(f"{prefix}.{key}: must be a non-negative int")
+        if isinstance(attempts, int) and isinstance(budget, int) \
+                and isinstance(attempts, bool) is False and attempts > budget:
+            violations.append(f"{prefix}.recovery_attempts: exceeds the budget")
+        candidates = track["replacement_candidates"]
+        if not isinstance(candidates, list):
+            violations.append(f"{prefix}.replacement_candidates: must be a list")
+        else:
+            for candidate in candidates:
+                if not isinstance(candidate, dict) or any(
+                        key not in candidate for key in DEVICE_CANDIDATE_KEYS):
+                    violations.append(
+                        f"{prefix}.replacement_candidates: every entry needs "
+                        f"{DEVICE_CANDIDATE_KEYS}")
+                    break
+    defaults = devices["defaults"]
+    if not isinstance(defaults, dict):
+        violations.append("status.devices.defaults: must be an object")
+    else:
+        missing = [key for key in LIVE_DEVICE_DEFAULT_KEYS if key not in defaults]
+        if missing:
+            violations.append(f"status.devices.defaults: missing keys {missing}")
+        else:
+            for kind, value in defaults.items():
+                if value is not None and not isinstance(value, dict):
+                    violations.append(
+                        f"status.devices.defaults.{kind}: must be an object or null")
+    events = devices["events"]
+    if not isinstance(events, list):
+        violations.append("status.devices.events: must be a list")
+    else:
+        for event in events:
+            if not isinstance(event, dict) or any(
+                    key not in event for key in DEVICE_EVENT_KEYS):
+                violations.append(
+                    f"status.devices.events: every event needs {DEVICE_EVENT_KEYS}")
+                break
+            if event["kind"] not in dl.DEVICE_EVENT_KINDS:
+                violations.append(
+                    f"status.devices.events: unknown kind {event['kind']!r}")
+                break
+            if event["track"] is not None and event["track"] not in TRACK_ORDER:
+                violations.append(
+                    "status.devices.events: event track must be a track name "
+                    "or null")
+                break
+    retargets = devices["retargets"]
+    if not isinstance(retargets, int) or isinstance(retargets, bool) \
+            or retargets < 0:
+        violations.append("status.devices.retargets: must be a non-negative int")
     return violations

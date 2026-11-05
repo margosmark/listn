@@ -225,6 +225,7 @@ is attached yet.
 | `POST /api/live/start` | Both targets required (400 with the refusal reason); 409 when a recording already runs; nothing starts on refusal |
 | `GET /api/live` | `pipewire` object = live status (§6), `report` null until stopped |
 | `POST /api/live/stop` | Response `pipewire` = the final report (§3) |
+| `POST /api/live/replace` | **L7, user-initiated only:** resume a failed track on a chosen node; 400 with the refusal reason (wrong kind, sibling's target, unknown node, second stream, budget spent), 409 when nothing records or the session is paused |
 | `listn record --json` | Exit 0 = `ok`, 1 = report not ok, 2 = bad argument, 3 = unavailable/refused (nothing started) |
 
 ## 8. Extension points
@@ -242,10 +243,15 @@ change requiring doc + module + fixtures in one commit.
   may be session metadata only as the user-visible selection. Whole-sink
   mode (`sink_monitor`) remains fully supported.
 * **L7 (device lifecycle):** node loss already fails the affected track
-  (§5). L7 may add *additive* fields (e.g. a machine-readable `cause` on a
-  track, device state in the live status) by extending the key tuples in
-  `capture_contract.py` and this doc together; it may not introduce silent
-  retargeting, a paused capture state, or a looser `ok`.
+  (§5); L7 has now landed as the additive `devices` block of the live
+  status (`LIVE_DEVICES_KEYS`, `LIVE_DEVICE_TRACK_KEYS`,
+  `LIVE_DEVICE_DEFAULT_KEYS`, `DEVICE_EVENT_KEYS`), validated by
+  `validate_live_status`. It introduces no silent retargeting, no paused
+  capture state and no looser `ok`: `devices.retargets` counts only
+  explicit user replacements and stays `0` for every automatic event, and
+  a replacement is refused (400/409 with the reason) rather than guessed.
+  Behaviour, refusal codes and the open Plasma hardware gate are in
+  [LINUX_DEVICE_LIFECYCLE](LINUX_DEVICE_LIFECYCLE.md).
 * **Changing any key set:** update `REPORT_KEYS` / `TRACK_KEYS` /
   `TARGET_KEYS` / `LIVE_*`, this document, and the fixtures in the same
   commit — `tests/test_capture_contract.py` compares them byte-for-byte
