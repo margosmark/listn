@@ -107,6 +107,40 @@ management script on Linux. GPU acceleration is unverified; MLX-based
 notes are unavailable and the existing extractive fallback is used. See
 [operations](docs/OPERATIONS.md) for validation steps.
 
+### Speaker labels and known voices (Linux)
+
+The diarization and known-voice code is shared Python, so Linux uses the same
+rules and the same tests as macOS:
+
+- **CPU, no GPU assumed.** The speaker model is placed on MPS only when Apple
+  Silicon is present; otherwise it runs on the CPU, and a failure on another
+  device retries on the CPU.
+- **Offline after the cache.** `uv sync --extra diarize` installs the
+  dependency. The pyannote pipeline is a gated model, so nothing is downloaded
+  until you add a Hugging Face token and label a session; Settings shows
+  *ready* and *will download once* as separate facts, and every later load reads
+  the local cache with the hub offline. No token, no cache, or a refused model
+  each produce their own message — never a silent no-op.
+- **The transcript never depends on it.** Without the extra, the token, or the
+  model, a recording still finishes with its transcript; the session is marked
+  *skipped* with the reason and can be labelled later.
+- **Enrolment reads the Others track only.** Naming or correcting a speaker
+  slices the speaker-isolated system track. A session that only has the
+  microphone track is refused with that reason rather than learned from, and
+  **Me** is never a voice to learn. A recording imported as a single track has
+  no isolated track, so its own audio is what a correction slices.
+- **Ambiguous stays generic.** A voice print is used only when it clears the
+  threshold *and* leads the next profile; otherwise the line keeps its
+  `Speaker N` label.
+- **The profiles are yours.** They live in `$XDG_DATA_HOME/listn/speakers`
+  (or `~/.local/share/listn/speakers`). Settings lists them with *Forget*
+  (profile and clips removed) and *Export voice prints (JSON)* — the numbers
+  only, no audio and no local paths.
+
+This is qualified by the automated suite with synthetic audio and stub models.
+Actual CPU inference with a cached pyannote model has **not** been run on this
+machine: the model is gated and has not been downloaded here.
+
 ### Desktop integration (Linux): menu entry, login, and the Arch package
 
 Everything here is user scope: files land under `$XDG_DATA_HOME` and

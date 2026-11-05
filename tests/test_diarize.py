@@ -264,6 +264,65 @@ def test_readiness_explains_each_state(monkeypatch):
     assert "https://huggingface.co/pyannote/speaker-diarization-community-1" in cached["terms"]
 
 
+def test_a_missing_model_never_opens_a_socket_without_a_token(fake_stack, monkeypatch):
+    """No token means no download attempt: the failure has to happen locally."""
+    import socket
+
+    monkeypatch.setattr(diarize, "_from_pretrained",
+                        lambda model_id, token: (_ for _ in ()).throw(FileNotFoundError("not cached")))
+    touched: list = []
+
+    def connect(self, *args, **kwargs):
+        touched.append(args)
+        raise AssertionError("the network was touched")
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket, "create_connection", lambda *a, **k: touched.append(a))
+    diarize.readiness(None)
+    with pytest.raises(diarize.DiarizationUnavailable):
+        diarize.load_pipeline(None)
+    assert touched == []
+    assert hub.hub_offline()
+
+
+def test_readiness_describes_this_machine_and_separates_the_download(monkeypatch):
+    """Readiness ("can label now") and "will download on first use" are different facts."""
+    diarize.reset()
+    monkeypatch.setattr(diarize, "installed", lambda: True)
+    monkeypatch.setattr(diarize, "cached_pipeline", lambda: None)
+
+    with_token = diarize.readiness("tok")
+    assert with_token["ready"] and with_token["needs_download"]
+    assert "downloads once" in with_token["message"]
+
+    no_token = diarize.readiness(None)
+    assert not no_token["ready"] and not no_token["needs_download"]
+    assert "Hugging Face token" in no_token["message"]
+
+    monkeypatch.setattr(diarize, "cached_pipeline", lambda: diarize.COMMUNITY_ID)
+    cached = diarize.readiness(None)
+    assert cached["ready"] and not cached["needs_download"] and "offline" in cached["message"]
+
+    for state in (with_token, no_token, cached):
+        assert "Mac" not in state["message"], state["message"]
+
+
+def test_the_speaker_model_runs_on_the_cpu_unless_apple_silicon_is_there(monkeypatch):
+    import sys
+    import types
+
+    cpu_only = types.SimpleNamespace(backends=types.SimpleNamespace(),
+                                     device=lambda name: types.SimpleNamespace(type=name))
+    monkeypatch.setitem(sys.modules, "torch", cpu_only)
+    assert diarize.pick_device().type == "cpu"
+
+    mps = types.SimpleNamespace(type="mps", is_available=lambda: True)
+    monkeypatch.setitem(sys.modules, "torch",
+                        types.SimpleNamespace(backends=types.SimpleNamespace(mps=mps),
+                                              device=lambda name: types.SimpleNamespace(type=name)))
+    assert diarize.pick_device().type == "mps"
+
+
 def test_pyannote_telemetry_is_forced_off(monkeypatch):
     monkeypatch.setenv("PYANNOTE_METRICS_ENABLED", "1")
     diarize.telemetry_off()

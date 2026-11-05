@@ -241,6 +241,24 @@ def test_turned_on_without_a_model_the_recording_says_why(data_dir, fake_factory
     assert engine._live_finished(session) is False
 
 
+def test_the_transcript_is_kept_when_the_diarize_extra_is_missing(data_dir, fake_factory, stack, monkeypatch):
+    """No speaker model, no labels — and no damage to the recording that was made."""
+    monkeypatch.setattr(diarize, "installed", lambda: False)
+    engine = _engine(fake_factory)
+    sid = _call(engine.library)
+    before = engine.library.segments(sid)
+    session = SimpleNamespace(meta=engine.library.get(sid), segments=before,
+                              settings=Settings(diarize_after=True, summarize_after=False))
+    q = engine.bus.subscribe()
+    assert engine._live_finished(session) is False
+    event = q.get(timeout=5)
+    assert event["type"] == "speakers.skipped" and "diarize extra" in event["message"]
+    meta = engine.library.get(sid)
+    assert meta.speaker_state == "skipped" and "diarize extra" in (meta.speaker_note or "")
+    assert meta.status == "done"
+    assert engine.library.segments(sid) == before
+
+
 def test_diarize_after_follows_the_token_unless_set(monkeypatch):
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.setattr(diarize, "installed", lambda: True)
