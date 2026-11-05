@@ -155,6 +155,10 @@ def no_cuda_by_default(monkeypatch):
 
 
 def _build(model="small", **kwargs):
+    # These tests inspect the constructed model in-process (device knobs,
+    # caching, status lines). The process boundary itself — including
+    # native crashes — is covered in tests/test_isolation.py.
+    kwargs.setdefault("isolate", False)
     return tr.get_transcriber(model, "faster-whisper", **kwargs)
 
 
