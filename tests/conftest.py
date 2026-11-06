@@ -147,9 +147,17 @@ def fake_factory():
 
 @pytest.fixture(autouse=True)
 def no_local_llm(monkeypatch):
-    """Never load a real MLX model in tests; tests pass a fake ``complete``."""
+    """Never load a real MLX model in tests; tests pass a fake ``complete``.
+
+    The env override also pins every ``Settings.load()`` in the suite to the
+    extractive backend, so a machine with an operator's Ollama endpoint
+    configured can never make listn's test run call it: a test that wants the
+    Ollama path builds its own ``Settings`` (or clears the override) and talks
+    to a local fake server.
+    """
     import listn.ask
     import listn.summary
 
     monkeypatch.setattr(listn.summary, "mlx_lm_available", lambda: False)
     monkeypatch.setattr(listn.ask, "mlx_lm_available", lambda: False)
+    monkeypatch.setenv("LISTN_LLM_BACKEND", "extractive")

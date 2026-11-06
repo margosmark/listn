@@ -8,13 +8,13 @@ import re
 from listn.config import Settings
 from listn.index import SearchIndex
 from listn.library import fmt_clock
-from listn.llm import mlx_lm_available
+from listn.llm import mlx_lm_available, notes_backend
 
 
 def _complete(prompt: str, settings: Settings) -> str:
     from listn.llm import generate
 
-    return generate(prompt, settings.llm_model, max_tokens=500)
+    return generate(prompt, settings.llm_model, max_tokens=500, settings=settings)
 
 
 def _parse_answer(raw: str) -> tuple[str, list[int]] | None:
@@ -64,7 +64,7 @@ def ask(index: SearchIndex, question: str, settings: Settings | None = None, com
         f"Question: {question}\n\n" + "\n".join(lines)
     )
     runner = complete
-    if runner is None and mlx_lm_available():
+    if runner is None and notes_backend(settings, mlx_available=mlx_lm_available()) is not None:
         runner = lambda text: _complete(text, settings)  # noqa: E731
     parsed = None
     if runner is not None:

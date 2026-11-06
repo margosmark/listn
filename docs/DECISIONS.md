@@ -27,3 +27,12 @@ Mark requested Linux desktop support focused on KDE, and raised the idea of a da
 - Maintain macOS behavior, local privacy boundaries, private data permissions, explicit errors and pause semantics.
 - Show what is running, what is unavailable and what needs action; avoid claiming feature parity or GPU performance without evidence.
 - Document model downloads, hardware requirements and any feature differences. Do not introduce cloud processing or telemetry without approval.
+
+## Generative notes on Linux: an Ollama endpoint, not a local runtime (2026-11-05)
+
+Mark decided the L4 question: listn uses the Ollama service he already runs (`http://10.10.10.6:11434`, tag `qwen3.8:27b`) instead of embedding llama.cpp and instead of acquiring the pinned Qwen3-8B-GGUF weights. Consequences:
+
+- listn ships no weights and installs no runtime. It is an HTTP client of one operator-configured endpoint (`llm_ollama_url` / `LISTN_OLLAMA_URL`), and configuring that endpoint is the opt-in. No endpoint → extractive notes and no outbound connection.
+- The gate's "zero outbound connections during generation" and "≤9 GB peak RSS / unload ≤300 s" conditions were rewritten for a service listn does not own; the deviations and the measured numbers live in [55-linux-generative-notes-backend](55-linux-generative-notes-backend.md) (150.9 s for a 599-token single-chunk note at 4.8 tok/s, listn-side peak RSS 23.7 MiB).
+- Extractive stays the default and the fallback, labelled `extractive`, and macOS MLX behaviour is unchanged.
+- Open, not measured: a multi-chunk meeting on this endpoint would be several requests at 4.8 tok/s and is expected to exceed the 180 s envelope. No quality or parity claim is made until QA measures it.
