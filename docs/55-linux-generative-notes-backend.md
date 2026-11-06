@@ -35,6 +35,23 @@
 
 Stated because the margin is thin: 150.9 s is a *single-chunk* note over a 517-character transcript. A meeting longer than `SINGLE_PASS_CHARS` issues one request per chunk plus a reduce call, so multi-chunk wall time is **not measured** and would be expected to exceed 180 s at this speed. The feature therefore stays opt-in and no parity or performance claim is made.
 
+### QA acceptance findings (2026-11-05/06, `t_2bb863cd` on PR #23): timeout, cold-start fallback, multi-chunk (F1/F2)
+
+- **Client budget:** `OLLAMA_TIMEOUT_SECONDS = 180.0` (`listn/llm.py`) applies to one `/api/chat` request via `opener.open(request, timeout=...)`. It is deliberately the same number as the gate's ≤180 s envelope — pinned, with no headroom for a model load.
+- **Keep-alive / cold path:** listn sends no `keep_alive`, so the server default applies — observed twice at **5 min** (`expires_at` = last use + 5 m, e.g. `2026-11-06T03:24:20Z` for a 22:19:20 use). Any note after ≥5 idle minutes pays a model load first (the load itself is fast, ~17 s: resident again 17 s after a cold run started).
+- **Cold fallback (F1), measured on this box, product path unmodified:**
+
+  | run | model state at start | wall | result |
+  |---|---|---|---|
+  | 22:04:46 (probe C) | cold (last use 21:40 → unload) | **180.1 s** | `TimeoutError` → `backend: extractive`, transcript intact |
+  | 22:16:20 (probe D, `D0` asserts resident=False) | cold, verified unloaded | **180.1 s** | `TimeoutError` → `backend: extractive`, transcript intact |
+  | 22:08:25 (probe C re-run) | resident | **165.0 s** | `backend: ollama`, 1149 prompt / 783 generated, 4.8 tok/s |
+
+- **Token-count dependency:** at the measured 4.8 tok/s a ~900-token note needs ~163 s of pure generation, so load + prompt eval + generation lands at ~185 s for the 783-token fixture — over budget — while the implementer's smaller 599-token fixture fits at 150.9 s warm. Wall time scales with generated tokens; the envelope has no room for a cold load on a long note.
+- **Safe degradation:** the cold path is not a privacy or honesty defect — the timeout surfaces as `OllamaError`, `summary.build_notes` falls back to extractive notes labelled `backend: "extractive"`, the transcript is intact, and no transcript text reaches the logs.
+- **Open owner question:** whether `OLLAMA_TIMEOUT_SECONDS` stays pinned to the gate's envelope or carries headroom (e.g. envelope + load allowance) is an owner decision, not an implementer one. Headroom trades slower worst-case notes for fewer silent cold fallbacks.
+- **Multi-chunk (F2), explicitly unassessed:** per criterion 4 no pass is recorded for multi-chunk meetings. At this speed an N-chunk meeting is N requests plus a reduce call, so end-to-end time is unbounded by any 180 s envelope. The single-chunk figures above must not be read as covering it; evidence in `t_2bb863cd` attachments (`probe_c.out`, `probe_c_warm.out`, `probe_d.out`, `probe_c_measurements.json`, `probe_d_measurements.json`).
+
 ### Deviations from the gate, forced by the owner decision
 
 1. "Zero outbound connections during generation" → **no connections except the single configured endpoint** (endpoint validation plus a socket-egress test; zero connections when no endpoint is configured).
