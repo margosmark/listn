@@ -16,9 +16,9 @@
 | `llm_ollama_url` (`LISTN_OLLAMA_URL`) | bare `http(s)://host[:port]` origin. Empty by default — that emptiness *is* the opt-in gate. |
 | `llm_ollama_model` (`LISTN_OLLAMA_MODEL`) | the tag served there, e.g. `qwen3.8:27b`. |
 
-- Seam: `listn.llm.generate(..., settings=..., backend=...)`, chosen by `listn.llm.notes_backend` in `summary.build_notes` and `ask`. The request is `POST <origin>/api/chat` with `stream:false`, `think:false` (Qwen3 thinking otherwise spends the note budget on a private reasoning field and can leave `content` empty) and `options.num_predict` set to the note budget. Proxies are bypassed so a stray `HTTP_PROXY` cannot reroute a transcript.
+- Seam: `listn.llm.generate(..., settings=..., backend=...)`, chosen by `listn.llm.notes_backend` in `summary.build_notes` and `ask`. The request is `POST <origin>/api/chat` with `stream:false`, `think:false` (Qwen3 thinking otherwise spends the note budget on a private reasoning field and can leave `content` empty) and `options.num_predict` set to the note budget. Proxies are bypassed so a stray `HTTP_PROXY` cannot reroute a transcript, and redirects are never followed: a 3xx is answered as an `OllamaError` with its status, so the allowlisted origin stays the only endpoint listn ever contacts (security review F1).
 - Honest labels: notes report `backend:"ollama"` and `model:<tag>` only when that run really used it. Every failure path returns the extractive notes labelled `backend:"extractive"` — never blank, never mislabelled.
-- Fallback matrix, test-covered: connection refused, HTTP 5xx, non-JSON body, empty `content`, timeout, unparseable model reply → extractive output with the transcript intact.
+- Fallback matrix, test-covered: connection refused, HTTP 5xx, refused 3xx redirect, non-JSON body, empty `content`, timeout, unparseable model reply → extractive output with the transcript intact.
 - Privacy: logs carry token counts and durations only; `OllamaError` carries origin + HTTP status only.
 
 ### Measured (2026-11-05, against Mark's service, single-pass fixture note)

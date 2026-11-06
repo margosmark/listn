@@ -85,6 +85,41 @@ class OllamaError(RuntimeError):
     """
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect: the allowlist is the one configured origin.
+
+    A 301/302/303 followed off that origin would contact a second endpoint
+    and accept its body as the operator's notes while still labelling them
+    ``ollama/<model>`` (security review F1, egress check 2).
+    ``redirect_request`` returning ``None`` makes the 3xx surface as an
+    ``HTTPError`` carrying its status instead of being followed.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _redacted_origin(raw) -> str:
+    """``scheme://host[:port]`` of a rejected value, for an error message.
+
+    Credentials, path, query and fragment are dropped on purpose: these
+    messages surface in ``SettingsError`` and in logs, so a rejected URL is
+    never echoed in full (security review N1).
+    """
+    parts = urllib.parse.urlsplit(str(raw or "").strip())
+    if not parts.scheme:
+        return "no scheme"
+    if not parts.hostname:
+        return f"{parts.scheme}://"
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    try:
+        port = parts.port
+    except ValueError:
+        return f"{parts.scheme}://{host}"
+    origin = f"{parts.scheme}://{host}"
+    return f"{origin}:{port}" if port else origin
+
+
 def validate_ollama_url(raw) -> str:
     """Return the bare ``scheme://host[:port]`` origin of an Ollama endpoint.
 
@@ -99,9 +134,9 @@ def validate_ollama_url(raw) -> str:
     if parts.scheme not in ("http", "https"):
         raise ValueError(
             "llm_ollama_url must be an http(s) origin such as "
-            f"http://10.10.10.6:11434 - got {raw!r}")
+            f"http://10.10.10.6:11434 - got {_redacted_origin(raw)}")
     if not parts.hostname:
-        raise ValueError(f"llm_ollama_url has no host - got {raw!r}")
+        raise ValueError(f"llm_ollama_url has no host - got {_redacted_origin(raw)}")
     if parts.username or parts.password:
         raise ValueError("llm_ollama_url must not contain credentials")
     if parts.query or parts.fragment:
@@ -179,12 +214,26 @@ def ollama_generate(prompt: str, model: str, url: str, max_tokens: int = 900,
     started = time.time()
     # Proxies are bypassed on purpose: this is a direct request to the
     # operator's own endpoint, and a stray HTTP_PROXY must not reroute the
-    # transcript through a third party.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    # transcript through a third party. _NoRedirect (F1) is installed
+    # alongside: a redirect is answered, never followed, so the allowlisted
+    # origin stays the only one listn ever talks to.
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _NoRedirect())
     try:
         with opener.open(request, timeout=timeout) as response:
+            # Second gate (F1): only the allowlisted origin's own URL may
+            # be read, and it is read before the body is parsed, so a body
+            # from anywhere else can never become notes.
+            if response.geturl() != origin + "/api/chat":
+                raise OllamaError(
+                    f"Ollama at {origin} answered from a different URL; "
+                    "listn follows no redirects (single allowlisted origin)")
             body = json.load(response)
     except urllib.error.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            raise OllamaError(
+                f"Ollama at {origin} answered HTTP {exc.code} (redirect refused: "
+                "only the allowlisted origin may answer)") from None
         raise OllamaError(f"Ollama at {origin} answered HTTP {exc.code}") from None
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise OllamaError(f"Ollama at {origin} is unreachable ({type(exc).__name__})") from None

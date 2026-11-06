@@ -57,18 +57,33 @@ def fake_ollama():
 
     def start(responder):
         class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):  # noqa: N802
+            def _reply(self, method):
                 length = int(self.headers.get("Content-Length") or 0)
-                request = {"path": self.path, "body": self.rfile.read(length),
+                request = {"path": self.path, "method": method,
+                           "body": self.rfile.read(length),
                            "headers": dict(self.headers)}
                 self.server.requests.append(request)
-                status, payload = responder(request)
+                # ``(status, payload)`` or ``(status, payload, {header: value})``
+                # - the 302 regression test needs a Location header.
+                reply = responder(request)
+                status, payload = reply[0], reply[1]
+                extra = reply[2] if len(reply) > 2 else {}
                 raw = payload if isinstance(payload, (bytes, bytearray)) else json.dumps(payload).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(raw)))
+                for key, value in extra.items():
+                    self.send_header(key, value)
                 self.end_headers()
                 self.wfile.write(raw)
+
+            def do_POST(self):  # noqa: N802
+                self._reply("POST")
+
+            def do_GET(self):  # noqa: N802
+                # urllib follows a 302 with a bodyless GET, so a followed
+                # redirect must be recorded here as a hit on this origin.
+                self._reply("GET")
 
             def log_message(self, *args):  # keep pytest output clean
                 pass
@@ -119,6 +134,16 @@ def test_validate_ollama_url_normalises_a_bare_origin():
 def test_validate_ollama_url_refuses_anything_but_a_bare_http_origin(bad):
     with pytest.raises(ValueError):
         llm.validate_ollama_url(bad)
+
+
+def test_validation_errors_never_echo_credentials():
+    """N1: a rejected URL surfaces in SettingsError without its secrets."""
+    for bad in ("ftp://user:secret@10.10.10.6:11434",
+                "http://user:secret@",
+                "1user:secret@10.10.10.6"):
+        with pytest.raises(SettingsError) as caught:
+            Settings(llm_ollama_url=bad).validated()
+        assert "secret" not in str(caught.value), "credentials leaked into a settings error"
 
 
 def test_settings_reject_an_unknown_backend():
@@ -296,6 +321,54 @@ def test_generation_only_touches_the_configured_endpoint(data_dir, fake_ollama, 
     for address in targets:
         assert address[0] in ("127.0.0.1", "::1"), f"unexpected egress to {address}"
         assert address[1] == port, f"unexpected egress to {address}"
+
+
+def test_a_302_is_refused_before_a_second_origin_is_contacted(fake_ollama, monkeypatch):
+    """F1 regression: a redirect off the allowlisted origin is answered,
+    never followed, and the redirect target's body is never read."""
+    # The redirect target would answer with perfectly valid notes if contacted.
+    target_url, target_server = fake_ollama(good_response)
+    url, server = fake_ollama(
+        lambda request: (302, {"error": "moved"}, {"Location": target_url + "/api/chat"}))
+    target_port = int(target_url.rsplit(":", 1)[1])
+    connects = []
+    real_connect = socket.socket.connect
+
+    def spy(sock, address):
+        connects.append(address)
+        return real_connect(sock, address)
+
+    monkeypatch.setattr(socket.socket, "connect", spy)
+
+    with pytest.raises(llm.OllamaError) as caught:
+        llm.ollama_generate("SECRET_PROMPT_TEXT", MARK_MODEL, url)
+
+    message = str(caught.value)
+    assert url in message, "the error must name the allowlisted origin"
+    assert "302" in message, "the error must carry the HTTP status"
+    assert "SECRET_PROMPT_TEXT" not in message, "the prompt leaked into the error"
+    assert GOOD_REPLY["summary"] not in message, "output text leaked into the error"
+    assert server.requests and server.requests[0]["path"] == "/api/chat", (
+        "the allowlisted origin must receive the chat request")
+    assert target_server.requests == [], "the redirect target must never be asked for anything"
+    assert all(address[1] != target_port for address in connects), (
+        f"no socket may open to the redirect target {target_url}")
+
+
+def test_notes_never_come_from_a_redirect_target(data_dir, fake_ollama):
+    """F1 regression end to end: a refused redirect falls back to extractive
+    notes and the target's body never becomes generated notes."""
+    target_url, target_server = fake_ollama(good_response)
+    url, _server = fake_ollama(
+        lambda request: (302, {}, {"Location": target_url + "/api/chat"}))
+    lib = Library()
+    meta = _meeting(lib)
+    notes = build_notes(lib.segments(meta.id), meta.speakers, settings=settings_for(url))
+    assert notes["backend"] == "extractive", "a refused redirect must never be labelled ollama"
+    assert notes["summary"] != GOOD_REPLY["summary"]
+    assert GOOD_REPLY["summary"] not in json.dumps(notes), (
+        "the redirect target's body must not become notes")
+    assert target_server.requests == []
 
 
 def test_without_an_endpoint_no_connection_is_made(data_dir, monkeypatch):
