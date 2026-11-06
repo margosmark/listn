@@ -37,7 +37,7 @@ from dataclasses import dataclass
 
 from listn.config import Settings
 from listn.library import Library, Segment
-from listn.llm import DEFAULT_LLM, generate, mlx_lm_available
+from listn.llm import DEFAULT_LLM, generate, mlx_lm_available, notes_backend
 
 log = logging.getLogger("listn")
 
@@ -720,16 +720,39 @@ def build_notes(
     speakers: dict | None,
     model_id: str = DEFAULT_LLM,
     complete: Callable[[str], str] | None = None,
+    settings=None,
 ) -> dict:
-    """Notes for one transcript. ``complete`` overrides the MLX call (tests)."""
+    """Notes for one transcript. ``complete`` overrides the backend call (tests).
+
+    The generative path is chosen from ``settings``: MLX when the machine has
+    it, the operator's Ollama endpoint when one is configured, otherwise the
+    extractive notes below - which are always returned labelled
+    ``backend: "extractive"`` and never as generated.
+    """
     fallback = extractive_notes(segments, speakers)
     turns = build_turns(segments, speakers)
     if not turns:
         return fallback
     runner = complete
-    if runner is None and mlx_lm_available():
-        def runner(prompt: str) -> str:
-            return generate(prompt, model_id, max_tokens=NOTES_MAX_TOKENS, system=SYSTEM_PROMPT)
+    backend = "model" if runner is not None else None
+    reported_model = model_id
+    if runner is None:
+        chosen = notes_backend(settings, mlx_available=mlx_lm_available())
+        if chosen == "ollama":
+            if settings is None:
+                settings = Settings.load()
+            # The notes must name the backend and model that actually ran, not
+            # the MLX id this machine never loaded.
+            reported_model = str(getattr(settings, "llm_ollama_model", "") or "") or model_id
+
+            def runner(prompt: str) -> str:
+                return generate(prompt, model_id, max_tokens=NOTES_MAX_TOKENS,
+                                system=SYSTEM_PROMPT, settings=settings, backend="ollama")
+            backend = "ollama"
+        elif chosen == "mlx":
+            def runner(prompt: str) -> str:
+                return generate(prompt, model_id, max_tokens=NOTES_MAX_TOKENS, system=SYSTEM_PROMPT)
+            backend = "mlx"
     if runner is None:
         return fallback
     started = time.time()
@@ -751,8 +774,8 @@ def build_notes(
         "decision_items": notes["decision_items"],
         "actions": notes["actions"],
         "open_questions": notes["open_questions"],
-        "model": model_id,
-        "backend": "mlx" if complete is None else "model",
+        "model": reported_model,
+        "backend": backend or "extractive",
         "edited": False,
         "version": NOTES_VERSION,
         "chunks": notes.get("chunks", 1),
@@ -772,7 +795,7 @@ def write_notes(library: Library, session_id: str, settings: Settings,
         if existing and existing.get("edited"):
             log.info("Keeping edited notes for %s", session_id)
             return existing
-    notes = build_notes(library.segments(session_id), meta.speakers, settings.llm_model, complete)
+    notes = build_notes(library.segments(session_id), meta.speakers, settings.llm_model, complete, settings=settings)
     library.save_notes(session_id, notes)
     return notes
 

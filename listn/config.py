@@ -25,7 +25,7 @@ import sys
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
-from listn.llm import DEFAULT_LLM
+from listn.llm import DEFAULT_LLM, LLM_BACKENDS, validate_ollama_url
 
 MODELS = ["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"]
 BACKENDS = ["auto", "faster-whisper", "mlx", "openai-whisper"]
@@ -121,6 +121,19 @@ class Settings:
     diarize_after: bool | None = None
     hf_token: str | None = None
     llm_model: str = DEFAULT_LLM
+    # Notes backend on this machine: "auto" (MLX when installed, otherwise the
+    # Ollama endpoint below, otherwise extractive), "mlx", "ollama" or
+    # "extractive".
+    llm_backend: str = "auto"
+    # Opt-in endpoint of an ALREADY RUNNING Ollama service, e.g.
+    # http://10.10.10.6:11434, together with the tag served there, e.g.
+    # qwen3.8:27b. Empty by default: without MLX and without an endpoint,
+    # listn writes extractive notes and makes no outbound connection. Setting
+    # the URL is the opt-in - listn still never downloads weights, never runs
+    # `ollama pull` and never installs a runtime; it is an HTTP client of that
+    # one endpoint and nothing else.
+    llm_ollama_url: str = ""
+    llm_ollama_model: str = ""
     summarize_after: bool = True
     offer_meetings: bool = True
     auto_record_meetings: bool = False
@@ -158,7 +171,10 @@ class Settings:
         """``LISTN_*`` environment variables win over settings.json."""
         for var, attr in (("LISTN_COMPUTE_TYPE", "compute_type"),
                           ("LISTN_CPU_THREADS", "cpu_threads"),
-                          ("LISTN_BEAM_SIZE", "beam_size")):
+                          ("LISTN_BEAM_SIZE", "beam_size"),
+                          ("LISTN_LLM_BACKEND", "llm_backend"),
+                          ("LISTN_OLLAMA_URL", "llm_ollama_url"),
+                          ("LISTN_OLLAMA_MODEL", "llm_ollama_model")):
             raw = os.environ.get(var)
             if raw is not None and raw.strip():
                 setattr(self, attr, raw.strip())
@@ -208,6 +224,24 @@ class Settings:
         self.device = self.device or None
         self.hf_token = (self.hf_token or "").strip() or None
         self.llm_model = (self.llm_model or DEFAULT_LLM).strip()[:200] or DEFAULT_LLM
+        # The notes backend fails loudly like compute_type: a typo'd backend or
+        # an endpoint listn refuses to talk to must not silently turn into
+        # "no generative notes" and look like a working feature.
+        self.llm_backend = str(self.llm_backend or "auto").strip().lower() or "auto"
+        if self.llm_backend not in LLM_BACKENDS:
+            raise SettingsError(
+                f"llm_backend must be one of {', '.join(LLM_BACKENDS)} — "
+                f"got {self.llm_backend!r}.")
+        try:
+            self.llm_ollama_url = validate_ollama_url(self.llm_ollama_url)
+        except ValueError as exc:
+            raise SettingsError(str(exc)) from None
+        self.llm_ollama_model = str(self.llm_ollama_model or "").strip()[:200]
+        if self.llm_backend == "ollama" and not (self.llm_ollama_url and self.llm_ollama_model):
+            raise SettingsError(
+                "llm_backend=ollama needs both llm_ollama_url "
+                "(e.g. http://10.10.10.6:11434) and llm_ollama_model "
+                "(e.g. qwen3.8:27b).")
         self.summarize_after = bool(self.summarize_after)
         self.offer_meetings = bool(self.offer_meetings)
         self.auto_record_meetings = bool(self.auto_record_meetings)
