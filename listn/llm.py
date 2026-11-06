@@ -25,11 +25,15 @@ drops it after a few idle minutes.
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import os
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 from listn.hub import load_local_or_download
@@ -47,6 +51,18 @@ RECOMMENDED_LLMS = {
 
 IDLE_UNLOAD_SECONDS = 300.0
 
+# The notes backends. ``auto`` resolves to MLX when it is installed (macOS,
+# unchanged), otherwise the operator's Ollama endpoint when one is configured,
+# otherwise nothing at all - listn then writes extractive notes. Selecting
+# ``ollama`` or configuring ``llm_ollama_url`` is the opt-in; with neither,
+# listn makes no outbound connection for notes.
+LLM_BACKENDS = ("auto", "mlx", "ollama", "extractive")
+
+# One HTTP request to an existing Ollama service. listn holds no model of its
+# own on this path: loading and unloading the weights is the Ollama host's
+# job, so there is nothing to unload here.
+OLLAMA_TIMEOUT_SECONDS = 180.0
+
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="listn-llm")
 _state: dict = {"repo": None, "model": None, "tokenizer": None, "last": 0.0, "stream_ready": False}
 _timer_lock = threading.Lock()
@@ -59,6 +75,135 @@ def mlx_lm_available() -> bool:
         return importlib.util.find_spec("mlx_lm") is not None
     except (ImportError, ValueError):
         return False
+
+
+class OllamaError(RuntimeError):
+    """An Ollama request failed.
+
+    Carries no prompt, transcript or model output on purpose: this message is
+    what reaches the log when a notes run falls back.
+    """
+
+
+def validate_ollama_url(raw) -> str:
+    """Return the bare ``scheme://host[:port]`` origin of an Ollama endpoint.
+
+    Configuration is the allowlist: listn talks to exactly one endpoint the
+    operator wrote down, and only over plain HTTP(S) as a bare origin - no
+    credentials, path or query. Anything else raises ``ValueError``.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    parts = urllib.parse.urlsplit(text)
+    if parts.scheme not in ("http", "https"):
+        raise ValueError(
+            "llm_ollama_url must be an http(s) origin such as "
+            f"http://10.10.10.6:11434 - got {raw!r}")
+    if not parts.hostname:
+        raise ValueError(f"llm_ollama_url has no host - got {raw!r}")
+    if parts.username or parts.password:
+        raise ValueError("llm_ollama_url must not contain credentials")
+    if parts.query or parts.fragment:
+        raise ValueError("llm_ollama_url must be a bare origin (no query or fragment)")
+    if parts.path.strip("/"):
+        raise ValueError(f"llm_ollama_url must be the bare origin, not a path - got {raw!r}")
+    try:
+        port = parts.port
+    except ValueError:
+        raise ValueError(f"llm_ollama_url has an invalid port - got {raw!r}") from None
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    origin = f"{parts.scheme}://{host}"
+    return f"{origin}:{port}" if port else origin
+
+
+def notes_backend(settings=None, *, mlx_available: bool | None = None) -> str | None:
+    """Which generative backend this machine has: ``"mlx"``, ``"ollama"`` or ``None``.
+
+    ``None`` means no generative backend is available or wanted, and callers
+    must use the extractive notes in ``listn.summary``.
+    """
+    if settings is None:
+        from listn.config import Settings
+
+        settings = Settings.load()
+    if mlx_available is None:
+        mlx_available = mlx_lm_available()
+    choice = str(getattr(settings, "llm_backend", "auto") or "auto").strip().lower()
+    endpoint = str(getattr(settings, "llm_ollama_url", "") or "").strip()
+    model = str(getattr(settings, "llm_ollama_model", "") or "").strip()
+    ollama = "ollama" if (endpoint and model) else None
+    if choice == "extractive":
+        return None
+    if choice == "mlx":
+        return "mlx" if mlx_available else None
+    if choice == "ollama":
+        return ollama
+    return "mlx" if mlx_available else ollama
+
+
+def ollama_generate(prompt: str, model: str, url: str, max_tokens: int = 900,
+                    system: str | None = None, temperature: float = 0.0,
+                    timeout: float | None = None) -> str:
+    """One chat request to an existing Ollama service. Raises ``OllamaError``.
+
+    ``think`` is disabled on purpose: Qwen3-class models otherwise spend most
+    of the reply on a private reasoning field, which burns the note budget and
+    can leave ``content`` empty. listn never pulls a model and never installs a
+    runtime - the weights live on the Ollama host and listn is an HTTP client.
+
+    Only numbers are logged. The prompt, the transcript and the reply
+    never appear in a log line or an exception message.
+    """
+    timeout = OLLAMA_TIMEOUT_SECONDS if timeout is None else float(timeout)
+    origin = validate_ollama_url(url)
+    if not origin:
+        raise OllamaError("no Ollama endpoint configured (llm_ollama_url is empty)")
+    if not str(model or "").strip():
+        raise OllamaError("no Ollama model configured (llm_ollama_model is empty)")
+    messages = [{"role": "system", "content": system}] if system else []
+    messages.append({"role": "user", "content": prompt})
+    payload = {
+        "model": str(model),
+        "messages": messages,
+        "stream": False,
+        "think": False,
+        "options": {"num_predict": int(max_tokens), "temperature": float(temperature)},
+    }
+    request = urllib.request.Request(
+        origin + "/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    started = time.time()
+    # Proxies are bypassed on purpose: this is a direct request to the
+    # operator's own endpoint, and a stray HTTP_PROXY must not reroute the
+    # transcript through a third party.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            body = json.load(response)
+    except urllib.error.HTTPError as exc:
+        raise OllamaError(f"Ollama at {origin} answered HTTP {exc.code}") from None
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise OllamaError(f"Ollama at {origin} is unreachable ({type(exc).__name__})") from None
+    except ValueError:
+        raise OllamaError(f"Ollama at {origin} answered with a body that is not JSON") from None
+    elapsed = time.time() - started
+    message = body.get("message") if isinstance(body, dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, str) or not content.strip():
+        raise OllamaError(f"Ollama at {origin} returned an empty reply")
+    generated = body.get("eval_count") or 0
+    eval_seconds = (body.get("eval_duration") or 0) / 1e9
+    if generated and eval_seconds > 0:
+        log.info("ollama: %s prompt tokens, %s generated at %.1f tok/s (%.1fs request)",
+                 body.get("prompt_eval_count"), generated, generated / eval_seconds, elapsed)
+    else:
+        log.info("ollama: %s prompt tokens, %s generated (%.1fs request)",
+                 body.get("prompt_eval_count"), generated, elapsed)
+    return content
 
 
 def _snapshot(repo: str) -> str:
@@ -165,9 +310,33 @@ def _run(prompt: str, repo: str, max_tokens: int, system: str | None, temperatur
         _state["last"] = time.time()
 
 
+def _load_settings():
+    from listn.config import Settings
+
+    return Settings.load()
+
+
 def generate(prompt: str, model_id: str = DEFAULT_LLM, max_tokens: int = 900,
-             system: str | None = None, temperature: float = 0.0) -> str:
-    """Run one prompt on a local MLX model. Raises if MLX is not installed."""
+             system: str | None = None, temperature: float = 0.0,
+             *, settings=None, backend: str | None = None) -> str:
+    """Run one prompt on the machine's local notes backend.
+
+    With ``backend="ollama"`` (or ``settings`` whose ``llm_backend`` resolves to
+    Ollama) the prompt goes to the operator's Ollama endpoint as one HTTP
+    request. Otherwise it runs on the local MLX model exactly as before - which
+    is what raises when MLX is not installed, so callers keep their extractive
+    fallback.
+    """
+    if backend is None and settings is not None:
+        backend = notes_backend(settings)
+    if backend == "ollama":
+        settings = settings or _load_settings()
+        return ollama_generate(
+            prompt,
+            str(getattr(settings, "llm_ollama_model", "") or ""),
+            str(getattr(settings, "llm_ollama_url", "") or ""),
+            max_tokens=max_tokens, system=system, temperature=temperature,
+        )
     repo = (model_id or DEFAULT_LLM).strip()
     try:
         return _executor.submit(_run, prompt, repo, max_tokens, system, temperature).result()

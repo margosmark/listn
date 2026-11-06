@@ -1,6 +1,45 @@
 # Linux generative notes backend: options and decision
 
-**Status:** decision brief; no Linux generative backend has been implemented or measured. Checked 2026-10-30.
+**Status:** decision made and implemented (Ollama), measured against Mark's own service on 2026-11-05. The options brief below is kept as the reasoning that preceded the decision; its llama.cpp recommendation is superseded.
+
+## Decision (Mark, 2026-11-05): use the Ollama service he already runs
+
+- Endpoint `http://10.10.10.6:11434`, model tag `qwen3.8:27b` — 27.3 B parameters, Q4_K_M, 17,741,872,154 B, digest `aaee06c39dcf2437cde036998d960e1fc1494b8191be7cc9657d01e509097813`, as reported by `GET /api/tags`.
+- listn ships no weights, installs no runtime and never runs `ollama pull`: it is an HTTP client of that one endpoint, and the model's licence is Mark's to have checked on his own host.
+- This supersedes the llama.cpp/`llama-cpp-python` recommendation below, the pinned Qwen3-8B-GGUF acquisition plan, and the gate's "zero outbound connections" wording (deviations listed at the end).
+
+### What shipped
+
+| Setting (env override) | Meaning |
+|---|---|
+| `llm_backend` (`LISTN_LLM_BACKEND`) | `auto` (default) = MLX when installed → Ollama when an endpoint is configured → extractive. `ollama` / `mlx` force one and fail loudly at settings load if incomplete; `extractive` forces the old behaviour. |
+| `llm_ollama_url` (`LISTN_OLLAMA_URL`) | bare `http(s)://host[:port]` origin. Empty by default — that emptiness *is* the opt-in gate. |
+| `llm_ollama_model` (`LISTN_OLLAMA_MODEL`) | the tag served there, e.g. `qwen3.8:27b`. |
+
+- Seam: `listn.llm.generate(..., settings=..., backend=...)`, chosen by `listn.llm.notes_backend` in `summary.build_notes` and `ask`. The request is `POST <origin>/api/chat` with `stream:false`, `think:false` (Qwen3 thinking otherwise spends the note budget on a private reasoning field and can leave `content` empty) and `options.num_predict` set to the note budget. Proxies are bypassed so a stray `HTTP_PROXY` cannot reroute a transcript.
+- Honest labels: notes report `backend:"ollama"` and `model:<tag>` only when that run really used it. Every failure path returns the extractive notes labelled `backend:"extractive"` — never blank, never mislabelled.
+- Fallback matrix, test-covered: connection refused, HTTP 5xx, non-JSON body, empty `content`, timeout, unparseable model reply → extractive output with the transcript intact.
+- Privacy: logs carry token counts and durations only; `OllamaError` carries origin + HTTP status only.
+
+### Measured (2026-11-05, against Mark's service, single-pass fixture note)
+
+| Metric | Measured |
+|---|---|
+| Result | `backend: ollama`, `model: qwen3.8:27b`, 1 chunk, grounded actions/decisions |
+| Prompt / generated tokens | 983 / 599 |
+| Generation speed | 4.8 tok/s (listn's own log line) |
+| Wall time | 150.9 s — inside the gate's ≤180 s, but with little headroom |
+| listn-process peak RSS | 23.7 MiB (HTTP client only) |
+| Model-side RSS | not measured: the weights live on the Ollama host, which listn does not own |
+| Unreachable endpoint | falls back to `backend: extractive` with the transcript intact, no transcript text in logs |
+
+Stated because the margin is thin: 150.9 s is a *single-chunk* note over a 517-character transcript. A meeting longer than `SINGLE_PASS_CHARS` issues one request per chunk plus a reduce call, so multi-chunk wall time is **not measured** and would be expected to exceed 180 s at this speed. The feature therefore stays opt-in and no parity or performance claim is made.
+
+### Deviations from the gate, forced by the owner decision
+
+1. "Zero outbound connections during generation" → **no connections except the single configured endpoint** (endpoint validation plus a socket-egress test; zero connections when no endpoint is configured).
+2. "≤9 GB peak RSS, unload ≤300 s" described a model process listn would have owned. With Ollama, listn-side peak RSS is measured instead (23.7 MiB) and unload is the Ollama host's own idle policy.
+3. Offline weight checksum/allowlist is moot: listn obtains no weights. The endpoint string itself is the allowlist — bare origin, no credentials, path or query, no proxy.
 
 ## Recommendation at a glance
 
