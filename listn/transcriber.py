@@ -15,6 +15,7 @@ only when ``HF_TOKEN`` is unset.
 
 from __future__ import annotations
 
+import logging
 import platform
 import re
 import sys
@@ -27,6 +28,8 @@ import numpy as np
 from listn.audio import TARGET_RATE, rms
 from listn.hub import load_local_or_download
 
+log = logging.getLogger(__name__)
+
 MLX_REPOS = {
     "tiny": "mlx-community/whisper-tiny-mlx",
     "base": "mlx-community/whisper-base-mlx",
@@ -37,6 +40,36 @@ MLX_REPOS = {
 }
 
 SPEECH_RMS_GATE = 0.003
+
+CPU_FALLBACK_MESSAGE = "CUDA libraries unavailable — transcribing on CPU"
+
+# CTranslate2 names the library it could not load when a GPU is visible but the
+# CUDA user-space libraries are absent (libcublas.so.12 on a default CachyOS).
+_CUDA_ERROR_MARKERS = ("cuda", "cublas", "dnn", "nccl")
+
+
+def _is_cuda_unavailable(exc: BaseException) -> bool:
+    """True for the CUDA-library RuntimeErrors worth recovering from on CPU."""
+    if not isinstance(exc, RuntimeError):
+        return False
+    message = str(exc).lower()
+    return any(marker in message for marker in _CUDA_ERROR_MARKERS)
+
+
+def _cuda_device_count() -> int:
+    """``ctranslate2.get_cuda_device_count()``, or -1 when the probe fails.
+
+    Only settles the obvious case: a count of 0 means ``device="auto"`` can
+    resolve to nothing but CPU, so a CUDA-shaped error has no CPU rebuild to
+    offer. A count above 0 proves nothing about the libraries — the broken
+    laptop reports 1 with none installed — so the real gate is the error
+    itself, raised at op time.
+    """
+    try:
+        import ctranslate2
+        return int(ctranslate2.get_cuda_device_count())
+    except Exception:
+        return -1
 
 _ALWAYS_HALLUCINATED = {
     "thanks for watching", "thank you for watching", "thanks for watching and please subscribe",
@@ -105,6 +138,14 @@ def available_backends() -> dict[str, bool]:
 
 class Transcriber:
     backend = "base"
+    # The device the model is actually built for; only faster-whisper sets it
+    # ("auto" as configured, "cpu" after a CUDA-library fallback). Others keep
+    # the default and are keyed without a device.
+    device: str | None = None
+    # Set by a backend that had to abandon its configured device (the CPU
+    # rebuild after CUDA libraries turned out to be unusable). Shown as the
+    # job's stage so the fallback is visible instead of silent.
+    status_note: str | None = None
 
     def __init__(self, model: str):
         self.model_name = model
@@ -147,36 +188,89 @@ class FasterWhisper(Transcriber):
         # Defaults are byte-identical to the old hard-coded call: device auto,
         # int8, and no cpu_threads passed (CTranslate2 picks its own count).
         self.beam_size = beam_size
+        # The device this model is actually built for: "auto" unless
+        # CTranslate2 can only be CPU (no GPU visible), or the CUDA libraries
+        # failed and we rebuilt on CPU. The cache keys on it so a fallback
+        # build is never served as if it were the configured one.
+        self.device = "auto" if _cuda_device_count() != 0 else "cpu"
+        # ``download`` is get_transcriber's status callback: it reports the
+        # one-time model download and the CPU fallback alike.
+        self._status = download
         kwargs: dict = dict(device="auto", compute_type=compute_type)
         if cpu_threads:
             kwargs["cpu_threads"] = int(cpu_threads)
+        self._model_kwargs = kwargs
 
         def cached():
-            return WhisperModel(model, local_files_only=True, **kwargs)
+            try:
+                return WhisperModel(model, local_files_only=True, **self._model_kwargs)
+            except RuntimeError as exc:
+                # The weights are local and the rebuild below is local-only,
+                # so recovering here can never turn into a download attempt
+                # by load_local_or_download.
+                if self.device == "cpu" or not _is_cuda_unavailable(exc):
+                    raise
+                log.warning("Model build on CUDA failed (%s); rebuilding on CPU", exc)
+                return self._rebuild_on_cpu()
 
         def fetched():
-            return WhisperModel(model, **kwargs)
+            return WhisperModel(model, **self._model_kwargs)
 
         self._model = load_local_or_download(
             cached,
             fetched,
             on_download=(lambda: download(f"Downloading Whisper '{model}' (one time)...")) if download else None,
         )
+        if self.status_note:
+            self._announce_fallback()
+
+    def _rebuild_on_cpu(self):
+        """Rebuild once on CPU after a CUDA-library failure; never loops.
+
+        compute_type stays as configured (int8 is valid on CPU) and the
+        weights are already on disk, so this load is local-only.
+        """
+        from faster_whisper import WhisperModel
+        self.device = "cpu"
+        self.status_note = CPU_FALLBACK_MESSAGE
+        self._model_kwargs["device"] = "cpu"
+        self._model = WhisperModel(self.model_name, local_files_only=True, **self._model_kwargs)
+        return self._model
+
+    def _announce_fallback(self) -> None:
+        """Tell the status callback (UI/tray) why transcription moved to CPU."""
+        if self.status_note and self._status:
+            self._status(self.status_note)
 
     def segments(self, audio, language=None, prompt=None, vad=True, hotwords=None):
-        kwargs = dict(
+        kwargs: dict = dict(
             language=language, initial_prompt=prompt, vad_filter=vad,
             beam_size=self.beam_size, condition_on_previous_text=False,
         )
         if hotwords:
             kwargs["hotwords"] = hotwords
-        try:
-            segs, _info = self._model.transcribe(audio, **kwargs)
-        except TypeError:
-            kwargs.pop("hotwords", None)
-            segs, _info = self._model.transcribe(audio, **kwargs)
-        for s in segs:
-            yield RawSegment(s.start, s.end, s.text, getattr(s, "no_speech_prob", 0.0))
+        yielded = 0
+        while True:
+            try:
+                try:
+                    segs, _info = self._model.transcribe(audio, **kwargs)
+                except TypeError:
+                    kwargs.pop("hotwords", None)
+                    segs, _info = self._model.transcribe(audio, **kwargs)
+                for s in segs:
+                    yielded += 1
+                    yield RawSegment(s.start, s.end, s.text, getattr(s, "no_speech_prob", 0.0))
+                return
+            except RuntimeError as exc:
+                # One CPU rebuild per model, and only before the first segment
+                # went out (restarting mid-stream would repeat it). A second
+                # CUDA-shaped error — or anything else — propagates instead
+                # of looping.
+                if self.device == "cpu" or yielded or not _is_cuda_unavailable(exc):
+                    raise
+                log.warning("Transcription on CUDA failed (%s); rebuilding on CPU", exc)
+                self._rebuild_on_cpu()
+                self._announce_fallback()
 
 
 class _WindowedBackend(Transcriber):
@@ -249,8 +343,9 @@ class OpenAIWhisper(_WindowedBackend):
 
 
 _BACKENDS = {"faster-whisper": FasterWhisper, "mlx": MlxWhisper, "openai-whisper": OpenAIWhisper}
-# Keyed by (backend, model, compute_type, cpu_threads, beam_size) so a knob
-# change reloads the model instead of reusing one built with the old settings.
+# Keyed by (backend, model, compute_type, cpu_threads, beam_size, device) so a
+# knob change reloads the model, and a build that fell back to CPU is only ever
+# served from its cpu key — never as the configured (auto) one.
 _cache: dict[tuple, Transcriber] = {}
 _cache_lock = threading.Lock()
 
@@ -265,6 +360,10 @@ def get_transcriber(model: str, backend: str = "auto",
     plus ``LISTN_*`` env overrides), so every caller — live capture, file
     jobs, the ingest socket — picks them up without being changed. Pass them
     explicitly to override. Only the faster-whisper backend uses them.
+
+    A faster-whisper build whose CUDA libraries turn out to be unusable is
+    rebuilt on CPU, announced through ``status``, and cached under its own
+    device key.
     """
     name = resolve_backend(backend)
     if name not in _BACKENDS:
@@ -279,19 +378,43 @@ def get_transcriber(model: str, backend: str = "auto",
             cpu_threads = s.cpu_threads if cpu_threads is None else cpu_threads
             beam_size = s.beam_size if beam_size is None else beam_size
         knobs = dict(compute_type=compute_type, cpu_threads=cpu_threads, beam_size=beam_size)
-    key = (name, model, knobs.get("compute_type"), knobs.get("cpu_threads"), knobs.get("beam_size"))
+    prefix = (name, model, knobs.get("compute_type"), knobs.get("cpu_threads"), knobs.get("beam_size"))
+    # faster-whisper builds start on device "auto"; one that had to fall back
+    # to CPU is keyed as "cpu" and found only under that key.
+    requested_device = "auto" if name == "faster-whisper" else None
+    candidates = [prefix + (requested_device,)]
+    if requested_device == "auto":
+        candidates.append(prefix + ("cpu",))
+    instance: Transcriber | None = None
+    fresh = False
     with _cache_lock:
-        if key in _cache:
-            return _cache[key]
-        try:
-            instance = _BACKENDS[name](model, download=status, **knobs)
-        except ImportError as exc:
-            extra = {"mlx": "mlx", "openai-whisper": "openai"}.get(name, "")
-            hint = f" Install it with: pip install 'listn[{extra}]'" if extra else ""
-            raise RuntimeError(f"The {name} backend is not installed.{hint}") from exc
-        _cache.clear()  # keep one model resident; they're large
-        _cache[key] = instance
-        return instance
+        for key in candidates:
+            found = _cache.get(key)
+            if found is None:
+                continue
+            instance = found
+            effective = key[:-1] + (getattr(found, "device", requested_device),)
+            if effective != key:
+                # It fell back to CPU after being cached: move it over so the
+                # auto key never describes it again.
+                del _cache[key]
+                _cache[effective] = found
+            break
+        if instance is None:
+            fresh = True
+            try:
+                instance = _BACKENDS[name](model, download=status, **knobs)
+            except ImportError as exc:
+                extra = {"mlx": "mlx", "openai-whisper": "openai"}.get(name, "")
+                hint = f" Install it with: pip install 'listn[{extra}]'" if extra else ""
+                raise RuntimeError(f"The {name} backend is not installed.{hint}") from exc
+            _cache.clear()  # keep one model resident; they're large
+            _cache[prefix + (getattr(instance, "device", requested_device),)] = instance
+    if not fresh and getattr(instance, "status_note", None) and status:
+        # A cache hit on a CPU-fallback build says so instead of silently
+        # transcribing on a different device than the one configured.
+        status(instance.status_note)
+    return instance
 
 
 def register_backend(name: str, factory) -> None:
