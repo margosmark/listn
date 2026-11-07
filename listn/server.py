@@ -625,18 +625,22 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
 
 
 class _Server:
-    """uvicorn.Server that ends open event streams as soon as Ctrl+C arrives.
+    """uvicorn.Server whose shutdown ends open event streams first.
 
-    Otherwise graceful shutdown waits forever on the browser's EventSource.
+    The browser's EventSource (or any /api/events client) otherwise outlives
+    the 3-second grace period, so uvicorn cancels it with an ASGI traceback
+    after logging "Cancel N running task(s), timeout graceful shutdown
+    exceeded". Signalled exits (Ctrl+C) and programmatic ones (the tray
+    setting ``should_exit``) both go through ``shutdown()``.
     """
 
     def __new__(cls, app: FastAPI, port: int):
         import uvicorn
 
         class Server(uvicorn.Server):
-            def handle_exit(self, sig, frame):
+            async def shutdown(self, sockets=None):
                 app.state.shutting_down.set()
-                super().handle_exit(sig, frame)
+                await super().shutdown(sockets)
 
         config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning",
                                 timeout_graceful_shutdown=3)

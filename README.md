@@ -403,7 +403,7 @@ A settings file left over from an older run keeps whatever model you saved. In t
 
 Backends:
 
-- **faster-whisper** (always installed): CTranslate2 int8 on CPU, with voice-activity detection.
+- **faster-whisper** (always installed): CTranslate2 int8 on CPU, with voice-activity detection. On a machine where CTranslate2 sees an NVIDIA GPU but the CUDA user-space libraries are missing (a default CachyOS install has none), the first transcription reports **CUDA libraries unavailable — transcribing on CPU** and finishes on CPU instead of failing; `CUDA_VISIBLE_DEVICES=""` is no longer needed for that.
 - **mlx** (`--extra mlx`): Apple Silicon GPU. This is the backend the menu bar setup is meant to use.
 - **openai-whisper** (`--extra openai`): the original implementation, for comparison.
 

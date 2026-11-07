@@ -283,3 +283,118 @@ def test_invalid_knob_exits_readably_not_with_a_traceback(data_dir, capsys, monk
     err = capsys.readouterr().err
     assert "beam_size" in err and "banana" in err
     assert "Traceback" not in err
+
+
+# --- CPU fallback when the CUDA user-space libraries are missing ------------
+# Mark's CachyOS laptop: CTranslate2 counts a GPU (device "auto" resolves to
+# CUDA) but libcublas.so.12 is not installed, so every op on the CUDA build
+# dies with a RuntimeError naming the library.
+
+_CUBLAS_ERROR = "Library libcublas.so.12 is not found or cannot be loaded"
+
+
+class CudaBrokenWhisper:
+    """faster_whisper.WhisperModel stand-in for that laptop.
+
+    Builds and transcribes on ``device="auto"`` raise the way CTranslate2
+    does; ``device="cpu"`` works — unless a test widens ``fail_devices``.
+    """
+
+    instances: list = []
+    fail_devices = ("auto",)
+    fail_at_init = False
+
+    def __init__(self, model, **kwargs):
+        self.model = model
+        self.init_kwargs = kwargs
+        self.transcribe_kwargs = None
+        CudaBrokenWhisper.instances.append(self)
+        if CudaBrokenWhisper.fail_at_init and kwargs.get("device") in CudaBrokenWhisper.fail_devices:
+            raise RuntimeError(_CUBLAS_ERROR)
+
+    def transcribe(self, audio, **kwargs):
+        self.transcribe_kwargs = kwargs
+        if self.init_kwargs.get("device") in CudaBrokenWhisper.fail_devices:
+            raise RuntimeError(_CUBLAS_ERROR)
+        segment = types.SimpleNamespace(start=0.0, end=1.0, text="hello", no_speech_prob=0.0)
+        return iter([segment]), types.SimpleNamespace(language="en")
+
+
+@pytest.fixture
+def cuda_broken_whisper(monkeypatch, data_dir):
+    """A GPU-visible box with no CUDA libraries, faked end to end."""
+    CudaBrokenWhisper.instances = []
+    CudaBrokenWhisper.fail_devices = ("auto",)
+    CudaBrokenWhisper.fail_at_init = False
+    tr._cache.clear()
+    # The probe reports a device, like the broken laptop; the libraries are
+    # still absent, which only the op-time error can reveal.
+    monkeypatch.setattr(tr, "_cuda_device_count", lambda: 1)
+    monkeypatch.setitem(sys.modules, "faster_whisper",
+                        types.SimpleNamespace(WhisperModel=CudaBrokenWhisper))
+    yield CudaBrokenWhisper
+    tr._cache.clear()
+
+
+def test_transcribe_cuda_error_falls_back_to_cpu_once_and_reports_it(cuda_broken_whisper):
+    statuses = []
+    t = _build(status=statuses.append)
+    assert t.device == "auto" and t.status_note is None
+
+    segs = list(t.segments(np.zeros(16000, dtype=np.float32)))
+    assert [s.text for s in segs] == ["hello"]
+    # Exactly one rebuild: the auto build raised, the CPU build ran and served
+    # the segments — no retry loop.
+    assert [m.init_kwargs["device"] for m in cuda_broken_whisper.instances] == ["auto", "cpu"]
+    assert t.device == "cpu"
+    assert t.status_note == "CUDA libraries unavailable — transcribing on CPU"
+    assert statuses == [tr.CPU_FALLBACK_MESSAGE]
+
+    # Later calls reuse the CPU model: no rebuild, no repeated announcement.
+    list(t.segments(np.zeros(16000, dtype=np.float32)))
+    assert len(cuda_broken_whisper.instances) == 2
+    assert statuses == [tr.CPU_FALLBACK_MESSAGE]
+
+
+def test_model_init_cuda_error_falls_back_to_cpu_and_reports_it(cuda_broken_whisper):
+    cuda_broken_whisper.fail_at_init = True
+    statuses = []
+    t = _build(status=statuses.append)
+    assert t.device == "cpu"
+    assert t.status_note == tr.CPU_FALLBACK_MESSAGE
+    assert statuses == [tr.CPU_FALLBACK_MESSAGE]
+    assert [m.init_kwargs["device"] for m in cuda_broken_whisper.instances] == ["auto", "cpu"]
+    # The job still completes on the rebuilt model.
+    assert [s.text for s in t.segments(np.zeros(16000, dtype=np.float32))] == ["hello"]
+
+
+def test_cuda_error_on_the_cpu_rebuild_raises_after_one_attempt(cuda_broken_whisper):
+    """Even a hopeless box must fail once, honestly — never loop."""
+    cuda_broken_whisper.fail_devices = ("auto", "cpu")
+    statuses = []
+    t = _build(status=statuses.append)
+    with pytest.raises(RuntimeError, match="libcublas"):
+        list(t.segments(np.zeros(16000, dtype=np.float32)))
+    # One auto build + one CPU rebuild, then the error propagates.
+    assert len(cuda_broken_whisper.instances) == 2
+    assert statuses == [tr.CPU_FALLBACK_MESSAGE]
+
+
+def test_cache_key_distinguishes_the_cpu_fallback_from_the_configured_build(cuda_broken_whisper):
+    t = _build()
+    # A healthy build is keyed as configured (device "auto").
+    assert [key[-1] for key in tr._cache] == ["auto"]
+
+    list(t.segments(np.zeros(16000, dtype=np.float32)))   # falls back to CPU
+    assert t.device == "cpu"
+
+    hits = []
+    again = _build(status=hits.append)
+    assert again is t                       # served from the cpu key, not rebuilt
+    assert [key[-1] for key in tr._cache] == ["cpu"]   # the auto key never survives
+    assert hits == [tr.CPU_FALLBACK_MESSAGE]
+
+    # A different configuration must not inherit the fallback model.
+    other = _build(compute_type="float16")
+    assert other is not t
+    assert len(cuda_broken_whisper.instances) == 3   # auto, cpu rebuild, float16 auto
