@@ -25,6 +25,7 @@ import sys
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
+from listn import autostart
 from listn.llm import DEFAULT_LLM, LLM_BACKENDS, validate_ollama_url
 
 MODELS = ["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"]
@@ -297,6 +298,11 @@ class Settings:
         data["hf_token"] = bool(self.resolved_hf_token())
         data["diarize_after_auto"] = self.diarize_after is None
         data["diarize_after"] = self.speakers_after()
+        if autostart.supported():
+            # The file on disk is the truth on Linux: a hand-deleted entry
+            # must read back as off, not as the stored bool. On macOS the
+            # native app owns the toggle and the stored value stands.
+            data["launch_at_login"] = autostart.is_enabled()
         return data
 
 

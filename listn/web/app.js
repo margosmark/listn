@@ -202,7 +202,9 @@ async function saveSetting(key, value) {
       if (!pwUsable()) {
         $("#capture-help").textContent = "This page records one selected input only. Separate microphone and system tracks, KDE tray controls, and per-app capture are not implemented. A PipeWire monitor may be available depending on your audio setup.";
       }
-      ["#offer-meetings", "#auto-record", "#launch-at-login"].forEach(id => { $(id).closest("label").hidden = true; });
+      // launch-at-login is wired up on Linux now (Settings writes the XDG
+      // autostart entry), so only the genuinely unimplemented ones stay hidden.
+      ["#offer-meetings", "#auto-record"].forEach(id => { $(id).closest("label").hidden = true; });
       $("#privacy-open").hidden = true;
     }
     renderSettings();
@@ -990,7 +992,9 @@ async function boot() {
     state.status = await api("GET", "/api/status");
     if (state.status.platform === "linux") {
       $("#capture-help").textContent = "This page records one selected input only. Separate microphone and system tracks, KDE tray controls, and per-app capture are not implemented. A PipeWire monitor may be available depending on your audio setup.";
-      ["#offer-meetings", "#auto-record", "#launch-at-login"].forEach(id => { $(id).closest("label").hidden = true; });
+      // launch-at-login is wired up on Linux now (Settings writes the XDG
+      // autostart entry), so only the genuinely unimplemented ones stay hidden.
+      ["#offer-meetings", "#auto-record"].forEach(id => { $(id).closest("label").hidden = true; });
       $("#privacy-open").hidden = true;
       $("#pw-panel").hidden = false;   // two-track capture is Linux-only
       $("#dashboard-link").hidden = false;   // session dashboard is Linux-scoped

@@ -1,0 +1,367 @@
+"""Settings → Launch at login on Linux: the XDG autostart entry.
+
+Every test runs against a throwaway ``$HOME``: nothing here may touch the
+real one, and nothing may be written outside it. The status assertions are
+about the file on disk, never about the stored bool alone.
+"""
+
+from __future__ import annotations
+
+import configparser
+import shutil
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from listn import autostart
+from listn.config import Settings
+from listn.engine import Engine
+from listn.server import create_app
+
+from .conftest import MAC_DEVICES, FakeSD
+
+FOREIGN = (
+    "[Desktop Entry]\n"
+    "Type=Application\n"
+    "Name=mine\n"
+    "Exec=/home/someone/bin/other tray\n"
+)
+
+
+@pytest.fixture
+def home(monkeypatch, tmp_path):
+    """A fresh $HOME with no XDG override — where the entry must land."""
+    h = tmp_path / "home"
+    h.mkdir()
+    monkeypatch.setenv("HOME", str(h))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    return h
+
+
+@pytest.fixture
+def entry(home):
+    return home / ".config/autostart/listn.desktop"
+
+
+@pytest.fixture
+def launcher(monkeypatch, tmp_path):
+    """A packaged-style absolute console script in argv[0], like /usr/bin/listn."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    exe = bin_dir / "listn"
+    exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    exe.chmod(0o755)
+    monkeypatch.setattr(sys, "argv", [str(exe), "ui"])
+    return exe
+
+
+@pytest.fixture
+def client(data_dir, fake_factory, home, launcher):
+    sd = FakeSD(MAC_DEVICES, default=(0, 3), speed=40.0)
+    engine = Engine(sd=sd, transcriber_factory=fake_factory)
+    app = create_app(engine=engine, sd=sd)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        yield c
+
+
+def read_entry(path: Path) -> dict[str, str]:
+    parser = configparser.ConfigParser(interpolation=None, strict=True)
+    parser.optionxform = str  # desktop keys are case-sensitive
+    parser.read(path, encoding="utf-8")
+    assert "Desktop Entry" in parser.sections(), path
+    return dict(parser["Desktop Entry"])
+
+
+def decode_exec(value: str) -> list[str]:
+    """Desktop-entry ``Exec`` tokenizer, written from the spec for round trips.
+
+    Arguments split on unquoted whitespace; ``"`` groups; ``\\`` makes the next
+    character literal anywhere. There is no shell in the spec either.
+    """
+    args: list[str] = []
+    buf: list[str] = []
+    quoted = escape = started = False
+    for ch in value:
+        if escape:
+            buf.append(ch)
+            escape = False
+            started = True
+        elif ch == "\\":
+            escape = started = True
+        elif ch == '"':
+            quoted = not quoted
+            started = True
+        elif ch in " \t" and not quoted:
+            if started:
+                args.append("".join(buf))
+                buf, started = [], False
+        else:
+            buf.append(ch)
+            started = True
+    assert not escape, "Exec ends mid-escape"
+    if started:
+        args.append("".join(buf))
+    return args
+
+
+# ------------------------------------------------------------------- create
+
+
+def test_toggle_on_writes_the_entry_under_home(client, home, entry, launcher):
+    r = client.put("/api/settings", json={"launch_at_login": True})
+    assert r.status_code == 200
+    assert r.json()["launch_at_login"] is True
+
+    assert entry.is_file()
+    assert stat.S_IMODE(entry.stat().st_mode) == 0o644
+    assert entry.resolve().is_relative_to(home.resolve())
+    # The entry is the only file this writes, and it is inside $HOME.
+    assert [p for p in home.rglob("*") if p.is_file()] == [entry]
+
+    text = entry.read_text(encoding="utf-8")
+    assert text.splitlines()[0].startswith(autostart.MARKER)
+
+    desktop = read_entry(entry)
+    assert desktop["Type"] == "Application"
+    assert desktop["Terminal"] == "false"
+    assert desktop["NoDisplay"] == "true"
+    # Exactly the running launcher plus `tray`: no shell, no extra words.
+    assert desktop["Exec"] == f"{launcher} tray"
+
+
+def test_toggle_on_validates_as_a_desktop_entry(client, entry):
+    if shutil.which("desktop-file-validate") is None:
+        pytest.skip("desktop-file-utils not installed")
+    client.put("/api/settings", json={"launch_at_login": True})
+    result = subprocess.run(["desktop-file-validate", str(entry)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_exec_is_quoted_with_desktop_entry_rules(client, monkeypatch, tmp_path, entry):
+    """Spaces group with quotes; `$` and `%` are escaped. No shell involved."""
+    spaced = tmp_path / "ap p"
+    spaced.mkdir()
+    exe = spaced / "listn$bin"
+    exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    exe.chmod(0o755)
+    monkeypatch.setattr(sys, "argv", [str(exe), "ui"])
+
+    assert client.put("/api/settings", json={"launch_at_login": True}).status_code == 200
+    desktop = read_entry(entry)
+    expected = '"' + str(exe).replace("$", "\\$") + '" tray'
+    assert desktop["Exec"] == expected
+    # The value must be parseable back into exactly two arguments.
+    assert decode_exec(desktop["Exec"]) == [str(exe), "tray"]
+
+
+# ------------------------------------------------------------------ disable
+
+
+def test_toggle_off_removes_the_entry(client, entry):
+    client.put("/api/settings", json={"launch_at_login": True})
+    assert entry.is_file()
+
+    r = client.put("/api/settings", json={"launch_at_login": False})
+    assert r.status_code == 200
+    assert r.json()["launch_at_login"] is False
+    assert not entry.exists()
+
+
+def test_toggle_off_with_no_file_is_a_noop(client, entry):
+    r = client.put("/api/settings", json={"launch_at_login": False})
+    assert r.status_code == 200
+    assert r.json()["launch_at_login"] is False
+    assert not entry.exists()          # nothing was created to "turn off"
+
+
+def test_toggle_off_never_deletes_a_foreign_entry(client, entry):
+    entry.parent.mkdir(parents=True)
+    entry.write_text(FOREIGN, encoding="utf-8")
+
+    r = client.put("/api/settings", json={"launch_at_login": False})
+    assert r.status_code == 200
+    assert entry.read_text(encoding="utf-8") == FOREIGN   # untouched, byte for byte
+    # …and it does not count as listn's own entry, so the status is off.
+    assert r.json()["launch_at_login"] is False
+
+
+def test_toggle_on_refuses_to_overwrite_a_foreign_entry(client, entry, data_dir):
+    entry.parent.mkdir(parents=True)
+    entry.write_text(FOREIGN, encoding="utf-8")
+
+    r = client.put("/api/settings", json={"launch_at_login": True})
+    assert r.status_code == 400
+    assert "not written by listn" in r.json()["detail"]
+    assert entry.read_text(encoding="utf-8") == FOREIGN
+    # The refusal did not persist a setting that never took effect.
+    assert Settings.load().launch_at_login is False
+    assert client.get("/api/settings").json()["launch_at_login"] is False
+
+
+# --------------------------------------------------------------- idempotent
+
+
+def test_toggle_on_twice_writes_the_same_file_once(client, entry):
+    client.put("/api/settings", json={"launch_at_login": True})
+    first = entry.stat()
+    content = entry.read_text(encoding="utf-8")
+
+    r = client.put("/api/settings", json={"launch_at_login": True})
+    assert r.status_code == 200
+    second = entry.stat()
+    assert entry.read_text(encoding="utf-8") == content
+    assert (second.st_ino, second.st_mtime_ns) == (first.st_ino, first.st_mtime_ns)
+
+
+# ------------------------------------------------------------- disk is truth
+
+
+def test_status_follows_the_file_not_the_stored_bool(client, entry):
+    assert client.put("/api/settings", json={"launch_at_login": True}).status_code == 200
+    assert client.get("/api/settings").json()["launch_at_login"] is True
+    assert client.get("/api/status").json()["settings"]["launch_at_login"] is True
+
+    # Hand-deleted file: the stored bool is still True, the status is off.
+    entry.unlink()
+    assert Settings.load().launch_at_login is True
+    assert client.get("/api/settings").json()["launch_at_login"] is False
+    assert client.get("/api/status").json()["settings"]["launch_at_login"] is False
+
+    # Hand-written listn entry: on again, without a PUT.
+    entry.write_text(autostart.render(), encoding="utf-8")
+    assert client.get("/api/settings").json()["launch_at_login"] is True
+
+    # A foreign entry at the same path reads as off.
+    entry.write_text(FOREIGN, encoding="utf-8")
+    assert client.get("/api/settings").json()["launch_at_login"] is False
+
+
+# ------------------------------------------------------------------- macOS
+
+
+def test_macos_leaves_the_toggle_to_the_native_app(client, home, entry, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    r = client.put("/api/settings", json={"launch_at_login": True})
+    assert r.status_code == 200
+    assert r.json()["launch_at_login"] is True      # the stored bool still rules
+    assert not entry.exists()
+    assert [p for p in home.rglob("*") if p.is_file()] == []   # nothing written
+
+    # Even a listn-marked file at the path is not read or touched on macOS.
+    entry.parent.mkdir(parents=True)
+    entry.write_text(autostart.render(), encoding="utf-8")
+    assert client.get("/api/settings").json()["launch_at_login"] is True
+    entry.unlink()
+    assert client.get("/api/settings").json()["launch_at_login"] is True
+    assert Settings.load().launch_at_login is True
+
+
+# ------------------------------------------------------------ paths and scope
+
+
+def test_xdg_config_home_is_honoured_when_inside_home(client, home, monkeypatch):
+    xdg = home / "xdg"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    client.put("/api/settings", json={"launch_at_login": True})
+    assert (xdg / "autostart/listn.desktop").is_file()
+    assert not (home / ".config/autostart/listn.desktop").exists()
+
+
+def test_refuses_to_write_outside_home(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "elsewhere"))
+    r = client.put("/api/settings", json={"launch_at_login": True})
+    assert r.status_code == 400
+    assert "outside $HOME" in r.json()["detail"]
+    assert not (tmp_path / "elsewhere").exists()
+
+
+def test_autostart_file_stays_under_home(home, entry):
+    assert autostart.autostart_file() == entry
+
+
+def test_source_adds_no_network_no_subprocess_no_shell():
+    """Local-only by construction: no sockets, no child processes, no shell."""
+    import ast
+
+    tree = ast.parse(Path(autostart.__file__).read_text(encoding="utf-8"))
+    imported = set()
+    spawned = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported |= {a.name.split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+        elif isinstance(node, ast.Call):
+            fn = node.func
+            if isinstance(fn, ast.Attribute) and fn.attr in {
+                    "system", "popen", "Popen", "run", "call", "check_call",
+                    "check_output", "spawn", "spawnl", "spawnv", "execv"}:
+                spawned.append(fn.attr)
+            if any(kw.arg == "shell" for kw in node.keywords):
+                spawned.append("shell=True")
+    assert not imported & {"socket", "subprocess", "urllib", "requests",
+                           "http", "asyncio", "ftplib", "smtplib", "paramiko"}
+    assert not spawned, spawned
+    # Standard library and local file handling only.
+    assert imported <= {"os", "shutil", "sys", "__future__", "pathlib"}
+
+
+# -------------------------------------------------------------- launcher argv
+
+
+def test_launcher_argv_prefers_the_running_console_script(tmp_path, monkeypatch):
+    exe = tmp_path / "listn"
+    exe.write_text("#!/bin/sh\n", encoding="utf-8")
+    exe.chmod(0o755)
+    monkeypatch.setattr(sys, "argv", [str(exe), "ui"])
+    assert autostart.launcher_argv() == [str(exe)]
+
+    # A bare name is resolved through PATH.
+    monkeypatch.setattr(sys, "argv", ["listn", "ui"])
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert autostart.launcher_argv() == [str(exe)]
+
+    # `python -m listn` relaunches the same way.
+    main_py = tmp_path / "site" / "listn" / "__main__.py"
+    main_py.parent.mkdir(parents=True)
+    main_py.write_text("import sys\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [str(main_py), "ui"])
+    assert autostart.launcher_argv() == [sys.executable, "-m", "listn"]
+
+    # A non-listn argv[0] (pytest, an interpreter) never lands in Exec: the
+    # listn command on PATH wins, and the bare command name is the last resort.
+    other = tmp_path / "pytest"
+    other.write_text("#!/bin/sh\n", encoding="utf-8")
+    other.chmod(0o755)
+    monkeypatch.setattr(sys, "argv", [str(other), "-q"])
+    assert autostart.launcher_argv() == [str(exe)]
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    assert autostart.launcher_argv() == ["listn"]
+
+
+def test_launcher_argv_resolves_a_relative_invocation(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "bin").mkdir()
+    exe = tmp_path / "bin" / "listn"
+    exe.write_text("#!/bin/sh\n", encoding="utf-8")
+    exe.chmod(0o755)
+    monkeypatch.setattr(sys, "argv", ["bin/listn", "ui"])
+    assert autostart.launcher_argv() == [str(exe)]
+
+
+# ------------------------------------------------------------------ the UI
+
+
+def test_linux_settings_shows_the_toggle(client):
+    """The toggle is wired up on Linux now, so the UI must not hide it."""
+    js = client.get("/static/app.js").text
+    assert '["#offer-meetings", "#auto-record", "#launch-at-login"]' not in js
+    assert js.count('["#offer-meetings", "#auto-record"]') == 2
+    html = client.get("/").text
+    assert 'data-setting="launch_at_login"' in html
