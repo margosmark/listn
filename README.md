@@ -100,9 +100,11 @@ exercised.
 input. A PipeWire/PulseAudio monitor may be selectable if exposed
 by PortAudio; routing, permissions, device changes and audio quality need
 verification on the target desktop. Do not interpret its labels as reliable
-speaker identity. Per-app capture, meeting detection and
-launch-at-login integration are not implemented (the tray hides those
-controls rather than faking them). Do not use the macOS
+speaker identity. Per-app capture and meeting detection are not
+implemented (the tray hides those controls rather than faking them). Launch
+at login works on Linux through the web Settings toggle described below and
+natively on macOS; the tray menu itself still offers no launch-at-login
+control. Do not use the macOS
 management script on Linux. GPU acceleration is unverified; MLX-based
 notes are unavailable and the existing extractive fallback is used. See
 [operations](docs/OPERATIONS.md) for validation steps.
@@ -130,6 +132,16 @@ never doubles up on a running server. The login entry is an install-time
 choice made by `install --autostart`, never a tray control: the tray has no
 launch-at-login control, that macOS control stays hidden. `uninstall` removes
 the login entry too, whether or not you installed it.
+
+The web UI's **Settings → Launch at login** toggle does the same job without
+the installer. On Linux it writes `$XDG_CONFIG_HOME/autostart/listn.desktop`
+(`~/.config/autostart/listn.desktop` when `XDG_CONFIG_HOME` is unset) with
+the launcher that is running plus `tray`, and switching it off removes that
+file again. It only ever removes a file carrying listn's `# written by listn`
+marker — an entry you wrote yourself at that path is never deleted, and
+turning the toggle on over one asks you to move it first. The toggle reports
+what is on disk, not the saved setting, so deleting the file by hand turns it
+off. Nothing outside your home directory is written.
 
 The script launches the `listn` command it finds: `$LISTN_CMD` if you set it,
 this checkout's `.venv/bin/listn`, then `listn` on `PATH`. Set `LISTN_CMD`
@@ -160,7 +172,9 @@ locally, and no state outside `$HOME` is ever written. Declared depends:
 `python`, `uv`, `portaudio`, `pipewire`, `wireplumber`; the optional `tray`
 extra (dbus-next) is pulled into your environment when you run `listn tray`.
 Starting the tray at login stays an install-time choice — copy the shipped
-template into your own autostart directory:
+template into your own autostart directory (the web **Settings → Launch at
+login** toggle writes its own `listn.desktop` there instead; the two entries
+are independent, so keep one):
 
 ```sh
 install -Dm644 /usr/share/listn/packaging/listn-tray.desktop \

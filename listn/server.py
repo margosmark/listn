@@ -26,7 +26,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Res
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from listn import __version__, diarize
+from listn import __version__, autostart, diarize
 from listn import devices as devmod
 from listn.capture import DeviceError, measure_levels
 from listn.config import BACKENDS, MODELS, Settings, data_dir
@@ -258,6 +258,15 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
             raise HTTPException(400, f"Unknown model. Choose one of {', '.join(MODELS)}.")
         if "backend" in changes and changes["backend"] not in BACKENDS:
             raise HTTPException(400, f"Unknown backend. Choose one of {', '.join(BACKENDS)}.")
+        if "launch_at_login" in changes:
+            # On Linux the autostart entry *is* the switch: apply it first so
+            # a refusal (foreign file, HOME unset, path outside $HOME) leaves
+            # settings.json untouched instead of claiming it worked. macOS is
+            # a no-op here — the native app owns that toggle.
+            try:
+                autostart.set_enabled(bool(changes["launch_at_login"]))
+            except autostart.AutostartError as exc:
+                raise HTTPException(400, str(exc)) from exc
         for key, value in changes.items():
             setattr(current, key, value)
         current.validated().save()
