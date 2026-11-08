@@ -479,7 +479,7 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
     def reenroll_speakers():
         book = voice_book()
         if not book.embedder.neural:
-            raise HTTPException(400, "The voice model isn't on this Mac yet. Label speakers in one session first; "
+            raise HTTPException(400, "The voice model isn't on this machine yet. Label speakers in one session first; "
                                      "that downloads it once.")
         return book.reenroll(eng().library)
 
@@ -490,6 +490,30 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
         if not SpeakerBook().delete(name):
             raise HTTPException(404, "No voice with that name.")
         return {"ok": True}
+
+    @app.get("/api/speakers/export")
+    def export_speakers():
+        """The user's own voice prints as one JSON file, on request.
+
+        Portability counterpart to delete: the numbers behind each profile, so
+        the data can be taken out or backed up without handing over the audio.
+        No absolute paths, no audio bytes, nothing leaves the machine — this is
+        a download the user asked for.
+        """
+        book = voice_book()
+        payload = {
+            "listn_voice_export": 1,
+            "method": book.embedder.key,
+            "profiles": [
+                {"name": p["name"], "vectors": p["vectors"], "clips": p["clips"],
+                 "needs_reenroll": p["needs_reenroll"]}
+                for p in book.profiles()
+            ],
+            "note": ("Voice prints only: the audio clips stay in the data directory. "
+                     "Forgetting a voice in Settings removes the profile and its clips."),
+        }
+        return Response(json.dumps(payload, indent=2), media_type="application/json; charset=utf-8",
+                        headers={"Content-Disposition": 'attachment; filename="listn-voices.json"'})
 
     @app.post("/api/speakers/correct")
     def correct_speaker(body: SpeakerCorrectIn):
