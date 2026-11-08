@@ -195,6 +195,15 @@ def cmd_record(args) -> int:
             mark = "  [session default]" if node.name == default else ""
             desc = f" — {node.description}" if node.description else ""
             print(f"  {node.name}  (id {node.id}){desc}{mark}")
+        print("Application output streams (Stream/Output/Audio):")
+        apps = graph.app_streams
+        if not apps:
+            print("  (none)")
+        for node in apps:
+            # node.description already carries the application's own name
+            # only — never a window or media title (listn/pipewire.py).
+            desc = f" — {node.description}" if node.description else ""
+            print(f"  {node.name}  (id {node.id}){desc}")
         print("Microphones (Audio/Source):")
         default = graph.default_source or ""
         for node in graph.sources:
@@ -202,6 +211,8 @@ def cmd_record(args) -> int:
             desc = f" — {node.description}" if node.description else ""
             print(f"  {node.name}  (id {node.id}){desc}{mark}")
         print("\nPick both explicitly: listn record --system-target <node> --mic-target <node>")
+        print("  --system-target takes a system output (all applications mixed) or one "
+              "application stream (that app only).")
         return 0
     if args.backend != "pipewire":
         print(f"Unknown capture backend '{args.backend}'. Use pipewire.", file=sys.stderr)
@@ -561,7 +572,9 @@ def build_parser() -> argparse.ArgumentParser:
     rc.add_argument("--backend", choices=["pipewire"], default="pipewire",
                     help="Capture backend (default: pipewire)")
     rc.add_argument("--system-target", metavar="NODE",
-                    help="PipeWire node name or id for the system output track (see --list)")
+                    help="PipeWire node name, id, or application name for the system output "
+                         "track: a system output (all applications) or one application's "
+                         "output stream (see --list)")
     rc.add_argument("--mic-target", metavar="NODE",
                     help="PipeWire node name or id for the microphone track (see --list)")
     rc.add_argument("--duration", type=float, default=5.0, metavar="SEC",
