@@ -398,7 +398,14 @@ def test_replacement_is_refused_once_the_sibling_track_is_gone(fake_pw):
     assert wait_for(lambda: recorder._tracks["system"].frames > 0)
     # Both probes fail: both tracks die (L0's both-dead abort condition).
     recorder.probe = lambda n: False
-    assert wait_for(lambda: recorder._tracks["mic"].state == "failed")
+    # Wait for BOTH deaths, not just the sibling's: replace_track validates
+    # the requested track first ("not failed") and only then the sibling
+    # ("not recording"). Each track's reader thread detects the lost node on
+    # its own schedule, so calling replace_track the moment the mic is dead
+    # races the system track's independent detection loop — under load the
+    # system track is still "recording" and the wrong guard fires.
+    assert wait_for(lambda: recorder._tracks["mic"].state == "failed"
+                    and recorder._tracks["system"].state == "failed")
     replacement = pw.Node(id=77, name="hdmi.out", serial=77,
                           media_class="Audio/Sink", description="HDMI")
     with pytest.raises(pw.CaptureError, match="not recording"):
