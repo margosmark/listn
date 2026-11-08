@@ -8,6 +8,7 @@ about the file on disk, never about the stored bool alone.
 from __future__ import annotations
 
 import configparser
+import json
 import shutil
 import stat
 import subprocess
@@ -60,6 +61,19 @@ def launcher(monkeypatch, tmp_path):
 
 
 @pytest.fixture
+def hostile_launcher(monkeypatch, tmp_path):
+    """A launcher path that stresses both escaping layers: a space, a quote,
+    ``$()``, a backtick and a backslash — all legal in a Linux filename."""
+    odd_dir = tmp_path / 'we"ird $(x) `tick` \\ dir'
+    odd_dir.mkdir()
+    exe = odd_dir / "listn"
+    exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    exe.chmod(0o755)
+    monkeypatch.setattr(sys, "argv", [str(exe), "ui"])
+    return exe
+
+
+@pytest.fixture
 def client(data_dir, fake_factory, home, launcher):
     sd = FakeSD(MAC_DEVICES, default=(0, 3), speed=40.0)
     engine = Engine(sd=sd, transcriber_factory=fake_factory)
@@ -68,12 +82,78 @@ def client(data_dir, fake_factory, home, launcher):
         yield c
 
 
+KEYFILE_ESCAPES = {"\\": "\\", "s": " ", "n": "\n", "t": "\t", "r": "\r"}
+
+
+def keyfile_string(raw: str) -> str:
+    """What GLib's ``g_key_file_get_string`` hands back for a raw value.
+
+    The key-file *string* layer runs before any consumer reads the entry:
+    ``\\s \\n \\t \\r \\\\`` are the only escapes, and any other backslash
+    sequence makes the value un-interpretable — GLib then errors and the
+    entry loads with no command at all. An invalid escape here fails the
+    test for the same reason GLib would refuse it.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(raw):
+        if raw[i] == "\\":
+            i += 1
+            if i >= len(raw) or raw[i] not in KEYFILE_ESCAPES:
+                raise AssertionError(f"invalid key-file escape in {raw!r}")
+            out.append(KEYFILE_ESCAPES[raw[i]])
+        else:
+            out.append(raw[i])
+        i += 1
+    return "".join(out)
+
+
 def read_entry(path: Path) -> dict[str, str]:
     parser = configparser.ConfigParser(interpolation=None, strict=True)
     parser.optionxform = str  # desktop keys are case-sensitive
     parser.read(path, encoding="utf-8")
     assert "Desktop Entry" in parser.sections(), path
-    return dict(parser["Desktop Entry"])
+    # configparser returns the raw bytes of each value; GLib applies the
+    # key-file string layer on top, and that is the layer desktop-file-validate,
+    # GIO and GNOME see first — so assertions here work at that layer.
+    return {k: keyfile_string(v) for k, v in parser["Desktop Entry"].items()}
+
+
+#: A real GLib/GIO reader, run by an interpreter that has PyGObject (the venv
+#: does not): key-file string layer, Exec parsing, and what GIO makes of it.
+GLIB_PROBE = """
+import json
+import sys
+
+import gi
+
+gi.require_version("GLib", "2.0")
+from gi.repository import GLib, Gio
+
+path = sys.argv[1]
+out = {}
+try:
+    keyfile = GLib.KeyFile()
+    keyfile.load_from_file(path, GLib.KeyFileFlags.NONE)
+    out["exec"] = keyfile.get_string("Desktop Entry", "Exec")
+    _ok, argv = GLib.shell_parse_argv(out["exec"])
+    out["argv"] = list(argv)
+except GLib.Error as exc:
+    out["error"] = str(exc)
+info = Gio.DesktopAppInfo.new_from_filename(path)
+out["cmdline"] = None if info is None else info.get_commandline()
+print(json.dumps(out))
+"""
+
+
+def has_gi(candidate: str) -> bool:
+    """Whether this interpreter can import PyGObject (the venv cannot)."""
+    try:
+        probe = subprocess.run([candidate, "-c", "import gi"],
+                               capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
 
 
 def decode_exec(value: str) -> list[str]:
@@ -159,6 +239,40 @@ def test_exec_is_quoted_with_desktop_entry_rules(client, monkeypatch, tmp_path, 
     assert decode_exec(desktop["Exec"]) == [str(exe), "tray"]
 
 
+def test_toggle_on_validates_a_hostile_launcher_path(client, entry, hostile_launcher):
+    """F1: space + ``"`` + ``$()`` + backtick + backslash must validate.
+
+    The key-file string layer runs before the Exec layer, so a path that is
+    only escaped for Exec (``\\"``, ``\\$``, ``\\` ``) is an invalid key-file
+    value — GLib then refuses it and desktop-file-validate fails too.
+    """
+    if shutil.which("desktop-file-validate") is None:
+        pytest.skip("desktop-file-utils not installed")
+    assert client.put("/api/settings", json={"launch_at_login": True}).status_code == 200
+    result = subprocess.run(["desktop-file-validate", str(entry)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_hostile_launcher_path_round_trips_through_glib(client, entry, hostile_launcher):
+    """F1: real GLib must read Exec back and GIO must still see a command."""
+    interpreters = [c for c in (sys.executable, "/usr/bin/python3") if has_gi(c)]
+    if not interpreters:
+        pytest.skip("PyGObject not installed for any interpreter")
+    assert client.put("/api/settings", json={"launch_at_login": True}).status_code == 200
+
+    result = subprocess.run([interpreters[0], "-c", GLIB_PROBE, str(entry)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    data = json.loads(result.stdout)
+    assert "error" not in data, data["error"]          # key-file string layer is valid
+    assert data["argv"] == [str(hostile_launcher), "tray"], data   # Exec layer too
+    # GIO loads the entry with its command (before the fix: cmdline=None,
+    # so the entry existed but could never autostart).
+    assert data["cmdline"] is not None, data
+    assert data["cmdline"] == data["exec"], data
+
+
 # ------------------------------------------------------------------ disable
 
 
@@ -216,6 +330,50 @@ def test_toggle_on_twice_writes_the_same_file_once(client, entry):
     second = entry.stat()
     assert entry.read_text(encoding="utf-8") == content
     assert (second.st_ino, second.st_mtime_ns) == (first.st_ino, first.st_mtime_ns)
+
+
+# ------------------------------------------------------- temp file hardening
+
+
+def test_planted_symlink_at_the_temp_path_is_not_followed(client, home, entry, tmp_path):
+    """F2: a symlink at the fixed temp name is never opened, moved or chmod'd.
+
+    Whoever can write ``~/.config/autostart`` could point ``listn.desktop.tmp``
+    at a victim file; the write must remove that link (not its target) and
+    still land the entry as a regular file.
+    """
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious\n", encoding="utf-8")
+    victim.chmod(0o600)
+    tmp = entry.with_name(entry.name + ".tmp")
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    tmp.symlink_to(victim)
+
+    assert client.put("/api/settings", json={"launch_at_login": True}).status_code == 200
+
+    # The victim keeps its bytes and its mode.
+    assert victim.read_text(encoding="utf-8") == "precious\n"
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o600
+    # The entry still lands: a real file, 0644, with a valid Exec.
+    assert entry.is_file() and not entry.is_symlink()
+    assert stat.S_IMODE(entry.stat().st_mode) == 0o644
+    assert read_entry(entry)["Exec"].endswith(" tray")
+    # Nothing of the temp file survives, and it is the only file written.
+    assert not tmp.is_symlink() and not tmp.exists()
+    assert [p for p in home.rglob("*") if p.is_file()] == [entry]
+    assert client.get("/api/settings").json()["launch_at_login"] is True
+
+
+def test_a_stale_regular_temp_file_is_cleared_before_writing(client, entry):
+    """O_EXCL needs the fixed name cleared first: a leftover temp must not fail the toggle."""
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    tmp = entry.with_name(entry.name + ".tmp")
+    tmp.write_text("leftover from a crashed run\n", encoding="utf-8")
+
+    assert client.put("/api/settings", json={"launch_at_login": True}).status_code == 200
+    assert entry.is_file()
+    assert not tmp.exists()
+    assert read_entry(entry)["Type"] == "Application"
 
 
 # ------------------------------------------------------------- disk is truth
