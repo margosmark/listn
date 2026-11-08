@@ -35,6 +35,7 @@ here opens a socket to anywhere else.
 from __future__ import annotations
 
 import json
+import logging
 import socket
 import threading
 import urllib.error
@@ -43,6 +44,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from listn.config import data_dir
+
+log = logging.getLogger("listn.tray")
 
 LOOPBACK = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -69,8 +72,12 @@ ITEM_APP_BASE = 300      # application-stream entries: 300, 301, ...
 # Disabled section header *inside* the System output submenu. Not a
 # control: clicking it does nothing (no action branch owns this id).
 ITEM_SYSTEM_APPS_SECTION = 12
+ITEM_BOOKMARK = 7        # bookmark this moment (recording must be active)
+ITEM_CAPTIONS = 8        # show/hide the local caption window (toggle)
+ITEM_SHORTCUTS = 9       # global shortcut status line (informational)
 ITEM_PRIVACY = 20
 ITEM_QUIT = 30
+SETTINGS_POLL_EVERY = 5  # refreshes between GET /api/settings pulls
 
 
 class ServerUnreachable(ConnectionError):
@@ -100,8 +107,12 @@ class ServerClient:
 
     def _request(self, method: str, path: str, body: dict | None = None) -> dict:
         if self._transport is not None:
-            status, payload = (self._transport.get(path) if method == "GET"
-                               else self._transport.post(path, body))
+            if method == "GET":
+                status, payload = self._transport.get(path)
+            elif method == "PUT" and hasattr(self._transport, "put"):
+                status, payload = self._transport.put(path, body)
+            else:
+                status, payload = self._transport.post(path, body)
             if status >= 400:
                 raise RequestRefused(_detail_of(payload), status)
             return payload
@@ -145,6 +156,20 @@ class ServerClient:
 
     def stop(self) -> dict:
         return self._request("POST", "/api/live/stop", {})
+
+    def put(self, path: str, body: dict) -> dict:
+        return self._request("PUT", path, body)
+
+    def settings(self) -> dict:
+        """Server-side settings (the tray is a client; the server is truth)."""
+        return self._request("GET", "/api/settings")
+
+    def set_setting(self, key: str, value) -> dict:
+        return self.put("/api/settings", {key: value})
+
+    def bookmark(self, note: str = "", source: str = "tray") -> dict:
+        return self._request("POST", "/api/live/bookmark",
+                             {"note": note, "source": source})
 
 
 def _detail_of(payload) -> str:
@@ -334,7 +359,10 @@ class MenuItem:
 def build_menu(status: TrayStatus, sinks: list[dict], sources: list[dict],
                apps: list[dict], selected_system: str | None,
                selected_mic: str | None,
-               discovery_error: str | None = None) -> list[MenuItem]:
+               discovery_error: str | None = None,
+               captions_enabled: bool = False,
+               shortcut_status=None,
+               captions_unavailable: str | None = None) -> list[MenuItem]:
     """The whole tray menu. Unimplemented macOS controls are absent, not greyed.
 
     ``sinks`` and ``apps`` are two halves of *one* system-track picker:
@@ -343,6 +371,10 @@ def build_menu(status: TrayStatus, sinks: list[dict], sources: list[dict],
     group — exactly one entry in it can be checked, and whichever one is
     checked is exactly the selection ``start()`` sends. The section
     header is a disabled label, never a target.
+
+    ``shortcut_status`` (a ``listn.shortcuts.ShortcutStatus``) only ever
+    *reports*: when the desktop would not grant the global shortcuts the
+    line says so and the start/stop/bookmark controls above it stay usable.
     """
     items = [MenuItem(ITEM_STATUS, status.summary(), enabled=False)]
     if status.state == FAILED or status.state == UNREACHABLE:
@@ -358,6 +390,8 @@ def build_menu(status: TrayStatus, sinks: list[dict], sources: list[dict],
                           enabled=status.state == RECORDING))
     items.append(MenuItem(ITEM_RESUME, "Resume",
                           enabled=status.state == PAUSED))
+    items.append(MenuItem(ITEM_BOOKMARK, "Bookmark this moment",
+                          enabled=status.state in (RECORDING, PAUSED)))
     items.append(MenuItem(0, "", separator=True))
 
     system = MenuItem(10, "System output")
@@ -402,6 +436,23 @@ def build_menu(status: TrayStatus, sinks: list[dict], sources: list[dict],
         mic.label = "Microphone — none found"
     items.extend([system, mic, MenuItem(0, "", separator=True)])
 
+    if captions_unavailable:
+        # No display or no tkinter: say which, and do not offer a toggle
+        # that would silently do nothing.
+        items.append(MenuItem(ITEM_CAPTIONS,
+                              f"Show captions — {captions_unavailable}",
+                              enabled=False))
+    else:
+        items.append(MenuItem(ITEM_CAPTIONS, "Show captions",
+                              toggle="checkmark", toggled=bool(captions_enabled),
+                              enabled=status.state != UNREACHABLE))
+    if shortcut_status is not None:
+        # Informational: the reason for an unregistered shortcut is visible
+        # here instead of a shortcut that silently does nothing.
+        items.append(MenuItem(ITEM_SHORTCUTS, shortcut_status.summary(),
+                              enabled=False))
+    items.append(MenuItem(0, "", separator=True))
+
     items.append(MenuItem(ITEM_PRIVACY, "Open privacy settings",
                           enabled=status.state != UNREACHABLE))
     items.append(MenuItem(0, "", separator=True))
@@ -443,6 +494,15 @@ class TrayController:
         self.selected_mic: str | None = None
         self.notice: str | None = None      # last refused action, shown once
         self.quit_requested = False
+        # Desktop extras (Linux): the settings dict is the server's truth,
+        # the shortcut status is whatever the desktop granted, and the
+        # caption toggle follows the setting rather than a local flag.
+        self.settings: dict = {}
+        self.captions_enabled = False
+        self.shortcut_status = None
+        self.captions = None                # CaptionSupervisor, once started
+        self.on_chords_changed = None       # callable(chords) -> None
+        self._settings_countdown = 0
         self._targets_file = targets_file or (data_dir() / "tray-targets.json")
         self._load_targets()
 
@@ -477,9 +537,43 @@ class TrayController:
         except RequestRefused as exc:
             payload, error = None, exc.detail
         self.status = derive_status(payload, error)
-        if self.status.state != UNREACHABLE and not self.sinks and not self.discovery_error:
-            self._load_devices()
+        if self.status.state != UNREACHABLE:
+            self._refresh_settings()
+            if not self.sinks and not self.discovery_error:
+                self._load_devices()
         return self.status
+
+    def _refresh_settings(self) -> None:
+        """Pull ``GET /api/settings`` on a slow tick (captions, shortcut chords).
+
+        Failures keep the last known values: a settings hiccup must not
+        blank the menu or flip a toggle the user can see.
+        """
+        self._settings_countdown -= 1
+        if self._settings_countdown > 0:
+            return
+        self._settings_countdown = SETTINGS_POLL_EVERY
+        try:
+            fresh = self.client.settings()
+        except (ServerUnreachable, RequestRefused):
+            return
+        if not isinstance(fresh, dict):
+            return
+        previous, self.settings = self.settings, fresh
+        self.captions_enabled = bool(fresh.get("captions_enabled"))
+        if not previous:
+            return  # first pull: adopt, never rebind
+        # Settings keys -> shortcut action names the manager understands.
+        pairs = (("start_stop", "hotkey_start_stop"),
+                 ("bookmark", "hotkey_bookmark"))
+        chords = {action: fresh.get(setting) for action, setting in pairs}
+        changed = any(previous.get(setting) != fresh.get(setting)
+                      for _action, setting in pairs)
+        if changed and self.on_chords_changed is not None and all(chords.values()):
+            try:
+                self.on_chords_changed(chords)
+            except Exception:  # a rebind failure is reported by the status line
+                log.exception("shortcut rebind scheduling failed")
 
     def _load_devices(self) -> None:
         """Adopt the session defaults as labelled suggestions, once."""
@@ -522,10 +616,18 @@ class TrayController:
         if self.selected_mic not in source_names:
             self.selected_mic = default_mic
 
+    def captions_reason(self) -> str | None:
+        """Why captions cannot run here, or None when they can."""
+        supervisor = self.captions
+        return getattr(supervisor, "disabled_reason", None)
+
     def menu(self) -> list[MenuItem]:
         items = build_menu(self.status, self.sinks, self.sources, self.apps,
                            self.selected_system, self.selected_mic,
-                           self.discovery_error)
+                           self.discovery_error,
+                           captions_enabled=self.captions_enabled,
+                           shortcut_status=self.shortcut_status,
+                           captions_unavailable=self.captions_reason())
         if self.notice and self.status.state in (IDLE, FAILED):
             # The last action was refused (or failed) — show the server's
             # own reason as the status line instead of a bare "Idle".
@@ -545,6 +647,12 @@ class TrayController:
             self.pause()
         elif item_id == ITEM_RESUME:
             self.resume()
+        elif item_id == ITEM_BOOKMARK:
+            self.bookmark(source="tray")
+        elif item_id == ITEM_CAPTIONS:
+            self.toggle_captions()
+        elif item_id == ITEM_SHORTCUTS:
+            pass  # informational line: the reason is already in the label
         elif item_id == ITEM_PRIVACY:
             self.open_privacy()
         elif item_id == ITEM_QUIT:
@@ -613,6 +721,39 @@ class TrayController:
             return
         self.notice = None
         self.refresh()
+
+    def bookmark(self, note: str = "", source: str = "tray") -> dict | None:
+        """Mark the current moment. Refusals surface as the usual notice,
+        so a bookmark with nothing recording says so instead of vanishing."""
+        try:
+            item = self.client.bookmark(note=note, source=source)
+        except RequestRefused as exc:
+            self._refused(exc)
+            return None
+        except ServerUnreachable as exc:
+            self.status = derive_status(None, str(exc))
+            return None
+        self.notice = None
+        self.refresh()
+        return item
+
+    def toggle_captions(self) -> bool:
+        """Flip the server-side ``captions_enabled`` setting and return it."""
+        want = not self.captions_enabled
+        try:
+            fresh = self.client.set_setting("captions_enabled", want)
+        except RequestRefused as exc:
+            self.notice = exc.detail
+            return self.captions_enabled
+        except ServerUnreachable as exc:
+            self.status = derive_status(None, str(exc))
+            return self.captions_enabled
+        if isinstance(fresh, dict):
+            self.settings = fresh
+            self.captions_enabled = bool(fresh.get("captions_enabled"))
+        else:
+            self.captions_enabled = want
+        return self.captions_enabled
 
     def open_privacy(self) -> str | None:
         """Open listn's own privacy/retention settings in the default browser.

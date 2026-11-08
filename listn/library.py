@@ -233,7 +233,13 @@ class Library:
                 t = float(item.get("t", 0))
             except (TypeError, ValueError):
                 continue
-            out.append({"t": round(t, 2), "note": str(item.get("note") or "Bookmark")[:200]})
+            entry = {"t": round(t, 2), "note": str(item.get("note") or "Bookmark")[:200]}
+            # Provenance ("tray", "hotkey", …) is stored with the bookmark;
+            # records without it keep their exact two-key shape.
+            source = item.get("source")
+            if source:
+                entry["source"] = str(source)[:32]
+            out.append(entry)
         return out
 
     def get(self, session_id: str) -> SessionMeta:

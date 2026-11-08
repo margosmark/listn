@@ -745,11 +745,16 @@ class Engine:
             return False
         return session.resume()
 
-    def add_bookmark(self, note: str = "") -> dict | None:
+    def add_bookmark(self, note: str = "", source: str | None = None) -> dict | None:
+        """Mark the current moment. ``source`` records where the marker came
+        from ("tray", "hotkey", …); it is stored only when the caller gives
+        it, so existing bookmark records keep their exact shape."""
         session = self.live
         if session is None or not self.live_active():
             return None
         item = {"t": round(session._elapsed_seconds(), 2), "note": (note or "Bookmark").strip()[:200] or "Bookmark"}
+        if source:
+            item["source"] = str(source).strip()[:32]
         marks = self.library.bookmarks(session.meta.id)
         marks.append(item)
         self.library.save_bookmarks(session.meta.id, marks)

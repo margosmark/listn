@@ -86,16 +86,24 @@ uv run listn tray                  # starts the engine if none is running on the
 uv run listn tray --no-server      # only attach to an already-running engine
 ```
 
-The tray menu is exactly: recording status, Start/Stop, Pause/Resume, the two
+The tray menu is exactly: recording status, Start/Stop, Pause/Resume,
+Bookmark this moment, the two
 target pickers (radio picks; the system picker holds whole sinks and
 individual application streams in one group, so exactly one is checked;
-session defaults labelled as suggestions), Open privacy settings (listn's
-own settings page — PipeWire has no macOS-style per-app permission list,
-and the tray does not pretend otherwise), and Quit (which stops an active
-recording first). Failure is shown as failure with the recorder's own cause
-(dead track, refused start, engine not answering) — never a stale
-"recording". The D-Bus contract is covered by tests against a real session
-bus; interaction with a running plasmashell panel is not yet exercised.
+session defaults labelled as suggestions), a
+Show captions toggle (off by default; opt-in local caption window), a
+global-shortcut status line (start/stop and bookmark are configurable
+`Ctrl+Alt+R` / `Ctrl+Alt+B` registered through the desktop's
+GlobalShortcuts portal — whatever it grants or refuses is shown there), Open
+privacy settings (listn's own settings page — PipeWire has no macOS-style per-app permission list,
+and the tray does not pretend otherwise), and Quit
+(which stops an active recording first). Failure is shown as failure with the
+recorder's own cause (dead track, refused start, engine not answering) —
+never a stale "recording". The D-Bus contract is covered by tests against a
+real session bus and the Tk caption window under Xvfb; interaction with a
+running plasmashell panel is not yet exercised. See
+[Linux desktop: captions and global shortcuts](docs/LINUX_DESKTOP.md) for
+the feature contract, privacy rules and the target-Plasma manual test.
 
 `listn live` and the web UI's single-input mode record **one** PortAudio
 input. A PipeWire/PulseAudio monitor may be selectable if exposed
