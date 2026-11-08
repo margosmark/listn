@@ -785,6 +785,11 @@ def test_recorder_on_block_feeds_engine_shape(fake_pw):
 # Integration: captured PCM drives the engine's existing ingest pipeline
 # ---------------------------------------------------------------------------
 
+#: Audio the stand-in must have delivered per track before the capture is
+#: stopped; the ingest contract below asserts > 1.0 s survives the pipeline.
+MIN_CAPTURE_SECONDS = 2.0
+
+
 def test_capture_feeds_engine_ingest_session(data_dir, fake_factory, fake_pw):
     from listn.config import Settings
     from listn.engine import Engine
@@ -794,12 +799,21 @@ def test_capture_feeds_engine_ingest_session(data_dir, fake_factory, fake_pw):
         Settings(model="tiny", chunk_seconds=2.0),
         {"source": "system", "mic": True}, "PipeWire prototype")
     pushes = []
+    captured = {TRACK_SYSTEM: 0.0, TRACK_MIC: 0.0}
 
     def on_block(track, rate, block):
         pushes.append(session.push_audio(track, rate, block))
+        captured[track] += block.shape[0] / rate
 
     recorder = start_recorder(fake_pw, on_block=on_block)
-    time.sleep(0.4)
+    # Wait on the captured audio budget, not wall time. The stand-in writes
+    # ~10x realtime, but under CPU saturation it is starved and a fixed 0.4 s
+    # sleep can stop the capture before the ingest session has the >1 s the
+    # contract below requires. 2 s gives the floor a 2x margin regardless of
+    # how slow the generator runs.
+    assert wait_for(lambda: all(seconds >= MIN_CAPTURE_SECONDS
+                                for seconds in captured.values()),
+                    timeout=15.0), f"capture starved: {captured}"
     report = recorder.stop()
     assert report["ok"] is True
     assert pushes and all(pushes), "a block was pushed after the session stopped"
