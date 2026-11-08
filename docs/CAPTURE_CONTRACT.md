@@ -221,7 +221,7 @@ is attached yet.
 
 | Surface | Contract |
 |---|---|
-| `GET /api/pipewire/devices` | Discovery only, never selects: `available`, `sinks`, `sources`, `defaults`, `usable`, `error` |
+| `GET /api/pipewire/devices` | Discovery only, never selects: `available`, `sinks`, `sources`, `apps` (L1: the `Stream/Output/Audio` candidates for the system track), `defaults`, `usable`, `error` |
 | `POST /api/live/start` | Both targets required (400 with the refusal reason); 409 when a recording already runs; nothing starts on refusal |
 | `GET /api/live` | `pipewire` object = live status (§6), `report` null until stopped |
 | `POST /api/live/stop` | Response `pipewire` = the final report (§3) |

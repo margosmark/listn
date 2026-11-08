@@ -338,14 +338,18 @@ async function loadPipeWire() {
       [n.name, `${n.description || n.name} · ${n.name}${d.defaults.sink === n.name ? " · session default" : ""}`]);
     const sources = d.sources.map(n =>
       [n.name, `${n.description || n.name} · ${n.name}${d.defaults.source === n.name ? " · session default" : ""}`]);
-    fillSelect($("#pw-system"), [["", "Choose a system output…"], ...sinks], $("#pw-system").value || "");
+    // Application streams are an alternative to the whole sink for the same
+    // track: picking one records that application only, never a mix.
+    const apps = (d.apps || []).map(n =>
+      [n.name, `${n.description || n.name} · ${n.name} · one application only`]);
+    fillSelect($("#pw-system"), [["", "Choose a system output or one application…"], ...sinks, ...apps], $("#pw-system").value || "");
     fillSelect($("#pw-mic"), [["", "Choose a microphone…"], ...sources], $("#pw-mic").value || "");
     const mode = $("#pw-mode");
     const pipewireOption = mode.querySelector("option[value=pipewire]");
     pipewireOption.disabled = !pwUsable();
     if (!pwUsable() && mode.value === "pipewire") mode.value = "device";
     if (pwUsable()) {
-      $("#capture-help").textContent = "Choose a system output and a microphone above, then Start: both are recorded as separate tracks through PipeWire. The session keeps independent system and microphone tracks; nothing leaves this computer.";
+      $("#capture-help").textContent = "Choose a system output (every application mixed) or one application, plus a microphone, then Start: both are recorded as separate tracks through PipeWire. The session keeps independent system and microphone tracks; nothing leaves this computer.";
     }
     renderPipeWire();
     renderLive();
