@@ -303,6 +303,9 @@ class CudaBrokenWhisper:
     instances: list = []
     fail_devices = ("auto",)
     fail_at_init = False
+    # The message the CUDA-shaped RuntimeError carries; tests widen this to the
+    # fault class (GPU OOM ...) that must NOT be recovered as "unavailable".
+    error = _CUBLAS_ERROR
 
     def __init__(self, model, **kwargs):
         self.model = model
@@ -310,12 +313,12 @@ class CudaBrokenWhisper:
         self.transcribe_kwargs = None
         CudaBrokenWhisper.instances.append(self)
         if CudaBrokenWhisper.fail_at_init and kwargs.get("device") in CudaBrokenWhisper.fail_devices:
-            raise RuntimeError(_CUBLAS_ERROR)
+            raise RuntimeError(CudaBrokenWhisper.error)
 
     def transcribe(self, audio, **kwargs):
         self.transcribe_kwargs = kwargs
         if self.init_kwargs.get("device") in CudaBrokenWhisper.fail_devices:
-            raise RuntimeError(_CUBLAS_ERROR)
+            raise RuntimeError(CudaBrokenWhisper.error)
         segment = types.SimpleNamespace(start=0.0, end=1.0, text="hello", no_speech_prob=0.0)
         return iter([segment]), types.SimpleNamespace(language="en")
 
@@ -398,3 +401,67 @@ def test_cache_key_distinguishes_the_cpu_fallback_from_the_configured_build(cuda
     other = _build(compute_type="float16")
     assert other is not t
     assert len(cuda_broken_whisper.instances) == 3   # auto, cpu rebuild, float16 auto
+
+
+# --- F1: only load/availability errors may be called "CUDA libraries unavailable"
+# A healthy-GPU box still raises inside cuBLAS/CUDA/NCCL (VRAM OOM, illegal
+# memory access, NCCL failures). Those are faults on a working stack, not
+# missing libraries: recovering them would relabel the job, the live status and
+# the cache key with a cause that is not true.
+
+@pytest.mark.parametrize("message", [
+    "cuBLAS failed with status CUBLAS_STATUS_ALLOC_FAILED",   # GPU OOM
+    "CUDA failed with error out of memory",                   # GPU OOM
+    "CUDA failed with error an illegal memory access was encountered",
+    "NCCL failed with error 1",
+    "std::bad_alloc",
+    "Out of memory",                       # CPU-side, not CUDA at all
+    "Audio is too short",
+    "Invalid data found when processing input",
+])
+def test_runtime_faults_are_not_cuda_unavailability(message):
+    assert tr._is_cuda_unavailable(RuntimeError(message)) is False
+
+
+@pytest.mark.parametrize("message", [
+    _CUBLAS_ERROR,
+    "Library libnccl.so.2 is not found or cannot be loaded",
+    "Library libcudnn.so.9 is not found or cannot be loaded",
+    "CUDA driver version is insufficient for CUDA runtime version",
+    "CUDA failed with error no CUDA-capable device is detected",
+    "CUDA-capable device(s) is/are busy or unavailable",
+    "CUDA driver is a stub library",
+])
+def test_missing_or_unusable_cuda_still_recovers_on_cpu(message):
+    assert tr._is_cuda_unavailable(RuntimeError(message)) is True
+
+
+@pytest.mark.parametrize("message", [_CUBLAS_ERROR, "CUDA failed with error out of memory"])
+def test_only_runtime_errors_are_considered(message):
+    assert tr._is_cuda_unavailable(ValueError(message)) is False
+
+
+def test_gpu_oom_at_transcribe_time_propagates_without_cpu_rebuild(cuda_broken_whisper, monkeypatch):
+    """A transient VRAM OOM must surface as itself, never as the fallback note."""
+    monkeypatch.setattr(CudaBrokenWhisper, "error",
+                        "cuBLAS failed with status CUBLAS_STATUS_ALLOC_FAILED")
+    statuses = []
+    t = _build(status=statuses.append)
+    with pytest.raises(RuntimeError, match="ALLOC_FAILED"):
+        list(t.segments(np.zeros(16000, dtype=np.float32)))
+    # No CPU rebuild, no announcement, still keyed as configured.
+    assert [m.init_kwargs["device"] for m in cuda_broken_whisper.instances] == ["auto"]
+    assert t.device == "auto" and t.status_note is None
+    assert statuses == []
+
+
+def test_gpu_oom_at_build_time_propagates_without_cpu_rebuild(cuda_broken_whisper, monkeypatch):
+    monkeypatch.setattr(CudaBrokenWhisper, "error", "CUDA failed with error out of memory")
+    cuda_broken_whisper.fail_at_init = True
+    statuses = []
+    with pytest.raises(RuntimeError, match="out of memory"):
+        _build(status=statuses.append)
+    # Only the configured (auto) builds were attempted — never a CPU rebuild,
+    # and the fallback note was never announced.
+    assert {m.init_kwargs["device"] for m in cuda_broken_whisper.instances} == {"auto"}
+    assert tr.CPU_FALLBACK_MESSAGE not in statuses
