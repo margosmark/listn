@@ -140,7 +140,10 @@ running or starts one on the port if nothing is answering — so a login start
 never doubles up on a running server. The login entry is an install-time
 choice made by `install --autostart`, never a tray control: the tray has no
 launch-at-login control, that macOS control stays hidden. `uninstall` removes
-the login entry too, whether or not you installed it.
+the login entry too, whether or not you installed it. Re-running `install`
+refreshes the entries in place — including a login entry you already opted
+into — so an upgrade never leaves a stale command behind, and it never
+creates a login entry without `--autostart`.
 
 The web UI's **Settings → Launch at login** toggle does the same job without
 the installer. On Linux it writes `$XDG_CONFIG_HOME/autostart/listn.desktop`
@@ -171,6 +174,14 @@ The newest release tag must match `pkgver` (currently `v0.5.0`): when a new
 tag is cut, bump `pkgver` and refresh the measured `sha256sums` with
 `updpkgsums`. The test suite stays red until the two match, and `makepkg`
 fails loudly on a missing or changed source either way.
+
+Upgrade = rebuild (after the `pkgver`/`pkgrel` bump) and
+`sudo pacman -U listn-*.pkg.tar.zst`; remove with `sudo pacman -R listn`.
+Removal takes only the package's own files: your environment
+(`~/.local/share/listn/env`), data and transcripts (`~/.local/share/listn`),
+any model cache, and a login entry you copied in are left in place — the
+package's `.install` message repeats this at install, upgrade and removal.
+
 pacman installs the project tree in `/usr/share/listn`, the launcher in
 `/usr/bin/listn`, and the menu entry with its icon. The launcher lets `uv`
 build **your** environment on first run from the shipped `uv.lock`, into
@@ -192,7 +203,18 @@ install -Dm644 /usr/share/listn/packaging/listn-tray.desktop \
 
 Remove that file to stop; the package's `.install` message repeats both
 commands. Desktop-entry correctness, the installer's XDG writes and these
-documented commands are covered by `uv run pytest tests/test_desktop_packaging.py`.
+documented commands are covered by `uv run pytest tests/test_desktop_packaging.py`,
+which also runs the isolated-HOME shell lifecycle test
+(`tests/shell/test_desktop_lifecycle.sh`: install, explicit login opt-in,
+re-install, uninstall, user data left alone) and checks the PKGBUILD's
+`package()` output against the pinned tag source. The clean Arch
+build/install/upgrade/uninstall lifecycle runs through
+`scripts/arch_pkg_check.sh` — natively where `makepkg` exists, in an
+archlinux container via docker/podman, otherwise an honest SKIP — and CI
+runs it in an `archlinux` container
+(`.github/workflows/arch-package.yml`). These are shell and container
+checks, not a Plasma login test: app-menu visibility, the tray in a real
+panel and autostart firing at login still need a manual pass on a desktop.
 
 ## Quick start
 

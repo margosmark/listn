@@ -1,0 +1,57 @@
+name: arch-package
+
+# L6 package lifecycle CI: a clean Arch build/install/upgrade/uninstall of
+# packaging/arch/PKGBUILD in an archlinux container, plus the isolated-HOME
+# desktop installer shell test.
+# These are container checks - NOT a Plasma login test. App-menu
+# visibility, the tray in a real panel and autostart firing at login stay
+# manual acceptance (docs/OPERATIONS.md).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - packaging/**
+      - scripts/arch_pkg_check.sh
+      - scripts/listn-desktop.sh
+      - tests/shell/**
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/arch-package.yml
+  pull_request:
+    paths:
+      - packaging/**
+      - scripts/arch_pkg_check.sh
+      - scripts/listn-desktop.sh
+      - tests/shell/**
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/arch-package.yml
+  workflow_dispatch:
+
+jobs:
+  pkg-lifecycle:
+    name: Clean Arch build/install/upgrade/uninstall
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    timeout-minutes: 45
+    steps:
+      # actions/checkout needs git in the bare archlinux image.
+      - name: Tooling for checkout
+        run: pacman -Sy --noconfirm --needed git curl
+      - uses: actions/checkout@v4
+      - name: Build, install, first run, one-engine-at-login, upgrade, uninstall
+        env:
+          # The repo is private: auth for the pinned tag archive the
+          # PKGBUILD downloads (makepkg verifies the sha256 either way).
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: sh scripts/arch_pkg_check.sh
+
+  desktop-lifecycle:
+    name: Isolated-HOME desktop installer lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install / opt-in / upgrade / uninstall against a throwaway HOME
+        run: sh tests/shell/test_desktop_lifecycle.sh
