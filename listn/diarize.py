@@ -109,7 +109,7 @@ def readiness(token: str | None) -> dict:
     if not is_installed:
         message = INSTALL_HINT
     elif cached or loaded:
-        message = f"Speaker model is on this Mac ({(loaded or cached).split('/')[-1]}). It loads offline."
+        message = f"Speaker model is on this machine ({(loaded or cached).split('/')[-1]}). It loads offline."
     elif has_token:
         message = ("The speaker model downloads once, the first time speakers are labelled. "
                    f"Accept the terms at {terms_urls((COMMUNITY_ID,))[0]} first.")
@@ -122,6 +122,10 @@ def readiness(token: str | None) -> dict:
         "cached": cached,
         "loaded": loaded,
         "ready": bool(is_installed and (cached or loaded or has_token)),
+        # Ready only because a token is set: nothing is on disk yet, so the first
+        # labelling is what downloads the model. Readiness and "will download"
+        # are different facts and the UI shows them separately.
+        "needs_download": bool(is_installed and has_token and not (cached or loaded)),
         "message": message,
         "terms": terms_urls(),
     }
@@ -213,7 +217,7 @@ def load_pipeline(token: str | None, status: Callable[[str], None] | None = None
             where = (
                 f"The saved speaker model didn't load ({'; '.join(errors)})."
                 if cached_pipeline()
-                else "The speaker model isn't on this Mac yet."
+                else "The speaker model isn't on this machine yet."
             )
             raise DiarizationUnavailable(
                 f"{where} Add a Hugging Face token in Settings for the one-time download, after accepting the "

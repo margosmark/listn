@@ -544,13 +544,29 @@ def library_clips(library: Library, name: str, limit: int = ENROL_CLIPS) -> list
 
 
 def slice_session_audio(library: Library, session_id: str, start: float, end: float) -> np.ndarray:
-    root = library.session_path(session_id)
-    system = root / "audio-system.wav"
-    # The Others track is the voice we want. The mix also contains Me.
-    path = system if system.exists() else library.audio_path(library.get(session_id))
+    """One line of the Others track, for learning a voice from.
+
+    Prefers the speaker-isolated system track. The microphone track is the
+    user's own voice, so a session that only has that is refused rather than
+    enrolled from. A session recorded as a single track (an import) has no
+    isolated track at all, so its own recording is used — there is nothing
+    else to slice.
+    """
+    path = others_track(library, session_id)
     if path is None:
+        if (library.session_path(session_id) / "audio-mic.wav").exists():
+            raise ValueError(
+                "This session only has your microphone track, so there is no audio of other people "
+                "alone to learn a voice from. Label a session that has the Others track instead."
+            )
         raise FileNotFoundError("This session has no saved audio to learn a voice from.")
-    audio = read_wav(path)
+    if not path.exists():
+        raise FileNotFoundError("This session has no saved audio to learn a voice from.")
+    audio = read_wav(path) if path.suffix.lower() == ".wav" else None
+    if audio is None:
+        from listn.audio import decode_file
+
+        audio = decode_file(path)
     n0 = max(0, int(start * TARGET_RATE))
     n1 = min(audio.size, int(max(end, start + 0.3) * TARGET_RATE))
     if n1 <= n0:
