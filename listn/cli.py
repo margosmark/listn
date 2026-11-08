@@ -93,6 +93,7 @@ def cmd_tray(args) -> int:
               "or `pip install 'listn[tray]'`.", file=sys.stderr)
         return 3
 
+    from listn.meeting_watch import MeetingWatcher
     from listn.tray import ServerClient, TrayController, port_in_use
     from listn.tray_sni import StatusNotifierItem
 
@@ -118,7 +119,8 @@ def cmd_tray(args) -> int:
             return 1
         print(f"listn tray: engine started on 127.0.0.1:{port}")
 
-    controller = TrayController(ServerClient(port=port))
+    controller = TrayController(ServerClient(port=port),
+                                meeting_watcher=MeetingWatcher())
     tray = StatusNotifierItem(controller)
     try:
         asyncio.run(_run_desktop(controller, tray, port))

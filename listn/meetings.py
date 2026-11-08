@@ -1,10 +1,13 @@
 """Which apps count as a meeting, and which calendar event they overlap.
 
-The menu bar app uses the same rules. Bundle ids are matched exactly.
-Browsers count only when a window title looks like Meet, Zoom, Teams, or
-Webex. Slack counts only for a huddle. The calendar pick is the shortest
-event that contains the current time, which is usually the meeting rather
-than an all-day hold.
+The menu bar app uses the same rules. Bundle ids are matched exactly
+(case-insensitively, so Linux desktop ids and macOS bundle ids both fit).
+Dedicated meeting apps match on the id alone. Browsers count only when a
+window title looks like Meet, Zoom, Teams, or Webex. Slack counts only for
+a huddle. The Linux watcher (``listn/meeting_sources``) feeds the same
+function with PipeWire application ids and, where available, X11 window
+titles. The calendar pick is the shortest event that contains the current
+time, which is usually the meeting rather than an all-day hold.
 """
 
 from __future__ import annotations
@@ -13,11 +16,14 @@ from datetime import datetime
 
 MEETING_APPS = {
     "us.zoom.xos": "Zoom",
+    "zoom": "Zoom",                      # Linux binary / desktop id
     "com.microsoft.teams2": "Teams",
     "com.microsoft.teams": "Teams",
+    "teams": "Teams",                    # Linux binary
     "com.cisco.webexmeetings": "Webex",
     "com.webex.meetingmanager": "Webex",
     "Cisco-Systems.Spark": "Webex",
+    "webex": "Webex",                    # Linux binary
     "com.apple.FaceTime": "FaceTime",
     "com.apple.facetime": "FaceTime",
 }
@@ -29,20 +35,36 @@ BROWSERS = {
     "com.brave.Browser",
     "com.microsoft.edgemac",
     "org.mozilla.firefox",
+    # Linux identities: WM_CLASS / process binary / desktop file ids.
+    "firefox",
+    "google-chrome",
+    "chromium",
+    "org.chromium.Chromium",
+    "microsoft-edge",
+    "com.microsoft.Edge",
+    "brave-browser",
 }
 
 BROWSER_HINTS = ("google meet", "meet.google", "zoom meeting", "microsoft teams", "webex")
 SLACK = "com.tinyspeck.slackmacgap"
+SLACK_IDS = {SLACK, "com.slack.Slack", "slack"}   # macOS bundle + Linux ids
+
+# Lowercased lookup tables: ids are compared case-insensitively so the
+# macOS bundle ids and Linux desktop ids share one rule set.
+_MEETING_APPS = {key.lower(): value for key, value in MEETING_APPS.items()}
+_BROWSERS = {key.lower() for key in BROWSERS}
+_SLACK_IDS = {key.lower() for key in SLACK_IDS}
 
 
 def meeting_label(bundle_id: str, app_name: str = "", window_titles: list[str] | None = None) -> str | None:
     titles = " ".join(window_titles or []).lower()
     name = (app_name or "").lower()
-    if bundle_id in MEETING_APPS:
-        return MEETING_APPS[bundle_id]
-    if bundle_id == SLACK and ("huddle" in titles or "huddle" in name):
+    identity = (bundle_id or "").lower()
+    if identity in _MEETING_APPS:
+        return _MEETING_APPS[identity]
+    if identity in _SLACK_IDS and ("huddle" in titles or "huddle" in name):
         return "Slack huddle"
-    if bundle_id in BROWSERS:
+    if identity in _BROWSERS:
         blob = f"{titles} {name}"
         if any(hint in blob for hint in BROWSER_HINTS):
             return "Browser meeting"
