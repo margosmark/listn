@@ -160,6 +160,7 @@ class TrayStatus:
     system_frames: int | None = None
     mic_frames: int | None = None
     session_id: str | None = None
+    device_note: str | None = None   # L7: lost / no device / recovery, if any
 
     @property
     def active(self) -> bool:
@@ -189,7 +190,44 @@ class TrayStatus:
                 tracks.append(f"mic {self.mic_frames}f")
             if tracks:
                 bits.append("· ".join(tracks))
+            if self.device_note:
+                bits.append(self.device_note)
         return " — ".join(bits)
+
+
+# Device states worth putting in front of the user while recording (L7).
+# `recording`, `stopped` and `replaced` are not problems, so they are
+# deliberately absent: the tray only speaks up when something needs the
+# user's attention (and the full state machine is in the API payload).
+DEVICE_NOTE_STATES = {
+    "lost": "device lost",
+    "no_device": "no device",
+    "unavailable": "PipeWire unavailable",
+    "recovering": "replacing device…",
+    "exhausted": "recovery spent",
+    "silent": "no signal",
+}
+
+
+def device_note(devices: dict | None) -> str | None:
+    """One short line naming every track whose device needs attention."""
+    if not isinstance(devices, dict):
+        return None
+    tracks = devices.get("tracks") or {}
+    notes = []
+    for name in ("system", "mic"):
+        track = tracks.get(name)
+        if not isinstance(track, dict):
+            continue
+        note = DEVICE_NOTE_STATES.get(track.get("state"))
+        if note:
+            notes.append(f"{name}: {note}")
+    retargets = devices.get("retargets")
+    if isinstance(retargets, int) and not isinstance(retargets, bool) \
+            and retargets > 0:
+        notes.append(f"{retargets} device replacement"
+                     + ("s" if retargets != 1 else ""))
+    return "; ".join(notes) or None
 
 
 def derive_status(payload: dict | None, error: str | None = None) -> TrayStatus:
@@ -214,6 +252,7 @@ def derive_status(payload: dict | None, error: str | None = None) -> TrayStatus:
         tracks = pw.get("tracks") or {}
         status.system_frames = (tracks.get("system") or {}).get("frames")
         status.mic_frames = (tracks.get("mic") or {}).get("frames")
+        status.device_note = device_note(pw.get("devices"))
         report = pw.get("report")
         if isinstance(report, dict):
             if report.get("ok"):

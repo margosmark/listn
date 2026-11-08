@@ -1,0 +1,86 @@
+{
+  "description": "System track silent while the mic has signal: nobody may have been playing anything, so the run stays ok (the asymmetric decision).",
+  "expect": {
+    "ok": true,
+    "failed_tracks": []
+  },
+  "report": {
+    "ok": true,
+    "out_dir": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/system_silent",
+    "rate": 48000,
+    "targets": {
+      "system": {
+        "id": 32,
+        "serial": 32,
+        "name": "sys.silent",
+        "media_class": "Audio/Sink",
+        "description": null,
+        "track": "system",
+        "selection": "default"
+      },
+      "mic": {
+        "id": 34,
+        "serial": 34,
+        "name": "mic.tone",
+        "media_class": "Audio/Source",
+        "description": null,
+        "track": "mic",
+        "selection": "default"
+      }
+    },
+    "tracks": {
+      "system": {
+        "track": "system",
+        "track_id": 0,
+        "target": {
+          "id": 32,
+          "serial": 32,
+          "name": "sys.silent",
+          "media_class": "Audio/Sink",
+          "description": null,
+          "track": "system",
+          "selection": "default"
+        },
+        "state": "stopped",
+        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/system_silent/system.wav",
+        "duration": 3.4,
+        "samplerate": 48000,
+        "channels": 1,
+        "frames": 163200,
+        "rms_db": -120.0,
+        "peak_db": -120.0,
+        "fs_fraction": 0.0,
+        "verdict": "silent",
+        "error": null,
+        "exit_code": 1,
+        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/system_silent/system.pw-record.log"
+      },
+      "mic": {
+        "track": "mic",
+        "track_id": 1,
+        "target": {
+          "id": 34,
+          "serial": 34,
+          "name": "mic.tone",
+          "media_class": "Audio/Source",
+          "description": null,
+          "track": "mic",
+          "selection": "default"
+        },
+        "state": "stopped",
+        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/system_silent/mic.wav",
+        "duration": 3.2,
+        "samplerate": 48000,
+        "channels": 1,
+        "frames": 153600,
+        "rms_db": -9.3,
+        "peak_db": -6.3,
+        "fs_fraction": 0.0,
+        "verdict": "ok",
+        "error": null,
+        "exit_code": 1,
+        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/system_silent/mic.pw-record.log"
+      }
+    }
+  }
+}

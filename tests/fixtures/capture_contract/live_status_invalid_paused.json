@@ -1,0 +1,83 @@
+{
+  "description": "Invalid: the capture source never reports 'paused' \u2014 pause belongs to the engine session and leaves both streams running.",
+  "status": {
+    "active": true,
+    "state": "paused",
+    "out_dir": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok",
+    "rate": 48000,
+    "targets": {
+      "system": {
+        "id": 32,
+        "serial": 32,
+        "name": "sys.tone",
+        "media_class": "Audio/Sink",
+        "description": "Built-in Audio Analog Stereo",
+        "track": "system",
+        "selection": "default"
+      },
+      "mic": {
+        "id": 34,
+        "serial": 34,
+        "name": "mic.tone",
+        "media_class": "Audio/Source",
+        "description": "USB Microphone",
+        "track": "mic",
+        "selection": "default"
+      }
+    },
+    "tracks": {
+      "system": {
+        "state": "recording",
+        "frames": 139200,
+        "seconds": 2.9,
+        "error": null,
+        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/system.wav"
+      },
+      "mic": {
+        "state": "recording",
+        "frames": 144000,
+        "seconds": 3.0,
+        "error": null,
+        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/mic.wav"
+      }
+    },
+    "devices": {
+      "active": true,
+      "tracks": {
+        "system": {
+          "state": "recording",
+          "cause": null,
+          "node": "sys.tone",
+          "media_class": "Audio/Sink",
+          "signal": null,
+          "reconnectable": false,
+          "recovery_attempts": 0,
+          "max_recovery_attempts": 2,
+          "replacement_candidates": [],
+          "detail": null
+        },
+        "mic": {
+          "state": "recording",
+          "cause": null,
+          "node": "mic.tone",
+          "media_class": "Audio/Source",
+          "signal": null,
+          "reconnectable": false,
+          "recovery_attempts": 0,
+          "max_recovery_attempts": 2,
+          "replacement_candidates": [],
+          "detail": null
+        }
+      },
+      "defaults": {
+        "observed": {"sink": "sys.tone", "source": "mic.tone"},
+        "remembered": {"sink": "sys.tone", "source": "mic.tone"}
+      },
+      "events": [
+        {"t": 0.0, "kind": "capture_started", "track": null, "node": null, "detail": null}
+      ],
+      "retargets": 0
+    },
+    "report": null
+  }
+}

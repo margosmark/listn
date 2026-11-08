@@ -1,0 +1,82 @@
+{
+  "description": "A lying report: ok=true while the microphone verdict is silent. The validator must refuse it (the false 'Capture OK' regression class).",
+  "report": {
+    "ok": true,
+    "out_dir": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/mic_silent",
+    "rate": 48000,
+    "targets": {
+      "system": {
+        "id": 32,
+        "serial": 32,
+        "name": "sys.tone",
+        "media_class": "Audio/Sink",
+        "description": null,
+        "track": "system",
+        "selection": "default"
+      },
+      "mic": {
+        "id": 34,
+        "serial": 34,
+        "name": "mic.silent",
+        "media_class": "Audio/Source",
+        "description": null,
+        "track": "mic",
+        "selection": "default"
+      }
+    },
+    "tracks": {
+      "system": {
+        "track": "system",
+        "track_id": 0,
+        "target": {
+          "id": 32,
+          "serial": 32,
+          "name": "sys.tone",
+          "media_class": "Audio/Sink",
+          "description": null,
+          "track": "system",
+          "selection": "default"
+        },
+        "state": "stopped",
+        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/mic_silent/system.wav",
+        "duration": 2.3,
+        "samplerate": 48000,
+        "channels": 1,
+        "frames": 110400,
+        "rms_db": -9.6,
+        "peak_db": -6.6,
+        "fs_fraction": 0.0,
+        "verdict": "ok",
+        "error": null,
+        "exit_code": 1,
+        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/mic_silent/system.pw-record.log"
+      },
+      "mic": {
+        "track": "mic",
+        "track_id": 1,
+        "target": {
+          "id": 34,
+          "serial": 34,
+          "name": "mic.silent",
+          "media_class": "Audio/Source",
+          "description": null,
+          "track": "mic",
+          "selection": "default"
+        },
+        "state": "stopped",
+        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/mic_silent/mic.wav",
+        "duration": 3.3,
+        "samplerate": 48000,
+        "channels": 1,
+        "frames": 158400,
+        "rms_db": -120.0,
+        "peak_db": -120.0,
+        "fs_fraction": 0.0,
+        "verdict": "silent",
+        "error": null,
+        "exit_code": 1,
+        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/mic_silent/mic.pw-record.log"
+      }
+    }
+  }
+}
