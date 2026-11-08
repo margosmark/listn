@@ -310,7 +310,7 @@ def test_menu_application_streams_are_a_section_of_the_system_picker():
     # the section is not a new top-level control
     assert {i.id for i in top if not i.separator} == \
         {ITEM_STATUS, ITEM_START, ITEM_STOP, ITEM_PAUSE, ITEM_RESUME,
-         10, 11, ITEM_PRIVACY, ITEM_QUIT}
+         ITEM_BOOKMARK, ITEM_CAPTIONS, 10, 11, ITEM_PRIVACY, ITEM_QUIT}
     system = items[10]
     assert [c.label for c in system.children] == \
         ["Speakers", "", "Application streams", "AppA", "AppB"]

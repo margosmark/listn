@@ -18,15 +18,19 @@ Three layers, so the interesting logic needs neither Qt nor a session bus:
   D-Bus (Plasma's tray protocol), a renderer of this model.
 
 Scope honesty: the menu offers exactly start/stop, pause/resume, the target
-pickers, open privacy settings, quit. The system-output picker covers both
-capture modes of the same track — a whole sink ("all applications") or one
-application stream — from the lists the local API returns, in one radio
-group, so what is checked is what is recorded. The macOS-only or
-unimplemented controls (``offer-meetings``, ``auto-record``,
-``launch-at-login``) do not exist here — not disabled, absent. Privacy
-settings on Linux is listn's own retention/audio settings page: PipeWire
-has no macOS-style per-app permission list, and the tray does not pretend
-otherwise.
+pickers, meeting prompts (offer / not now / remind later / end offer —
+see ``listn/meeting_watch.py``), open privacy settings, quit. The
+system-output picker covers both capture modes of the same track — a
+whole sink ("all applications") or one application stream — from the
+lists the local API returns, in one radio group, so what is checked is
+what is recorded. The macOS-only or unimplemented controls
+(``offer-meetings``, ``auto-record``, ``launch-at-login``) do not exist
+here — not disabled, absent. Meeting prompts are consent-gated:
+auto-record is off unless the user enabled it in settings, and detection
+sources are the documented PipeWire/X11 ones (``docs/LINUX_MEETINGS.md``),
+never an unsupported window API. Privacy settings on Linux is listn's own
+retention/audio settings page: PipeWire has no macOS-style per-app
+permission list, and the tray does not pretend otherwise.
 
 Local-first: HTTP stays on loopback, D-Bus stays on the session bus; nothing
 here opens a socket to anywhere else.
@@ -78,6 +82,12 @@ ITEM_SHORTCUTS = 9       # global shortcut status line (informational)
 ITEM_PRIVACY = 20
 ITEM_QUIT = 30
 SETTINGS_POLL_EVERY = 5  # refreshes between GET /api/settings pulls
+
+# Meeting prompt items (L3a): present only while a prompt is pending.
+ITEM_MEETING_RECORD = 40
+ITEM_MEETING_DISMISS = 41
+ITEM_MEETING_SNOOZE = 42
+ITEM_MEETING_END = 43
 
 
 class ServerUnreachable(ConnectionError):
@@ -139,6 +149,10 @@ class ServerClient:
 
     def live(self) -> dict:
         return self._request("GET", "/api/live")
+
+    def settings(self) -> dict:
+        """Server-held settings (offer/auto-record flags are server truth)."""
+        return self._request("GET", "/api/settings")
 
     def devices(self) -> dict:
         return self._request("GET", "/api/pipewire/devices")
@@ -362,7 +376,8 @@ def build_menu(status: TrayStatus, sinks: list[dict], sources: list[dict],
                discovery_error: str | None = None,
                captions_enabled: bool = False,
                shortcut_status=None,
-               captions_unavailable: str | None = None) -> list[MenuItem]:
+               captions_unavailable: str | None = None,
+               meeting_prompt=None) -> list[MenuItem]:
     """The whole tray menu. Unimplemented macOS controls are absent, not greyed.
 
     ``sinks`` and ``apps`` are two halves of *one* system-track picker:
@@ -375,11 +390,32 @@ def build_menu(status: TrayStatus, sinks: list[dict], sources: list[dict],
     ``shortcut_status`` (a ``listn.shortcuts.ShortcutStatus``) only ever
     *reports*: when the desktop would not grant the global shortcuts the
     line says so and the start/stop/bookmark controls above it stay usable.
+
+    ``meeting_prompt`` (a ``listn.meeting_watch.MeetingPrompt``) adds the
+    consent block while a prompt is pending: record / not now / remind
+    later for an offer, or the end offer for a meeting that just ended.
     """
     items = [MenuItem(ITEM_STATUS, status.summary(), enabled=False)]
     if status.state == FAILED or status.state == UNREACHABLE:
         pass  # the cause is already in the summary line
     items.append(MenuItem(0, "", separator=True))
+
+    if meeting_prompt is not None and meeting_prompt.kind == "offer":
+        can_record = (status.state in (IDLE, FAILED) and not status.active
+                      and selected_system is not None
+                      and selected_mic is not None)
+        items.append(MenuItem(ITEM_MEETING_RECORD,
+                              f"Record {meeting_prompt.label}?",
+                              enabled=can_record))
+        items.append(MenuItem(ITEM_MEETING_DISMISS, "Not now"))
+        items.append(MenuItem(ITEM_MEETING_SNOOZE, "Remind me in 5 minutes"))
+        items.append(MenuItem(0, "", separator=True))
+    elif meeting_prompt is not None and meeting_prompt.kind == "end":
+        items.append(MenuItem(
+            ITEM_MEETING_END,
+            f"{meeting_prompt.label} ended — stop recording",
+            enabled=status.state in (RECORDING, PAUSED)))
+        items.append(MenuItem(0, "", separator=True))
 
     can_start = (status.state in (IDLE, FAILED) and not status.active
                  and selected_system is not None and selected_mic is not None)
@@ -482,7 +518,8 @@ class TrayController:
     """
 
     def __init__(self, client: ServerClient, on_quit=None,
-                 targets_file: Path | None = None):
+                 targets_file: Path | None = None,
+                 meeting_watcher=None, meeting_source=None):
         self.client = client
         self.on_quit = on_quit
         self.status = TrayStatus(state=UNREACHABLE)
@@ -503,6 +540,12 @@ class TrayController:
         self.captions = None                # CaptionSupervisor, once started
         self.on_chords_changed = None       # callable(chords) -> None
         self._settings_countdown = 0
+        # L3a meeting prompts: a watcher (pure state) plus a hit source
+        # (PipeWire + X11, see listn.meeting_sources). Both optional —
+        # without them the tray is exactly the pre-meeting tray.
+        self.meeting_watcher = meeting_watcher
+        self.meeting_source = meeting_source
+        self.meeting_prompt = None
         self._targets_file = targets_file or (data_dir() / "tray-targets.json")
         self._load_targets()
 
@@ -541,6 +584,7 @@ class TrayController:
             self._refresh_settings()
             if not self.sinks and not self.discovery_error:
                 self._load_devices()
+        self._poll_meetings()
         return self.status
 
     def _refresh_settings(self) -> None:
@@ -574,6 +618,72 @@ class TrayController:
                 self.on_chords_changed(chords)
             except Exception:  # a rebind failure is reported by the status line
                 log.exception("shortcut rebind scheduling failed")
+
+
+    # -- meeting prompts (L3a) --------------------------------------------
+
+    def _poll_meetings(self) -> None:
+        """Advance the watcher with one poll's worth of hits.
+
+        Never raises: an unavailable source means "no meeting seen", and
+        a server that will not answer settings keeps the last values it
+        did give us (boot defaults: offer on, auto-record off — the
+        consent-safe direction).
+        """
+        watcher = self.meeting_watcher
+        if watcher is None or self.status.state == UNREACHABLE:
+            return
+        self._sync_meeting_settings(watcher)
+        source = self.meeting_source
+        if source is None:
+            from listn.meeting_sources import collect_hits
+            source = collect_hits
+        try:
+            hits = source()
+        except Exception:
+            hits = []
+        for event in watcher.poll(hits):
+            if event.kind in ("offer", "end"):
+                self.meeting_prompt = event
+            elif event.kind == "auto_start":
+                self.meeting_prompt = None
+                self.start(title=event.title)
+            elif event.kind == "auto_end":
+                self.meeting_prompt = None
+                self.stop()
+        # An offer whose meeting vanished before consent is stale.
+        if (self.meeting_prompt is not None
+                and self.meeting_prompt.kind == "offer"
+                and self.meeting_prompt.meeting_id
+                not in watcher.present_ids()):
+            self.meeting_prompt = None
+
+    def _sync_meeting_settings(self, watcher) -> None:
+        """Re-read ``GET /api/settings`` on every poll — macOS parity.
+
+        ``MenuBarController.refreshPrefs()`` re-reads the flags at start
+        **and on every ``menuWillOpen``**, so toggling a setting takes
+        effect without restarting the app; the tray polls at the same
+        rate it already fetches ``/api/live``, so a second small loopback
+        GET per tick keeps that parity continuously — including for a
+        toggle made while no menu is open. Server truth wins: a failed
+        fetch keeps the **last known** values (never the defaults), so a
+        dead server can never resurrect auto-record after the user
+        revoked it.
+        """
+        try:
+            settings = self.client.settings()
+        except Exception:  # a poll must never take the tray down
+            return
+        if not isinstance(settings, dict):
+            return
+        watcher.offer = bool(settings.get("offer_meetings", True))
+        watcher.auto_record = bool(settings.get("auto_record_meetings", False))
+        if (not watcher.offer and self.meeting_prompt is not None
+                and self.meeting_prompt.kind == "offer"):
+            # Offers were switched off while one was pending: it goes
+            # away with them instead of surviving until the meeting ends.
+            self.meeting_prompt = None
 
     def _load_devices(self) -> None:
         """Adopt the session defaults as labelled suggestions, once."""
@@ -627,7 +737,8 @@ class TrayController:
                            self.discovery_error,
                            captions_enabled=self.captions_enabled,
                            shortcut_status=self.shortcut_status,
-                           captions_unavailable=self.captions_reason())
+                           captions_unavailable=self.captions_reason(),
+                           meeting_prompt=self.meeting_prompt)
         if self.notice and self.status.state in (IDLE, FAILED):
             # The last action was refused (or failed) — show the server's
             # own reason as the status line instead of a bare "Idle".
@@ -653,6 +764,14 @@ class TrayController:
             self.toggle_captions()
         elif item_id == ITEM_SHORTCUTS:
             pass  # informational line: the reason is already in the label
+        elif item_id == ITEM_MEETING_RECORD:
+            self.accept_meeting()
+        elif item_id == ITEM_MEETING_DISMISS:
+            self.dismiss_meeting()
+        elif item_id == ITEM_MEETING_SNOOZE:
+            self.snooze_meeting()
+        elif item_id == ITEM_MEETING_END:
+            self.end_meeting()
         elif item_id == ITEM_PRIVACY:
             self.open_privacy()
         elif item_id == ITEM_QUIT:
@@ -681,7 +800,7 @@ class TrayController:
         self.notice = exc.detail
         self.refresh()
 
-    def start(self) -> None:
+    def start(self, title: str | None = None) -> None:
         if self.selected_system is None or self.selected_mic is None:
             self.notice = ("Pick a system output and a microphone first — "
                            "listn never guesses a capture target.")
@@ -690,7 +809,8 @@ class TrayController:
                                  system_target=self.selected_system,
                                  mic_target=self.selected_mic)
         try:
-            self.client.start(self.selected_system, self.selected_mic)
+            self.client.start(self.selected_system, self.selected_mic,
+                              title=title)
         except RequestRefused as exc:
             self._refused(exc)
             return
@@ -700,6 +820,38 @@ class TrayController:
         self._save_targets()
         self.notice = None
         self.refresh()
+
+    # -- meeting prompt actions (consent lives here) ----------------------
+
+    def accept_meeting(self) -> None:
+        """Record this meeting: the only path to a start from a prompt."""
+        prompt = self.meeting_prompt
+        if prompt is None or prompt.kind != "offer" or self.meeting_watcher is None:
+            return
+        self.meeting_watcher.accept(prompt.meeting_id)
+        self.meeting_prompt = None
+        self.start(title=prompt.title)
+
+    def dismiss_meeting(self) -> None:
+        prompt = self.meeting_prompt
+        if prompt is None or self.meeting_watcher is None:
+            return
+        self.meeting_watcher.dismiss(prompt.meeting_id)
+        self.meeting_prompt = None
+
+    def snooze_meeting(self) -> None:
+        prompt = self.meeting_prompt
+        if prompt is None or self.meeting_watcher is None:
+            return
+        self.meeting_watcher.snooze(prompt.meeting_id)
+        self.meeting_prompt = None
+
+    def end_meeting(self) -> None:
+        """The end offer: stop the recording this meeting started."""
+        if self.meeting_prompt is None:
+            return
+        self.meeting_prompt = None
+        self.stop()
 
     def pause(self) -> None:
         self._simple(self.client.pause)

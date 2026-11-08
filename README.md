@@ -94,7 +94,10 @@ session defaults labelled as suggestions), a
 Show captions toggle (off by default; opt-in local caption window), a
 global-shortcut status line (start/stop and bookmark are configurable
 `Ctrl+Alt+R` / `Ctrl+Alt+B` registered through the desktop's
-GlobalShortcuts portal — whatever it grants or refuses is shown there), Open
+GlobalShortcuts portal — whatever it grants or refuses is shown there),
+meeting prompts when a meeting is detected (Record / Not now / Remind me in
+5 minutes, then an end offer when it stops — see
+[Linux meeting detection](docs/LINUX_MEETINGS.md)), Open
 privacy settings (listn's own settings page — PipeWire has no macOS-style per-app permission list,
 and the tray does not pretend otherwise), and Quit
 (which stops an active recording first). Failure is shown as failure with the
@@ -109,8 +112,12 @@ the feature contract, privacy rules and the target-Plasma manual test.
 input. A PipeWire/PulseAudio monitor may be selectable if exposed
 by PortAudio; routing, permissions, device changes and audio quality need
 verification on the target desktop. Do not interpret its labels as reliable
-speaker identity. Per-app capture and meeting detection are not
-implemented (the tray hides those controls rather than faking them). Launch
+speaker identity. Per-app capture is implemented on Linux (the tray's
+System output picker covers whole sinks and application streams);
+meeting detection exists and only ever *offers*: see
+[Linux meeting detection](docs/LINUX_MEETINGS.md) for the supported
+sources (PipeWire app identity, X11 titles), the Wayland limit, and the
+consent rules (`auto_record_meetings` is off by default). Launch
 at login works on Linux through the web Settings toggle described below and
 natively on macOS; the tray menu itself still offers no launch-at-login
 control. Do not use the macOS
