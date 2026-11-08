@@ -72,17 +72,23 @@ def autostart_file() -> Path:
 
 
 def quote_exec_arg(arg: str) -> str:
-    """Quote one argument for a desktop-entry ``Exec`` line.
+    """Quote one argument for the ``Exec`` line *as written to the file*.
 
-    The desktop-entry spec has its own rules (``"`` grouping, backslash
-    escapes for ``\\ " $ ` `` and ``%%`` for a literal percent); there is no
-    shell involved, so nothing here is shell interpolation.
+    Two layers stack, and the outer one is applied first when the entry is
+    read: GLib's key-file *string* layer (only ``\\s \\n \\t \\r \\\\`` are
+    escapes — any other backslash makes the whole value un-interpretable,
+    so the entry loads with no command at all), then the ``Exec`` layer
+    (``"`` grouping, backslash escapes for ``\\ " $ ` `` and ``%%`` for a
+    literal percent). So this quotes for ``Exec`` and then doubles every
+    backslash for the string layer; GLib undoes exactly those two, in
+    reverse. No shell parses either layer, so nothing here is shell
+    interpolation.
     """
     if arg and not any(c in arg for c in ' \t"\\`$%'):
-        return arg
+        return arg              # no backslash in the argument: the layers are a no-op
     escaped = (arg.replace("\\", "\\\\").replace('"', '\\"')
                .replace("$", "\\$").replace("`", "\\`").replace("%", "%%"))
-    return f'"{escaped}"'
+    return f'"{escaped}"'.replace("\\", "\\\\")   # key-file string layer
 
 
 def _python() -> str | None:
@@ -202,14 +208,23 @@ def set_enabled(enabled: bool) -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_name(path.name + ".tmp")
             try:
-                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+                # O_EXCL|O_NOFOLLOW: never open through whatever sits at the
+                # fixed temp name. A stale temp — or a symlink planted there —
+                # is unlinked first, which removes that link itself and never
+                # its target; if anything reappears in the gap, O_EXCL fails
+                # the write instead of following it.
+                try:
+                    os.unlink(tmp)
+                except FileNotFoundError:
+                    pass
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    os.fchmod(fh.fileno(), 0o644)   # 0644 whatever the umask, no path followed
                     fh.write(content)
                 os.replace(tmp, path)
             finally:
-                if tmp.exists():
+                if tmp.is_symlink() or tmp.exists():
                     tmp.unlink()
-            path.chmod(0o644)
         except OSError as exc:
             raise AutostartError(f"could not write {path} ({exc})") from exc
         return
