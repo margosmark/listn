@@ -61,6 +61,11 @@ LLM_BACKENDS = ("auto", "mlx", "ollama", "extractive")
 # One HTTP request to an existing Ollama service. listn holds no model of its
 # own on this path: loading and unloading the weights is the Ollama host's
 # job, so there is nothing to unload here.
+# This budget is deliberately the same number as the gate's <=180 s envelope,
+# and listn sends no keep_alive (server default applies, observed 5 min):
+# a cold run pays a model load first and can exceed it, falling back to
+# extractive - see docs/55-linux-generative-notes-backend.md. Whether this
+# stays pinned to the envelope or carries headroom is an owner decision.
 OLLAMA_TIMEOUT_SECONDS = 180.0
 
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="listn-llm")
