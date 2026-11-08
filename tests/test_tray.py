@@ -734,3 +734,61 @@ def test_tray_ignores_a_default_pointing_at_the_wrong_media_class(
     assert controller.selected_mic is None
 
 
+def test_tray_quit_ends_open_event_streams_promptly(data_dir, caplog):
+    """Quitting the tray with a dashboard event stream open must end the
+    stream on the spot.
+
+    Otherwise uvicorn waits out its 3-second grace period, logs "Cancel 1
+    running task(s), timeout graceful shutdown exceeded" and cancels the
+    stream with an ASGI traceback — the noise in Mark's quit log. The tray's
+    exit sets ``should_exit`` directly (no signal is involved), so the
+    embedded server has to end the streams itself at shutdown time.
+    """
+    import socket
+    import threading
+    import urllib.request
+
+    from listn.tray import start_embedded_server
+
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    server, thread = start_embedded_server(port)
+    end = time.monotonic() + 15
+    while time.monotonic() < end and not server.started:
+        time.sleep(0.05)
+    assert server.started, "embedded server did not start"
+
+    opened = threading.Event()
+    finished = threading.Event()
+    errors = []
+
+    def hold_stream():
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/events", timeout=10) as resp:
+                if resp.read(6) != b"retry:":
+                    errors.append("unexpected first bytes from /api/events")
+                opened.set()
+                while resp.read(4096):   # hold the connection open until the server ends it
+                    pass
+        except Exception as exc:  # noqa: BLE001 - a raised cancel IS the failure
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    client = threading.Thread(target=hold_stream, daemon=True)
+    client.start()
+    try:
+        assert opened.wait(5), "event stream never opened"
+        server.should_exit = True    # exactly what listn/cli.py does on tray quit
+        # The grace period is 3 s; the stream must end well before it.
+        assert finished.wait(2.5), "the event stream outlived the graceful shutdown"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+    assert not thread.is_alive(), "server thread still running after ending the stream"
+    assert not errors, errors
+    assert not [r for r in caplog.records if "graceful shutdown" in r.getMessage()]
+
+
