@@ -79,6 +79,7 @@ import numpy as np
 
 from listn.audio import WavWriter, to_mono
 from listn.capture import dbfs
+from listn.capture_contract import MIC_KINDS, SYSTEM_KINDS, source_kind
 from listn.ipc import TRACK_MIC, TRACK_SYSTEM
 
 DEFAULT_RATE = 48000
@@ -110,6 +111,26 @@ TRACK_NAMES = {TRACK_SYSTEM: "system", TRACK_MIC: "mic"}
 
 class CaptureError(RuntimeError):
     """The capture cannot start or continue; message says what to do."""
+
+
+def build_record_argv(pw_record: str, target: TrackTarget, channels: int,
+                      rate: int) -> list[str]:
+    """argv for one ``pw-record`` stream, always as a list (never a shell).
+
+    ``--target`` only *names* a node. For an ``Audio/Sink`` target the
+    session manager may bind the stream to the default SOURCE instead of
+    the sink's monitor (measured on a real CachyOS/KDE desktop: both
+    tracks recorded the microphone, corr=1.0, empty pw-record stderr, no
+    listn code involved), while the headless rig links the same argv
+    correctly. Routing is environment-dependent, so monitor capture is
+    asked for unconditionally instead of relying on it.
+    """
+    argv = [pw_record, "--raw", "--target", target.node.name]
+    if target.node.is_sink:
+        argv += ["--properties", "stream.capture.sink=true"]
+    argv += ["--rate", str(rate), "--channels", str(channels),
+             "--format", "s16", "-"]
+    return argv
 
 
 @dataclass(frozen=True)
@@ -610,6 +631,7 @@ class _Track:
     stop_requested: bool = False
     target_lost: bool = False
     killed: bool = False
+    writer_held: bool = False   # node loss keeps the WAV open for a resume
     frames: int = 0
     pending: bytearray = field(default_factory=bytearray)
 
@@ -648,6 +670,10 @@ class TwoTrackRecorder:
         self.node_watch_interval = float(node_watch_interval)
         self.stop_grace = float(stop_grace)
         self.state = "idle"
+        # Frames of every track at the instant a target was declared lost:
+        # an explicit replacement pads exactly that span with silence so the
+        # resumed track stays aligned with the surviving one (L7).
+        self.loss_snapshot: dict[str, int] = {}
         self._tracks: dict[str, _Track] = {
             "system": _Track(targets.system, self.out_dir / "system.wav", system_channels,
                              self.out_dir / "system.pw-record.log"),
@@ -667,26 +693,8 @@ class TwoTrackRecorder:
                     raise CaptureError(
                         f"The {track.target.track} target '{track.target.node.name}' is already "
                         "gone from the PipeWire graph. Re-run discovery.")
-                argv = [
-                    self.pw_record, "--raw",
-                    "--target", track.target.node.name,
-                ]
-                if track.target.node.is_sink:
-                    # --target only *names* a node. For an Audio/Sink the
-                    # session manager may bind the stream to the default
-                    # SOURCE instead of the sink's monitor (measured on a
-                    # real CachyOS/KDE desktop: both tracks recorded the
-                    # microphone, corr=1.0, empty pw-record stderr, no
-                    # listn code involved), while the headless rig links
-                    # the same argv correctly. Routing is
-                    # environment-dependent, so monitor capture is asked
-                    # for unconditionally instead of relying on it.
-                    argv += ["--properties", "stream.capture.sink=true"]
-                argv += [
-                    "--rate", str(self.rate),
-                    "--channels", str(track.channels),
-                    "--format", "s16", "-",
-                ]
+                argv = build_record_argv(self.pw_record, track.target,
+                                         track.channels, self.rate)
                 log = open(track.log_path, "wb")
                 try:
                     track.proc = self.runner.spawn(
@@ -759,6 +767,119 @@ class TwoTrackRecorder:
                 track.writer.close()
         self.state = "stopped"
         return self.report()
+
+    def replace_track(self, name: str, node: Node, *,
+                      gap_frames: int | None = None,
+                      selection: str = "explicit") -> None:
+        """Resume one failed track on an explicitly chosen replacement node.
+
+        The only path in this module that may change the node a running
+        capture records from (L7): it is never called automatically, and
+        it refuses unless *every* one of these holds — the capture is
+        mid-run, this track really failed, its WAV is still open (node
+        loss keeps it open), it has no live process (never two streams),
+        the other track is still recording, and ``node`` is present in the
+        graph and of the right source kind for this track.
+
+        ``gap_frames`` frames of silence are written — and pushed through
+        ``on_block`` — between the old and the new audio so the resumed
+        track keeps the surviving track's timeline instead of shifting
+        every later word earlier.
+        """
+        if self.state != "recording":
+            raise CaptureError("The capture is not running.")
+        track = self._tracks.get(name)
+        if track is None:
+            raise CaptureError(f"Unknown track '{name}'.")
+        if track.state != "failed":
+            raise CaptureError(
+                f"The {name} track is not failed; only a track whose device was "
+                "lost can be replaced.")
+        if track.proc is not None and track.proc.poll() is None:
+            raise CaptureError(f"The {name} track already has a running stream.")
+        if track.writer is None or not track.writer_held:
+            raise CaptureError(
+                f"The {name} track's WAV is already finalized; stop and start a "
+                "new recording instead.")
+        other = self._tracks["mic" if name == "system" else "system"]
+        if other.state != "recording":
+            raise CaptureError(
+                f"The {other.target.track} track is not recording; the capture "
+                "is ending.")
+        kind = source_kind(node.to_dict())
+        allowed = MIC_KINDS if name == "mic" else SYSTEM_KINDS
+        if kind not in allowed:
+            raise CaptureError(
+                f"'{node.name}' is a {kind or 'unknown'} node; the {name} track "
+                f"records {' or '.join(allowed)}.")
+        if node.name == other.target.node.name:
+            raise CaptureError(
+                f"'{node.name}' is already the {other.target.track} track's target.")
+        if not self.probe(node):
+            raise CaptureError(f"'{node.name}' is not in the PipeWire graph.")
+        new_target = TrackTarget(track=track.target.track,
+                                 track_id=track.target.track_id,
+                                 node=node, selection=selection)
+        argv = build_record_argv(self.pw_record, new_target, track.channels,
+                                 self.rate)
+        log = open(track.log_path, "ab")
+        try:
+            track.proc = self.runner.spawn(
+                argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=log, bufsize=0)
+        except FileNotFoundError as exc:
+            raise CaptureError(
+                "pw-record not found. Install the PipeWire tools (for example "
+                "'pipewire-bin') and make sure pw-record is on PATH.") from exc
+        except OSError as exc:
+            raise CaptureError(f"Could not start pw-record: {exc}") from exc
+        finally:
+            log.close()
+        # From here the replacement owns the stream: commit the timeline
+        # gap first (still nothing else can have written to this file),
+        # then hand the track back to the reader.
+        track.target = new_target
+        # The report's ``targets.<track>`` must equal ``tracks.<track>.target``
+        # (L0 §3), so the declared targets follow the user's choice.
+        if name == "system":
+            self.targets = Targets(system=new_target, mic=self.targets.mic)
+        else:
+            self.targets = Targets(system=self.targets.system, mic=new_target)
+        if gap_frames is None:
+            before = (self.loss_snapshot or {}).get(other.target.track,
+                                                    other.frames)
+            gap_frames = max(0, other.frames - before)
+        if int(gap_frames) > 0:
+            self._write_silence(track, int(gap_frames))
+        track.state = "recording"
+        track.error = None
+        track.exit_code = None
+        track.stop_requested = False
+        track.target_lost = False
+        track.killed = False
+        track.writer_held = False
+        track.pending = bytearray()
+        track.thread = threading.Thread(
+            target=self._read_track, name=f"listn-pw-{track.target.track}",
+            args=(track,), daemon=True)
+        track.thread.start()
+
+    def _write_silence(self, track: _Track, frames: int) -> None:
+        """Pad ``frames`` of silence into the held WAV and the session."""
+        step = max(1, int(self.rate))
+        done = 0
+        while done < frames:
+            n = min(step, frames - done)
+            zeros = np.zeros(n, dtype=np.float32)
+            if track.writer is not None:
+                track.writer.write(zeros)
+            track.frames += n
+            if self.on_block is not None:
+                try:
+                    self.on_block(track.target.track_id, self.rate, zeros)
+                except Exception:
+                    pass  # a dead consumer must not abort the replacement
+            done += n
 
     def report(self) -> dict:
         tracks = {}
@@ -867,6 +988,13 @@ class TwoTrackRecorder:
                     last_probe = now
                     if not self.probe(track.target.node):
                         track.target_lost = True
+                        self.loss_snapshot = {
+                            name: item.frames for name, item in self._tracks.items()}
+                        # Keep the WAV open: an explicit replacement
+                        # (L7) resumes this same file, so the partial
+                        # recording, the gap and the resumed audio stay
+                        # one timeline for the report and the mix.
+                        track.writer_held = True
                         track.error = (f"target node '{track.target.node.name}' disappeared from "
                                        "the PipeWire graph while recording; stopped this track "
                                        "instead of recording another source")
@@ -895,7 +1023,7 @@ class TwoTrackRecorder:
                 track.exit_code = None
         else:
             track.exit_code = proc.returncode
-        if track.writer is not None:
+        if track.writer is not None and not track.writer_held:
             track.writer.close()
         self._finish_state(track)
 

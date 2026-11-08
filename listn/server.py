@@ -75,6 +75,12 @@ class LiveStartIn(BaseModel):
     mic_target: str | None = None       # explicit PipeWire node (name or id)
 
 
+class LiveReplaceIn(BaseModel):
+    """An explicit device replacement request (L7) — user-initiated only."""
+    track: str                          # "system" | "mic"
+    node: str                           # PipeWire node name from the graph
+
+
 class SessionPatch(BaseModel):
     title: str | None = None
     speakers: dict[str, str] | None = None
@@ -324,6 +330,29 @@ def create_app(engine: Engine | None = None, sd=None) -> FastAPI:
         if not eng().resume_live():
             raise HTTPException(409, "Nothing is paused.")
         return eng().live.status()
+
+    @app.post("/api/live/replace")
+    def live_replace(body: LiveReplaceIn):
+        """Resume a dead track on a device the user chose (L7).
+
+        The one path that may change the target of a running capture. It
+        never happens on its own: every refusal (unknown node, wrong kind,
+        the sibling's target, a second stream, an exhausted recovery
+        budget, a paused session) comes back as 400/409 with the reason
+        and the capture keeps its original targets.
+        """
+        from listn.pipewire import CaptureError
+        pwlive = getattr(app.state, "pw", None)
+        if pwlive is None or not pwlive.active:
+            raise HTTPException(409, "Nothing is recording.")
+        live = eng().live
+        if live is not None and getattr(live, "paused", False):
+            raise HTTPException(409, "Resume the recording before replacing "
+                                     "a device.")
+        try:
+            return pwlive.replace_track(body.track, body.node)
+        except CaptureError as exc:
+            raise HTTPException(400, str(exc))
 
     @app.post("/api/live/stop")
     def live_stop():
