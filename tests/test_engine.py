@@ -131,3 +131,44 @@ def test_file_job_bad_file_reports_error(engine, tmp_path):
     job = engine.enqueue_file(bad, "Broken", Settings(), False)
     wait_for(lambda: engine.library.get(job.meta.id).status == "error")
     assert engine.library.get(job.meta.id).error
+
+
+def test_file_job_completes_when_cuda_libraries_are_missing(tmp_path, data_dir, monkeypatch):
+    """Mark's box: a GPU CTranslate2 can see, CUDA user-space libraries absent.
+
+    The job must finish on CPU with the fallback in its status stages — not
+    die with ``libcublas.so.12 is not found`` — and rebuild exactly once.
+    """
+    import sys
+    import types
+
+    from listn import transcriber as tr
+    from .test_transcriber import CudaBrokenWhisper
+
+    CudaBrokenWhisper.instances = []
+    CudaBrokenWhisper.fail_devices = ("auto",)
+    CudaBrokenWhisper.fail_at_init = False
+    tr._cache.clear()
+    monkeypatch.setattr(tr, "_cuda_device_count", lambda: 1)
+    monkeypatch.setitem(sys.modules, "faster_whisper",
+                        types.SimpleNamespace(WhisperModel=CudaBrokenWhisper))
+    try:
+        eng = Engine(sd=FakeSD(MAC_DEVICES, speed=40.0))   # real get_transcriber
+        q = eng.bus.subscribe()
+        job = eng.enqueue_file(write_wav(tmp_path / "call.wav"), "Call",
+                               Settings(model="small"), diarize_speakers=False)
+        events = []
+        while True:
+            ev = q.get(timeout=15)
+            events.append(ev)
+            if ev["type"] == "job.done":
+                break
+        assert ev["error"] is None
+        meta = eng.library.get(job.meta.id)
+        assert meta.status == "done"
+        assert [s.text for s in eng.library.segments(meta.id)] == ["hello"]
+        stages = [e["job"]["stage"] for e in events if e["type"] == "job.update"]
+        assert tr.CPU_FALLBACK_MESSAGE in stages
+        assert [m.init_kwargs["device"] for m in CudaBrokenWhisper.instances] == ["auto", "cpu"]
+    finally:
+        tr._cache.clear()

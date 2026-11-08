@@ -795,16 +795,15 @@ def start_embedded_server(port: int = DEFAULT_PORT):
 
     Returns ``(server, thread)``; shutting the tray down also ends the server,
     whose lifespan finalizes any two-track recording with its honest report.
+    It is listn's own server, so shutdown ends open event streams first:
+    quitting with a dashboard open must not wait out uvicorn's grace period
+    and cancel the stream with an ASGI traceback.
     """
-    import uvicorn
-
-    from listn.server import create_app
+    from listn.server import _Server, create_app
 
     app = create_app()
     app.state.http_port = port
-    config = uvicorn.Config(app, host=LOOPBACK, port=port, log_level="warning",
-                            timeout_graceful_shutdown=3)
-    server = uvicorn.Server(config)
+    server = _Server(app, port)
     thread = threading.Thread(target=server.run, name="listn-tray-server",
                               daemon=True)
     thread.start()
