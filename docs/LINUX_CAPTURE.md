@@ -166,7 +166,9 @@ application therefore **excludes** every other application: there is no
   `parse_graph()` deliberately does not copy them into the node or the
   report.
 * The same list everywhere: `listn record --list`,
-  `GET /api/pipewire/devices` (`apps`), and the Live tab's target picker.
+  `GET /api/pipewire/devices` (`apps`), the Live tab's target picker, and
+  the KDE tray's *System output* picker (its **Application streams**
+  section, [KDE tray](#kde-tray-listn-tray) below).
 
 ### Refusals — a target is never silently replaced
 
@@ -566,6 +568,20 @@ port; `--no-server` refuses to start one and fails with a clear message.
   (opens the web UI's settings page — listn's own retention/audio settings
   are the privacy surface on Linux; PipeWire has no macOS-style per-app
   permission list), and Quit, which stops an active recording first.
+- Application streams (this increment): the *System output* picker is one
+  radio group holding both modes of that track — every whole sink, then a
+  separator and a disabled **Application streams** section listing the
+  `Stream/Output/Audio` nodes from `GET /api/pipewire/devices` (`apps`).
+  Labels are the applications' own names (never a window or media title);
+  identity is the node name, so the entry clicked is exactly the
+  `system_target` sent and `targets.system.media_class` in the report says
+  which mode was recorded (`Audio/Sink` vs `Stream/Output/Audio`). Because
+  it is one group, at most one entry can be checked: the tray cannot show
+  or record "the sink *and* the app". A remembered application pick that
+  is still in the graph is kept as made; one that left the graph is
+  handled by the same rule as a sink (graph default, else empty with Start
+  disabled), and a Start against a stream that closed is refused with the
+  server's reason — never re-pointed at the default sink.
 - Honest states: idle / starting / recording (with per-track frame counts)
   / paused / stopping / failed (with the recorder's own per-track cause) /
   unreachable ("listn is not answering"). A refused Start keeps the server's
@@ -574,23 +590,31 @@ port; `--no-server` refuses to start one and fails with a clear message.
   absent, not greyed.
 - Verification: the pure state machine and controller are covered in
   `tests/test_tray.py` against the real server app with the stand-in
-  `pw-dump`/`pw-record` tools; the D-Bus contract (properties, menu layout,
-  `Event(clicked)` dispatch, watcher registration, `LayoutUpdated` on state
-  change, failure icons) is covered in `tests/test_tray_sni.py` against a
-  real private `dbus-daemon` session and a real uvicorn engine. **Not
-  exercised: interaction with a running plasmashell panel** — that needs a
-  real KDE session.
+  `pw-dump`/`pw-record` tools — including the Application streams
+  section (menu contract, a recording started from a stream pick with
+  `media_class == "Stream/Output/Audio"`, whole-sink mode unchanged with
+  streams present, a vanished pick re-adopting only the graph default, a
+  refused Start, and menu labels carrying no title); the D-Bus contract
+  (properties, menu layout, `Event(clicked)` dispatch, watcher
+  registration, `LayoutUpdated` on state change, failure icons, and a
+  stream clicked over `com.canonical.dbusmenu` then recorded) is covered
+  in `tests/test_tray_sni.py` against a real private `dbus-daemon`
+  session and a real uvicorn engine. **Not exercised: interaction with a
+  running plasmashell panel** — that needs a real KDE session.
 
 ## Not in this increment
 
 Pause inside the capture layer (pause stays with the engine session
-consuming `on_block`), an application-stream picker in the **KDE tray**
-(`listn tray` still offers whole-sink targets only — the CLI, the local
-API and the web UI's Live tab do offer application streams), packaging,
-GPU/model changes, and any change to macOS behaviour or to the ingest
-socket protocol. Web-UI/server wiring now exists (this increment):
-`listn record`, `GET /api/pipewire/devices` (with `apps`),
-`POST /api/live/start` with `capture: "pipewire"` plus explicit
+consuming `on_block`), packaging, GPU/model changes, and any change to
+macOS behaviour or to the ingest socket protocol. Web-UI/server wiring now
+exists (this increment): `listn record`, `GET /api/pipewire/devices` (with
+`apps`), `POST /api/live/start` with `capture: "pipewire"` plus explicit
 `system_target`/`mic_target`, the report on `GET /api/live` and in the
 `POST /api/live/stop` response. The KDE tray controls now exist (this
-increment): `listn tray` with the menu above.
+increment): `listn tray` with the menu above — and its *System output*
+picker offers application streams as well (the L1 follow-up), so the tray
+is no longer whole-sink only. Still outside this increment: re-polling the
+graph for nodes that appear later (discovery runs once, exactly as it
+already does for the sink and microphone lists), and any claim about how
+the menu renders inside a running plasmashell panel — that needs a real
+KDE session.

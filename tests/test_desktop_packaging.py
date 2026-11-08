@@ -105,7 +105,7 @@ def test_install_time_choice_not_a_tray_toggle():
     assert "launch-at-login" in docstring.lower()  # documented as absent
 
     labels = [item.label for item in
-              build_menu(TrayStatus(), [], [], None, None)]
+              build_menu(TrayStatus(), [], [], [], None, None)]
     for label in labels:
         low = label.lower()
         assert "login" not in low and "autostart" not in low

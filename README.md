@@ -87,14 +87,15 @@ uv run listn tray --no-server      # only attach to an already-running engine
 ```
 
 The tray menu is exactly: recording status, Start/Stop, Pause/Resume, the two
-target pickers (radio picks, session defaults labelled as suggestions), Open
-privacy settings (listn's own settings page — PipeWire has no macOS-style
-per-app permission list, and the tray does not pretend otherwise), and Quit
-(which stops an active recording first). Failure is shown as failure with the
-recorder's own cause (dead track, refused start, engine not answering) —
-never a stale "recording". The D-Bus contract is covered by tests against a
-real session bus; interaction with a running plasmashell panel is not yet
-exercised.
+target pickers (radio picks; the system picker holds whole sinks and
+individual application streams in one group, so exactly one is checked;
+session defaults labelled as suggestions), Open privacy settings (listn's
+own settings page — PipeWire has no macOS-style per-app permission list,
+and the tray does not pretend otherwise), and Quit (which stops an active
+recording first). Failure is shown as failure with the recorder's own cause
+(dead track, refused start, engine not answering) — never a stale
+"recording". The D-Bus contract is covered by tests against a real session
+bus; interaction with a running plasmashell panel is not yet exercised.
 
 `listn live` and the web UI's single-input mode record **one** PortAudio
 input. A PipeWire/PulseAudio monitor may be selectable if exposed
