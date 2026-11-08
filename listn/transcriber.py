@@ -44,16 +44,55 @@ SPEECH_RMS_GATE = 0.003
 CPU_FALLBACK_MESSAGE = "CUDA libraries unavailable — transcribing on CPU"
 
 # CTranslate2 names the library it could not load when a GPU is visible but the
-# CUDA user-space libraries are absent (libcublas.so.12 on a default CachyOS).
+# CUDA user-space libraries are absent (libcublas.so.12 on a default CachyOS):
+# "Library libcublas.so.12 is not found or cannot be loaded". Any message here
+# must also carry one of these library/device markers.
 _CUDA_ERROR_MARKERS = ("cuda", "cublas", "dnn", "nccl")
+
+# Only load/availability phrasing counts as "unavailable". Every other member
+# of the CUDA error family is a fault on a working stack and must propagate:
+#   cuBLAS failed with status CUBLAS_STATUS_ALLOC_FAILED   (GPU OOM)
+#   CUDA failed with error out of memory                   (GPU OOM)
+#   CUDA failed with error an illegal memory access ...    (device fault)
+#   NCCL failed with error 1                               (runtime failure)
+# Strings verified against the shipped libctranslate2 4.8.3.
+_AVAILABILITY_MARKERS = (
+    "is not found",            # "Library libcublas.so.12 is not found ..."
+    "cannot be loaded",        # ... "or cannot be loaded"
+    "cannot open shared object",  # dlopen of libcuda.so.1 itself
+    "driver version is insufficient",
+    "stub library",            # "CUDA driver is a stub library"
+    "busy or unavailable",
+    "no cuda-capable device",  # no GPU at all
+    "api call is not supported in the installed cuda driver",
+    "unsupported display driver / cuda driver combination",
+)
+
+# Belt and braces: a message that is both availability-shaped and a runtime
+# fault is a fault — never recover it as "CUDA libraries unavailable".
+_RUNTIME_FAILURE_MARKERS = (
+    "out of memory",
+    "alloc_failed",
+    "illegal memory",
+    "failed with status",
+)
 
 
 def _is_cuda_unavailable(exc: BaseException) -> bool:
-    """True for the CUDA-library RuntimeErrors worth recovering from on CPU."""
+    """True only for load/availability CUDA RuntimeErrors worth CPU recovery.
+
+    A GPU OOM or device fault on a healthy stack is *not* "CUDA libraries
+    unavailable": it must propagate (and stay labelled as itself) rather than
+    relabel the job, the live status and the cache key.
+    """
     if not isinstance(exc, RuntimeError):
         return False
     message = str(exc).lower()
-    return any(marker in message for marker in _CUDA_ERROR_MARKERS)
+    if not any(marker in message for marker in _CUDA_ERROR_MARKERS):
+        return False
+    if any(marker in message for marker in _RUNTIME_FAILURE_MARKERS):
+        return False
+    return any(marker in message for marker in _AVAILABILITY_MARKERS)
 
 
 def _cuda_device_count() -> int:
