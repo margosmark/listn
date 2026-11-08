@@ -1,9 +1,14 @@
 """Linux desktop integration: .desktop entries, XDG autostart, PKGBUILD, docs.
 
 Everything here is checkable without a KDE session: the entries are parsed as
-text, the installer script is executed against a throwaway $HOME, the PKGBUILD
-is sourced by bash, and the README is asserted to document the same commands
-the files actually run.
+text, the installer script is executed against a throwaway $HOME (plus a
+standalone POSIX shell lifecycle script under tests/shell/), the PKGBUILD is
+sourced by bash and its package() run against the pinned tag archive, and the
+README is asserted to document the same commands the files actually run.
+
+What this file cannot check is a real Plasma login: app-menu visibility, the
+tray panel appearing in the system tray, and a session autostart actually
+firing stay manual acceptance (docs/OPERATIONS.md).
 """
 
 from __future__ import annotations
@@ -12,8 +17,11 @@ import configparser
 import hashlib
 import os
 import re
+import shlex
 import shutil
+import socket
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -316,11 +324,13 @@ def test_pkgbuild_builds_from_the_tag_and_says_so():
         f"v{version}: bump pkgver, run updpkgsums, and update this test")
 
 
-def test_pkgbuild_sha256_is_the_hash_of_the_published_tag_archive(tmp_path):
-    """The sum must be what GitHub actually serves for the tag archive the
-    PKGBUILD downloads - a moved or regenerated tag goes red here before
-    makepkg fails on the user's machine. The repo is private, so the fetch
-    borrows git's stored credentials the way makepkg's own curl config does.
+@pytest.fixture(scope="session")
+def tag_archive(tmp_path_factory) -> Path:
+    """The published tag archive the PKGBUILD downloads, fetched once.
+
+    The repo is private, so the fetch borrows git's stored credentials the
+    way makepkg's own curl config does. Without credentials (or curl) the
+    dependent tests skip rather than guess at a source.
     """
     fields = source_pkgbuild()
     url = fields["source"].split("::", 1)[1]
@@ -339,16 +349,107 @@ def test_pkgbuild_sha256_is_the_hash_of_the_published_tag_archive(tmp_path):
         pytest.skip("no stored GitHub credentials to fetch the archive")
     login = f'{secrets["username"]}:{secrets["password"]}'
     login = login.replace("\\", "\\\\").replace('"', '\\"')
-    archive = tmp_path / "tag.tar.gz"
+    archive = tmp_path_factory.mktemp("tag-archive") / "tag.tar.gz"
     fetch = subprocess.run([curl, "-fsSL", "-K", "-", "-o", str(archive), url],
                            input=f'user = "{login}"\n', text=True,
                            capture_output=True, cwd=ROOT, env=env)
     if fetch.returncode != 0:
         pytest.skip(f"cannot fetch the tag archive: {fetch.stderr.strip()}")
-    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    return archive
+
+
+def test_pkgbuild_sha256_is_the_hash_of_the_published_tag_archive(tag_archive):
+    """The sum must be what GitHub actually serves for the tag archive the
+    PKGBUILD downloads - a moved or regenerated tag goes red here before
+    makepkg fails on the user's machine.
+    """
+    fields = source_pkgbuild()
+    digest = hashlib.sha256(tag_archive.read_bytes()).hexdigest()
     assert digest == fields["sums"], (
         f"GitHub serves sha256 {digest} for v{fields['pkgver']} but the "
         f"PKGBUILD pins {fields['sums']}: run updpkgsums")
+
+
+def test_pkgbuild_package_fileset_is_exact_and_stateless(tag_archive, tmp_path):
+    """package() output is exactly the read-only app files: nothing under
+    /etc, no venv, no caches, no build-time state - the "clean install"
+    contract checked by running the real package() against the pinned tag
+    source in a throwaway pkgdir (no root, no system writes).
+    """
+    fields = source_pkgbuild()
+    version = fields["pkgver"]
+    # We are packaging the pinned bytes, not some other tree.
+    assert hashlib.sha256(tag_archive.read_bytes()).hexdigest() == fields["sums"]
+
+    src_root = tmp_path / "src"
+    src_root.mkdir()
+    subprocess.run(["tar", "-xzf", str(tag_archive), "-C", str(src_root)],
+                   check=True, capture_output=True)
+    source_dir = src_root / f"listn-{version}"
+    assert source_dir.is_dir(), sorted(p.name for p in src_root.iterdir())
+
+    pkgdir = tmp_path / "pkg"
+    # The packager's flow: the repo's current PKGBUILD against the tagged
+    # source it downloads - so source the worktree PKGBUILD, not the tag's.
+    run = subprocess.run(
+        ["bash", "-c", f"source {shlex.quote(str(PKGBUILD))} && package"],
+        cwd=src_root, env=dict(os.environ, pkgdir=str(pkgdir)),
+        capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+    files = sorted(p.relative_to(pkgdir).as_posix()
+                   for p in pkgdir.rglob("*") if p.is_file())
+    expected = [
+        "usr/bin/listn",
+        "usr/share/applications/listn.desktop",
+        "usr/share/icons/hicolor/128x128/apps/listn.png",
+        "usr/share/listn/README.md",
+        "usr/share/listn/pyproject.toml",
+        "usr/share/listn/uv.lock",
+        "usr/share/listn/packaging/listn-tray.desktop",
+    ]
+    expected += [f"usr/share/listn/listn/{p.relative_to(source_dir / 'listn').as_posix()}"
+                 for p in sorted((source_dir / "listn").rglob("*")) if p.is_file()]
+    assert files == sorted(expected)
+
+    # No runtime/build state ships: system config dirs, caches, envs, git.
+    assert not [f for f in files if f.startswith(("etc/", "var/", "home/"))]
+    assert not [f for f in files
+                if "__pycache__" in f or ".git" in f or "egg-info" in f
+                or "/env/" in f or f.endswith(".pyc")]
+
+    # The packaged files are byte-identical to the source they came from,
+    # and the tag's own version matches the pkgver being built.
+    assert ((pkgdir / "usr/bin/listn").read_bytes()
+            == (source_dir / "packaging/arch/listn-launcher.sh").read_bytes())
+    assert ((pkgdir / "usr/share/applications/listn.desktop").read_bytes()
+            == (source_dir / "packaging/listn.desktop").read_bytes())
+    tag_pyproject = (source_dir / "pyproject.toml").read_text(encoding="utf-8")
+    assert re.search(rf'^version = "{re.escape(version)}"', tag_pyproject,
+                     re.M), (f"tag v{version} source does not declare version "
+                             f"{version}: pkgver and source disagree")
+
+
+def test_install_file_messages_cover_the_lifecycle():
+    """pacman's .install must tell the truth about the three hooks: how to
+    opt in to login, that upgrade repeats the guidance, and that removal
+    leaves the user's environment, data and login entry alone."""
+    text = (PKGDIR / "listn.install").read_text(encoding="utf-8")
+    for hook in ("post_install", "post_upgrade", "post_remove"):
+        assert re.search(rf"^{hook}\(\)", text, re.M), hook
+    # Upgrade reprints the install guidance rather than going silent.
+    assert re.search(r"post_upgrade\(\) \{\s*\n\s*post_install\b", text)
+    # Opt-in is the shipped template copied into the user's own autostart dir.
+    assert "/usr/share/listn/packaging/listn-tray.desktop" in text
+    assert ".config/autostart/listn-tray.desktop" in text
+    # Removal promises retention, in the user's own paths.
+    remove = text.split("post_remove()", 1)[1]
+    assert "~/.local/share/listn/env" in remove
+    assert "~/.local/share/listn" in remove
+    assert ".config/autostart/" in remove
+    assert "left in place" in remove
+    # It never tells pacman's user to delete their own data for them.
+    assert "rm -rf" not in remove
 
 
 def test_pkgbuild_ships_only_user_scope_autostart_and_no_root_state():
@@ -400,3 +501,215 @@ def test_installer_passes_shellcheck():
     result = subprocess.run(["shellcheck", "-s", "sh", str(INSTALLER)],
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stdout
+
+
+
+# ------------------------------------- isolated-HOME shell lifecycle test
+
+SHELL_LIFECYCLE = ROOT / "tests" / "shell" / "test_desktop_lifecycle.sh"
+
+
+def test_isolated_home_shell_lifecycle_passes():
+    """The standalone POSIX shell script walks the whole lifecycle -
+    install, explicit login opt-in, upgrade re-install, status, uninstall,
+    dry-run, platform guard - against a throwaway $HOME, and proves
+    uninstall removed only listn's files while user data (transcripts,
+    settings, model cache, environment) and other apps' files survived.
+    """
+    assert SHELL_LIFECYCLE.is_file(), "committed shell lifecycle test missing"
+    result = subprocess.run(["sh", str(SHELL_LIFECYCLE)],
+                            capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "FAIL" not in result.stdout + result.stderr
+    checks = sum(1 for line in result.stdout.splitlines()
+                 if line.startswith("ok "))
+    assert checks >= 40, f"only {checks} lifecycle checks ran:\n{result.stdout}"
+    assert "PASS" in result.stdout
+
+
+@pytest.mark.skipif(shutil.which("shellcheck") is None,
+                    reason="shellcheck not installed")
+def test_shell_lifecycle_passes_shellcheck():
+    result = subprocess.run(["shellcheck", "-s", "sh", str(SHELL_LIFECYCLE)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout
+
+
+# ---------------------------------------- one engine at login (`listn tray`)
+
+class _QuietTrayItem:
+    """Stand-in for the D-Bus StatusNotifierItem: construct, run once, exit.
+
+    cmd_tray's engine ownership logic is what is under test here, not the
+    session bus - a real D-Bus tray belongs to a Plasma login test.
+    """
+
+    def __init__(self, controller):
+        self.controller = controller
+
+    async def run(self):
+        return None
+
+
+def _listening_socket(port: int | None = None):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", port if port is not None else 0))
+    sock.listen(4)
+    return sock
+
+
+def _free_port() -> int:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    return port
+
+
+def _must_not_start(*_args, **_kwargs):
+    raise AssertionError("start_embedded_server called but an engine answers / "
+                         "must not start one")
+
+
+def test_login_tray_attaches_to_a_running_engine(monkeypatch, capsys, data_dir):
+    """The login entry (`listn tray`) must never start a second engine: with
+    one already answering on the port it attaches and starts nothing.
+    """
+    from listn import cli, tray as tray_mod
+    import listn.tray_sni as sni_mod
+
+    listener = _listening_socket()
+    port = listener.getsockname()[1]
+    monkeypatch.setattr(tray_mod, "start_embedded_server", _must_not_start)
+    monkeypatch.setattr(sni_mod, "StatusNotifierItem", _QuietTrayItem)
+    try:
+        args = cli.build_parser().parse_args(["tray", "--port", str(port)])
+        assert cli.cmd_tray(args) == 0
+        out = capsys.readouterr().out
+        assert f"attached to the engine on 127.0.0.1:{port}" in out
+        assert "engine started" not in out
+    finally:
+        listener.close()
+
+
+def test_tray_starts_one_engine_then_a_second_tray_attaches(
+        monkeypatch, capsys, data_dir):
+    """With nothing answering, the first tray starts the one engine; a tray
+    started afterwards (user opens the menu while autostart already ran)
+    attaches to it instead of duplicating it.
+    """
+    from listn import cli, tray as tray_mod
+    import listn.tray_sni as sni_mod
+
+    monkeypatch.setattr(sni_mod, "StatusNotifierItem", _QuietTrayItem)
+    port = _free_port()
+    starts: list[int] = []
+    holder: dict[str, socket.socket] = {}
+
+    class _OwnedServer:
+        should_exit = False
+
+    def fake_start(p: int):
+        holder["sock"] = _listening_socket(p)
+        starts.append(p)
+        thread = threading.Thread(target=lambda: None)
+        thread.start()   # cmd_tray joins it on the way out
+        return _OwnedServer(), thread
+
+    monkeypatch.setattr(tray_mod, "start_embedded_server", fake_start)
+    try:
+        args = cli.build_parser().parse_args(["tray", "--port", str(port)])
+        assert cli.cmd_tray(args) == 0
+        out = capsys.readouterr().out
+        assert f"engine started on 127.0.0.1:{port}" in out
+        assert starts == [port]
+
+        assert cli.cmd_tray(args) == 0
+        out = capsys.readouterr().out
+        assert f"attached to the engine on 127.0.0.1:{port}" in out
+        assert starts == [port], "second tray must not start another engine"
+    finally:
+        holder.get("sock", socket.socket()).close()
+
+
+def test_tray_no_server_refuses_instead_of_starting_one(
+        monkeypatch, capsys, data_dir):
+    """`--no-server` (attach-only) with nothing answering fails honestly and
+    starts nothing - the login entry never silently spawns an engine twice.
+    """
+    from listn import cli, tray as tray_mod
+
+    monkeypatch.setattr(tray_mod, "start_embedded_server", _must_not_start)
+    args = cli.build_parser().parse_args(
+        ["tray", "--no-server", "--port", str(_free_port())])
+    assert cli.cmd_tray(args) == 1
+    err = capsys.readouterr().err
+    assert "not answering" in err
+    assert "listn ui" in err
+
+
+# ------------------------------------------------- Arch lifecycle CI script
+
+ARCH_CHECK = ROOT / "scripts" / "arch_pkg_check.sh"
+ARCH_WORKFLOW = ROOT / ".github" / "workflows" / "arch-package.yml"
+
+
+def test_arch_lifecycle_check_script_is_sound():
+    """scripts/arch_pkg_check.sh exists, parses, and carries the lifecycle
+    assertions and the honest skip/Plasma wording the story requires."""
+    assert ARCH_CHECK.is_file(), "Arch lifecycle check script missing"
+    assert subprocess.run(["sh", "-n", str(ARCH_CHECK)]).returncode == 0
+    assert ARCH_CHECK.stat().st_mode & 0o111, "script must be executable"
+    text = ARCH_CHECK.read_text(encoding="utf-8")
+    # Every lifecycle stage is asserted, not just run.
+    for needle in ("makepkg -sf", "pacman -U", "pacman -R",
+                   "/etc/xdg/autostart", "left in place",
+                   "attached to the engine", "post_upgrade",
+                   "retained through uninstall"):
+        assert needle in text, f"missing lifecycle assertion: {needle}"
+    # Honest boundaries: skip mode says what was NOT validated, and the
+    # script never claims to be a Plasma login test.
+    assert "SKIP: no makepkg and no docker/podman" in text
+    assert "NOT a Plasma login test" in text
+    # Opt-in only: removal of the login entry is never automatic.
+    assert "without opt-in" in text
+
+
+@pytest.mark.skipif(shutil.which("shellcheck") is None,
+                    reason="shellcheck not installed")
+def test_arch_lifecycle_check_passes_shellcheck():
+    result = subprocess.run(["shellcheck", "-s", "sh", str(ARCH_CHECK)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout
+
+
+def test_arch_lifecycle_check_skips_cleanly_without_an_arch_userland():
+    """Where neither makepkg nor a container runtime exists, the check must
+    exit 0 with an honest SKIP and write nothing - not fail, not pretend."""
+    if (shutil.which("makepkg") or shutil.which("docker")
+            or shutil.which("podman")):
+        pytest.skip("Arch userland or container runtime present: "
+                    "run scripts/arch_pkg_check.sh for the full lifecycle")
+    result = subprocess.run(["sh", str(ARCH_CHECK)],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SKIP" in result.stdout
+    assert "NOT validated" in result.stdout
+
+
+def test_arch_workflow_runs_the_checks_in_an_arch_container():
+    import yaml
+
+    wf = yaml.safe_load(ARCH_WORKFLOW.read_text(encoding="utf-8"))
+    jobs = wf["jobs"]
+    pkg = jobs["pkg-lifecycle"]
+    assert pkg["container"] == "archlinux:latest"
+    steps = yaml.dump(pkg["steps"])
+    assert "arch_pkg_check.sh" in steps
+    assert "GITHUB_TOKEN" in steps, "private tag archive needs the token"
+    assert "actions/checkout" in steps
+    desktop = yaml.dump(jobs["desktop-lifecycle"]["steps"])
+    assert "tests/shell/test_desktop_lifecycle.sh" in desktop
+    # The workflow itself says what it is not.
+    assert "NOT a Plasma login test" in ARCH_WORKFLOW.read_text(encoding="utf-8")

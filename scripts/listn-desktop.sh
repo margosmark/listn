@@ -19,6 +19,10 @@
 #   status            show what is installed and which command each entry runs
 #   --dry-run         print what would change without writing anything
 #
+# Re-running install refreshes the entries in place - including a login
+# entry you already opted into - so an upgrade never leaves a stale command
+# behind. It never creates a login entry without --autostart.
+#
 # What the entries run: $LISTN_CMD if set, otherwise this checkout's
 # .venv/bin/listn, otherwise `listn` on PATH. A $LISTN_CMD containing spaces
 # is used verbatim, so quote it yourself when it needs quoting.
@@ -154,16 +158,22 @@ EOF
         echo "installed: $icon_entry"
     fi
 
-    if [ "$want_autostart" = yes ]; then
+    # The login entry: created only by the explicit --autostart opt-in, but
+    # an entry the user already opted into is refreshed on every install so
+    # an upgrade cannot leave it launching a stale command.
+    if [ "$want_autostart" = yes ] || [ -f "$autostart_entry" ]; then
+        login_state=installed
+        if [ -f "$autostart_entry" ]; then login_state=refreshed; fi
         run mkdir -p "$autostart_dir"
         if [ "$dry_run" = yes ]; then
             echo "dry-run: write $autostart_entry (Exec=\"$bin\" tray)"
         else
             render "$autostart_src" "$bin" tray > "$autostart_entry"
-            echo "installed: $autostart_entry (tray starts at login)"
+            echo "$login_state: $autostart_entry (tray starts at login)"
         fi
     fi
-    refresh_databases
+    # update-desktop-database writes a cache file: never in --dry-run.
+    [ "$dry_run" = yes ] || refresh_databases
 }
 
 uninstall_entries() {
