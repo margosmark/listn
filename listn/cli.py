@@ -121,7 +121,7 @@ def cmd_tray(args) -> int:
     controller = TrayController(ServerClient(port=port))
     tray = StatusNotifierItem(controller)
     try:
-        asyncio.run(tray.run())
+        asyncio.run(_run_desktop(controller, tray, port))
     finally:
         # Quit must never leave a recording running behind us.
         if controller.status.active:
@@ -134,6 +134,60 @@ def cmd_tray(args) -> int:
             owned.should_exit = True
             thread.join(timeout=10)
     return 0
+
+
+async def _run_desktop(controller, tray, port: int) -> None:
+    """The tray's D-Bus loop plus the two desktop extras.
+
+    * global shortcuts (start/stop, bookmark) — registered with the
+      desktop's own portal; whatever it grants, or the reason it granted
+      nothing, is shown in the menu.
+    * captions — an opt-in window over the local transcript events; it
+      only subscribes while the setting is on.
+
+    Neither is a hard dependency: no portal or no display leaves the tray
+    fully working and says so on the menu instead of failing to start.
+    """
+    import asyncio
+
+    from listn.captions import CaptionSupervisor
+    from listn.shortcuts import (DEFAULT_BOOKMARK, DEFAULT_START_STOP,
+                                 HotkeyActions, ShortcutManager)
+
+    controller.refresh()  # settings first: chords and captions come from it
+    settings = controller.settings or {}
+    chords = {
+        "start_stop": settings.get("hotkey_start_stop") or DEFAULT_START_STOP,
+        "bookmark": settings.get("hotkey_bookmark") or DEFAULT_BOOKMARK,
+    }
+    shortcuts = ShortcutManager(HotkeyActions(controller), chords)
+    controller.shortcut_status = shortcuts.status
+
+    captions = CaptionSupervisor(port=port,
+                                 get_settings=lambda: controller.settings)
+    controller.captions = captions
+    captions.start()
+
+    loop = asyncio.get_running_loop()
+
+    def rebind(new_chords: dict) -> None:
+        # refresh() runs in the tray's executor thread: hand the coroutine
+        # back to the loop that owns the D-Bus connection.
+        async def apply():
+            await shortcuts.rebind(new_chords)
+            controller.shortcut_status = shortcuts.status
+
+        loop.call_soon_threadsafe(
+            lambda: asyncio.ensure_future(apply()))
+
+    controller.on_chords_changed = rebind
+    try:
+        await shortcuts.start()
+        controller.shortcut_status = shortcuts.status
+        await tray.run()
+    finally:
+        await shortcuts.close()
+        captions.stop()
 
 
 def cmd_devices(args) -> int:
