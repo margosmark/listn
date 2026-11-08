@@ -428,7 +428,7 @@ def test_prompt_items_render_through_the_menu_builder():
     items = build_menu(TrayController(FakeClient(),
                                       meeting_watcher=MeetingWatcher(),
                                       meeting_source=lambda: []).status,
-                       [], [], None, None, meeting_prompt=prompt)
+                       [], [], [], None, None, meeting_prompt=prompt)
     ids = {i.id for i in items if not i.separator}
     assert ITEM_MEETING_RECORD in ids and ITEM_MEETING_DISMISS in ids
     assert ITEM_MEETING_SNOOZE in ids
