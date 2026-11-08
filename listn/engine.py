@@ -422,7 +422,10 @@ class LiveSession:
             return
         if self.state == "loading-model":
             self.state = "listening"
-        self._emit("live.status", message="Listening", state=self.state)
+        # A CPU-fallback build says why the model is on CPU instead of the
+        # usual "Listening"; op-time fallbacks arrive through status below.
+        self._emit("live.status", message=getattr(model, "status_note", None) or "Listening",
+                   state=self.state)
         prompts: dict = {}
         recent: dict = {}
         while True:
@@ -973,7 +976,10 @@ class Engine:
         self._job_update(job, "loading-model")
         model = self._factory(job.model, job.backend,
                               status=lambda msg: self._job_update(job, msg))
-        self._job_update(job, "transcribing", 0.0)
+        # A CPU-fallback build's note replaces the plain stage for the whole
+        # job, so the fallback stays visible even when the model came from
+        # cache and the status callback fired on an earlier job.
+        self._job_update(job, getattr(model, "status_note", None) or "transcribing", 0.0)
         raw = model.transcribe(audio, language=job.language,
                                progress=lambda p: self._job_update(job, None, p * (0.85 if job.diarize else 1.0)))
         segments = [Segment(round(s.start, 2), round(s.end, 2), s.text) for s in raw]
