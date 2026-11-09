@@ -11,21 +11,53 @@ openai-whisper) and loaded from the local cache afterwards. A cached load
 sets ``HF_HUB_OFFLINE`` first, so it does not contact the Hub. The
 unauthenticated-request warning only happens on that first download, and
 only when ``HF_TOKEN`` is unset.
+
+Where the default backend runs is the ``compute_device`` setting: ``auto``
+(the default — main's shipped behaviour: GPU when this machine's CUDA *or
+ROCm* runtime is really usable, CPU otherwise, said out loud), ``cpu``
+(never touch the GPU), ``cuda`` (require NVIDIA and fail with a readable
+message instead of falling back) or ``rocm`` (require AMD's HIP build the
+same way). Which of
+those this machine can actually run — and the exact remedy for the piece
+that is missing — is answered by the vendor-neutral probe in
+:mod:`listn.compute_backend` (:func:`probe_capabilities`); see
+:func:`resolve_device` for the selection policy.
+
+Model load and inference for the faster-whisper backend run in a child
+process (:class:`IsolatedTranscriber`, worker: ``listn.inference_worker``)
+so a native crash — SIGSEGV/SIGABRT from the CUDA or HIP path — can never
+kill the caller or leave a partial transcript behind. ``auto`` then falls
+back to CPU truthfully; explicit ``cuda``/``rocm`` fails with an actionable
+message.
 """
 
 from __future__ import annotations
 
+import atexit
+import json
 import logging
+import os
 import platform
 import re
+import signal
+import subprocess
 import sys
 import threading
+from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from multiprocessing.connection import Connection
+from pathlib import Path
 
 import numpy as np
 
+from listn import compute_backend
 from listn.audio import TARGET_RATE, rms
+from listn.compute_backend import (  # re-exported: callers and the isolation
+    # worker import these from this module.
+    CUDA_RUNTIME_LIBS, Capability, CudaUnavailable, DeviceUnavailable, Plan,
+    format_report, probe_capabilities,
+)
 from listn.hub import load_local_or_download
 
 log = logging.getLogger(__name__)
@@ -175,6 +207,109 @@ def available_backends() -> dict[str, bool]:
     return out
 
 
+# The child-process probe itself lives in compute_backend; this module-level
+# name is the seam tests patch to drive timeouts, signal deaths and library
+# failures through a real child (tests/test_transcriber.py).
+_PROBE_SCRIPT = compute_backend.PROBE_SCRIPT
+
+
+def cuda_device_count() -> int:
+    """How many CUDA devices CTranslate2 can see; query in a child process.
+
+    A native driver/runtime bug becomes a quiet zero rather than killing listn.
+    The actionable reason is emitted by :func:`cuda_runtime_ready` when a GPU
+    device was requested explicitly.
+    """
+    result, _reason = compute_backend.run_probe(
+        script=_PROBE_SCRIPT, sonames=(), timeout=30.0)
+    return int(result.get("devices", 0)) if result else 0
+
+
+def cuda_runtime_ready(sonames: tuple[str, ...] = CUDA_RUNTIME_LIBS,
+                       timeout: float = 30.0) -> tuple[bool, str]:
+    """Can the CUDA runtime libraries CTranslate2 needs actually load?
+
+    Returns ``(ready, detail)``. The native loader and CTranslate2 device
+    query run in a child process: either can terminate the process without a
+    Python exception. A child that dies by signal, times out, or prints
+    nothing means "not ready" — returned as a reason, never as a crash.
+    """
+    result, error = compute_backend.run_probe(
+        script=_PROBE_SCRIPT, sonames=sonames, timeout=timeout)
+    if error or result is None:
+        return False, error or "the CUDA library probe returned no usable answer"
+    missing = result.get("missing", [])
+    if missing:
+        return False, "; ".join(missing)
+    if result.get("device_error"):
+        return False, f"CTranslate2 could not query the CUDA driver ({result['device_error']})"
+    return True, ""
+
+
+def _is_cuda_error(exc: BaseException) -> bool:
+    """True when an exception is CTranslate2 refusing (or failing) to use the GPU."""
+    text = str(exc).lower()
+    return any(word in text for word in
+               ("cuda", "cublas", "cudnn", "nccl", "libcuda", "gpu", "rocm"))
+
+
+def _resolve_plan(requested: str) -> Plan:
+    """The full selection plan: device, truthful note, and GPU truth.
+
+    Delegates to :func:`listn.compute_backend.resolve` with this module's
+    probe seams, so tests that pin ``cuda_device_count``/``cuda_runtime_ready``
+    (and ``compute_backend.rocm_capability``) drive the real policy.
+    """
+    return compute_backend.resolve(
+        requested, cuda_count=cuda_device_count, cuda_ready=cuda_runtime_ready,
+        rocm=compute_backend.rocm_capability)
+
+
+def resolve_device(requested: str) -> tuple[str, str | None]:
+    """Turn the ``compute_device`` setting into a WhisperModel device.
+
+    Returns ``(device, note)``. ``note`` explains a CPU fallback (or a ROCm
+    resolution) when there is one and is ``None`` otherwise. Raises
+    :class:`CudaUnavailable` when ``cuda``/``rocm`` was requested by name and
+    this machine cannot run it — checked before any model is built, so the
+    answer is one readable message with the missing piece and the remedy
+    rather than a failure inside CTranslate2.
+
+    ``auto`` means GPU only when a CUDA device is visible *and* the runtime
+    libraries load (or a ROCm build with a visible device); otherwise it
+    stays on the historical behaviour (``auto``, which CTranslate2 resolves
+    to CPU) or pins ``cpu`` when a GPU is visible but unusable. The full
+    plan (including which GPU backend resolved, for compute-type mapping)
+    is :func:`_resolve_plan`.
+    """
+    plan = _resolve_plan(requested)
+    return plan.device, plan.note
+
+
+def _reported_device(model: object, asked: str) -> str:
+    """The device CTranslate2 says the loaded model is actually running on."""
+    reported = getattr(getattr(model, "model", None), "device", None)
+    return str(reported) if reported else asked
+
+
+def _loud_device_failure(want: str, exc: BaseException) -> BaseException:
+    """The readable, actionable failure for an explicit ``cuda``/``rocm`` ask.
+
+    The message carries the missing piece and the exact remedy, so the user
+    never sees a bare CTranslate2 refusal. Only used on the in-process path;
+    the isolation parent builds the same messages in ``_on_cuda_failure``.
+    """
+    if want == "rocm":
+        return CudaUnavailable(
+            "compute_device=rocm was requested, but the model could not be "
+            f"built on the ROCm GPU: {exc}. Check the ROCm setup "
+            "(docs/GPU_LINUX.md), or run on CPU with --compute-device cpu.")
+    return CudaUnavailable(
+        "compute_device=cuda was requested, but the model could not be "
+        f"built on the GPU: {exc}. Install the CUDA 12 libraries "
+        "(docs/GPU_LINUX.md), or run on CPU with --compute-device cpu.")
+
+
 class Transcriber:
     backend = "base"
     # The device the model is actually built for; only faster-whisper sets it
@@ -183,8 +318,13 @@ class Transcriber:
     device: str | None = None
     # Set by a backend that had to abandon its configured device (the CPU
     # rebuild after CUDA libraries turned out to be unusable). Shown as the
-    # job's stage so the fallback is visible instead of silent.
+    # job's stage so the fallback is visible instead of silent. This is the
+    # canonical status surface: engine.py reads status_note.
     status_note: str | None = None
+    # Set by backends that know where they are running; reported verbatim.
+    # Richer detail beside status_note (probe reason, resolved device) —
+    # additive, never a replacement for it.
+    device_message: str | None = None
 
     def __init__(self, model: str):
         self.model_name = model
@@ -217,63 +357,124 @@ class Transcriber:
 
 class FasterWhisper(Transcriber):
     backend = "faster-whisper"
+    # What CTranslate2 reports after the model loads, not what we asked for.
+    device = "cpu"
 
     def __init__(self, model: str, download: Callable[[str], None] | None = None, *,
                  compute_type: str = "int8", cpu_threads: int | None = None,
-                 beam_size: int = 5):
+                 beam_size: int = 5, compute_device: str = "auto"):
         super().__init__(model)
         from faster_whisper import WhisperModel
 
-        # Defaults are byte-identical to the old hard-coded call: device auto,
-        # int8, and no cpu_threads passed (CTranslate2 picks its own count).
+        # Defaults stay byte-identical to the old hard-coded call: int8, no
+        # cpu_threads passed (CTranslate2 picks its own count), and "auto" on
+        # any machine without a usable GPU runtime. A GPU build left at the
+        # default compute type gets float16 via compute_type_for().
         self.beam_size = beam_size
-        # The device this model is actually built for: "auto" unless
-        # CTranslate2 can only be CPU (no GPU visible), or the CUDA libraries
-        # failed and we rebuilt on CPU. The cache keys on it so a fallback
-        # build is never served as if it were the configured one.
-        self.device = "auto" if _cuda_device_count() != 0 else "cpu"
+        plan = _resolve_plan(compute_device)
+        device, note = plan.device, plan.note
+        notes = [note] if note else []
+        want = (compute_device or "auto").strip().lower() or "auto"
+        # The probe narrows `auto` before any build: when it pins CPU because
+        # the GPU runtime is unusable, the canonical status note is main's
+        # exact library-unavailable message.
+        if want == "auto" and device == "cpu" and note:
+            self.status_note = CPU_FALLBACK_MESSAGE
+        base_compute_type = compute_type
+        compute_type = compute_backend.compute_type_for(
+            compute_type, device, gpu_active=plan.gpu_active)
+        kwargs: dict = dict(device=device, compute_type=compute_type)
+        if cpu_threads:
+            kwargs["cpu_threads"] = int(cpu_threads)
+        explicit_gpu = want in ("cuda", "rocm")
+        gpu_label = "ROCm" if plan.kind == "rocm" else "CUDA"
+        failures: list[Exception] = []
         # ``download`` is get_transcriber's status callback: it reports the
         # one-time model download and the CPU fallback alike.
         self._status = download
-        kwargs: dict = dict(device="auto", compute_type=compute_type)
-        if cpu_threads:
-            kwargs["cpu_threads"] = int(cpu_threads)
-        self._model_kwargs = kwargs
 
-        def cached():
-            try:
-                return WhisperModel(model, local_files_only=True, **self._model_kwargs)
-            except RuntimeError as exc:
-                # The weights are local and the rebuild below is local-only,
-                # so recovering here can never turn into a download attempt
-                # by load_local_or_download.
-                if self.device == "cpu" or not _is_cuda_unavailable(exc):
+        def load(dev: str):
+            """Build the model on ``dev``.
+
+            A device failure on the cached attempt is recorded in ``failures``
+            so the download path never runs: a broken GPU is not a missing
+            model, and retrying it over the network would both waste a round
+            trip and claim a download that is not happening.
+            """
+            kw: dict = dict(
+                kwargs, device=dev,
+                compute_type=compute_backend.compute_type_for(
+                    base_compute_type, dev,
+                    gpu_active=plan.gpu_active and dev != "cpu"))
+            failures.clear()
+
+            def cached():
+                try:
+                    return WhisperModel(model, local_files_only=True, **kw)
+                except Exception as exc:
+                    if _is_cuda_error(exc):
+                        failures.append(exc)
                     raise
-                log.warning("Model build on CUDA failed (%s); rebuilding on CPU", exc)
-                return self._rebuild_on_cpu()
 
-        def fetched():
-            return WhisperModel(model, **self._model_kwargs)
+            def fetched():
+                if failures:
+                    raise failures[0]
+                return WhisperModel(model, **kw)
 
-        self._model = load_local_or_download(
-            cached,
-            fetched,
-            on_download=(lambda: download(f"Downloading Whisper '{model}' (one time)...")) if download else None,
-        )
-        if self.status_note:
-            self._announce_fallback()
+            def notify():
+                if download and not failures:
+                    download(f"Downloading Whisper '{model}' (one time)...")
+
+            return load_local_or_download(cached, fetched,
+                                          on_download=notify if download else None)
+
+        # Kept for a segments-time rebuild (the in-process path only).
+        self._load = load
+
+        try:
+            self._model = load(device)
+        except Exception as exc:
+            if _IN_WORKER:
+                # The isolation child reports every error; the parent owns
+                # the classification (F1: the classifier lives in the parent).
+                raise
+            if not _is_cuda_unavailable(exc):
+                # F1: runtime faults (OOM, illegal memory access, NCCL) and
+                # unrelated errors propagate as themselves — no CPU rebuild,
+                # never relabelled as "CUDA libraries unavailable".
+                raise
+            if explicit_gpu:
+                # explicit cuda/rocm keeps the branch behaviour: one loud,
+                # actionable failure with the missing piece and the remedy.
+                raise _loud_device_failure(want, exc) from exc
+            if want == "cpu":
+                raise  # nowhere to fall back to
+            # auto: a broken GPU must not stop transcription — one rebuild,
+            # said out loud with main's exact message.
+            log.warning("Model build on CUDA failed (%s); rebuilding on CPU", exc)
+            self.status_note = CPU_FALLBACK_MESSAGE
+            notes.append(f"{gpu_label} unusable ({exc}); running on CPU")
+            device = "cpu"
+            self._model = load("cpu")
+
+        self.device = _reported_device(self._model, device)
+        # Truthful, user-facing: what the model reports, plus any fallback
+        # reason. get_transcriber passes this to the status callback on every
+        # call, cache hit or not.
+        self.device_message = f"device: {self.device}"
+        if notes:
+            self.device_message += " — " + "; ".join(notes)
 
     def _rebuild_on_cpu(self):
         """Rebuild once on CPU after a CUDA-library failure; never loops.
 
-        compute_type stays as configured (int8 is valid on CPU) and the
-        weights are already on disk, so this load is local-only.
+        Only the in-process path reaches this: the isolation child reports
+        the fault and the parent applies the policy instead. The weights are
+        already on disk, so this load is local-only.
         """
-        from faster_whisper import WhisperModel
         self.device = "cpu"
         self.status_note = CPU_FALLBACK_MESSAGE
-        self._model_kwargs["device"] = "cpu"
-        self._model = WhisperModel(self.model_name, local_files_only=True, **self._model_kwargs)
+        self._model = self._load("cpu")
         return self._model
 
     def _announce_fallback(self) -> None:
@@ -304,8 +505,10 @@ class FasterWhisper(Transcriber):
                 # One CPU rebuild per model, and only before the first segment
                 # went out (restarting mid-stream would repeat it). A second
                 # CUDA-shaped error — or anything else — propagates instead
-                # of looping.
-                if self.device == "cpu" or yielded or not _is_cuda_unavailable(exc):
+                # of looping. In the isolation child nothing is recovered
+                # here: the fault is reported and the parent classifies it.
+                if (_IN_WORKER or self.device == "cpu" or yielded
+                        or not _is_cuda_unavailable(exc)):
                     raise
                 log.warning("Transcription on CUDA failed (%s); rebuilding on CPU", exc)
                 self._rebuild_on_cpu()
@@ -382,24 +585,550 @@ class OpenAIWhisper(_WindowedBackend):
 
 
 _BACKENDS = {"faster-whisper": FasterWhisper, "mlx": MlxWhisper, "openai-whisper": OpenAIWhisper}
-# Keyed by (backend, model, compute_type, cpu_threads, beam_size, device) so a
-# knob change reloads the model, and a build that fell back to CPU is only ever
-# served from its cpu key — never as the configured (auto) one.
+# Keyed by (backend, model, compute_type, cpu_threads, beam_size, isolate,
+# device): a knob change reloads the model instead of reusing one built with
+# the old settings, and a build that fell back to CPU is only ever served
+# from its cpu key — never as the configured (auto) one.
 _cache: dict[tuple, Transcriber] = {}
 _cache_lock = threading.Lock()
+
+
+def _build_backend(name: str, model: str, knobs: dict,
+                   download: Callable[[str], None] | None = None) -> Transcriber:
+    """Build backend ``name`` in THIS process.
+
+    Shared by the in-process path and by the isolation worker child, so
+    both construct models through exactly the same code — device
+    resolution, the CPU fallback on a broken CUDA runtime and the download
+    messaging all behave identically wherever they run. Whether that code
+    is isolated in a child process is the caller's decision; this function
+    never spawns anything.
+    """
+    try:
+        return _BACKENDS[name](model, download=download, **knobs)
+    except ImportError as exc:
+        extra = {"mlx": "mlx", "openai-whisper": "openai"}.get(name, "")
+        hint = f" Install it with: pip install 'listn[{extra}]'" if extra else ""
+        raise RuntimeError(f"The {name} backend is not installed.{hint}") from exc
+
+
+# --- Process isolation for native inference ---------------------------------
+# CTranslate2's CUDA path can end the process with SIGSEGV/SIGABRT from
+# native code; no Python exception handler in this process can catch that.
+# IsolatedTranscriber therefore runs the COMPLETE model load + inference
+# operation in a child process (listn.inference_worker) and only hands a
+# result back once it is complete. Callers — engine jobs, live sessions —
+# write to the library only after that answer arrives, so a native crash
+# can never kill listn or leave a partial/duplicate transcript behind.
+
+# Test seam: "module:attr" factory the worker builds instead of the real
+# backend, so tests can kill a real child process on purpose. Production
+# leaves it None and the worker uses the registered backend.
+_FACTORY_PATH: str | None = None
+# True inside the isolation worker child (listn.inference_worker.main sets
+# it). The child never recovers a device fault itself: it reports the error
+# and the parent's classifier (the F1 policy) decides. In-process builds
+# recover on their own, because there is no parent to ask.
+_IN_WORKER = False
+
+
+class _Retry:
+    """Policy answer: restart the worker pinned to CPU."""
+
+
+_RETRY = _Retry()
+
+
+class _ChildDied(RuntimeError):
+    """The worker closed its response pipe without answering."""
+
+    def __init__(self, detail: str, phase: str | None = None):
+        super().__init__(detail)
+        self.detail = detail
+        self.phase = phase
+
+
+class _CudaFailure(RuntimeError):
+    """The worker answered ``kind="cuda"``/``kind="device"``.
+
+    ``device`` is True when the child raised :class:`CudaUnavailable`
+    itself — a refusal the probe issued before any model build, so it is
+    an availability answer by construction and keeps its type instead of
+    being re-read (and demoted) by the message classifier.
+    """
+
+    def __init__(self, detail: str, device: bool = False):
+        super().__init__(detail)
+        self.detail = detail
+        self.device = device
+
+
+class _BackendError(RuntimeError):
+    """The worker answered ``kind="error"``: a normal Python failure.
+
+    The worker itself is healthy, so this does not restart it.
+    """
+
+
+def _drain_stderr(stream, lines: deque) -> None:
+    """Keep the worker's stderr flowing (so it can never block) and tail it."""
+    try:
+        for raw in iter(stream.readline, b""):
+            lines.append(raw.decode("utf-8", "replace").rstrip())
+    except Exception:
+        pass
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+class _WorkerSession:
+    """One worker child process and the two pipes that talk to it."""
+
+    def __init__(self, proc, to_child: Connection, from_child: Connection,
+                 stderr_lines: deque):
+        self.proc = proc
+        self._to = to_child
+        self._from = from_child
+        self._stderr = stderr_lines
+
+    @classmethod
+    def spawn(cls) -> "_WorkerSession":
+        req_r, req_w = os.pipe()   # parent writes requests, child reads
+        res_r, res_w = os.pipe()   # child writes responses, parent reads
+        env = dict(os.environ)
+        # Make `python -m listn.inference_worker` resolvable no matter the cwd.
+        root = str(Path(__file__).resolve().parents[1])
+        env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "listn.inference_worker",
+                 str(req_r), str(res_w)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, pass_fds=(req_r, res_w),
+                env=env, close_fds=True)
+        except BaseException:
+            for fd in (req_r, req_w, res_r, res_w):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise
+        os.close(req_r)
+        os.close(res_w)
+        lines: deque[str] = deque(maxlen=80)
+        threading.Thread(target=_drain_stderr, args=(proc.stderr, lines),
+                         daemon=True).start()
+        return cls(proc, Connection(req_w), Connection(res_r), lines)
+
+    def death_detail(self) -> str:
+        """How the worker died, for a message a user can act on."""
+        proc = self.proc
+        try:
+            code = proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                code = proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                return "stopped responding"
+        if code is None:
+            return "stopped responding"
+        if code < 0:
+            try:
+                name = signal.Signals(-code).name
+            except ValueError:
+                name = f"signal {-code}"
+            return f"was killed by {name}"
+        if code > 0:
+            tail = self._stderr[-1] if self._stderr else ""
+            detail = f"exited with code {code}"
+            return f"{detail}: {tail}" if tail else detail
+        return "exited without answering"
+
+    def request(self, header: dict, payload=None, *, on_status=None,
+                on_progress=None) -> dict:
+        """Send one request and read events until its final answer.
+
+        A worker that died mid-request surfaces as :class:`_ChildDied` —
+        never as a partial result, because the final answer is the only
+        thing this method returns.
+        """
+        try:
+            self._to.send_bytes(json.dumps(header).encode("utf-8"))
+            if payload is not None:
+                view = payload if isinstance(payload, (bytes, bytearray)) \
+                    else memoryview(payload).cast("B")
+                self._to.send_bytes(view)
+        except (OSError, ValueError) as exc:
+            raise _ChildDied(self.death_detail()) from exc
+        while True:
+            try:
+                raw = self._from.recv_bytes()
+            except (EOFError, OSError) as exc:
+                raise _ChildDied(self.death_detail()) from exc
+            try:
+                message = json.loads(raw)
+            except ValueError:
+                raise _ChildDied("returned an unreadable answer") from None
+            if "ok" in message:
+                return message
+            event = message.get("event")
+            if event == "status" and on_status:
+                on_status(message.get("message"))
+            elif event == "progress" and on_progress:
+                on_progress(float(message.get("value") or 0.0))
+
+    def close(self) -> None:
+        for conn in (self._to, self._from):
+            try:
+                conn.close()
+            except Exception:
+                pass
+        proc = self.proc
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
+
+
+class IsolatedTranscriber(Transcriber):
+    """A backend whose model load and inference run in a child process.
+
+    The child takes every native crash. If it dies by signal mid-load or
+    mid-inference, the parent sees a closed pipe — not a dead listn — and
+    applies the compute-device policy:
+
+    * ``auto`` — a crash that happened (or could have happened) on the
+      GPU restarts the worker pinned to CPU, exactly once, and says so on
+      the status line: a truthful fallback, never a silent one. A crash
+      that was already on CPU, or a second crash after the fallback, is
+      an error.
+    * ``cuda``/``rocm`` — any crash or GPU refusal raises
+      :class:`CudaUnavailable` with the per-backend advice (CUDA libraries
+      or ROCm setup); the worker is never restarted on CPU.
+    * ``cpu`` — a crash is an error: there is no other device to fall
+      back to.
+
+    Only complete answers cross the process boundary, so callers write to
+    the library exactly when (and because) inference finished.
+    """
+
+    backend = "faster-whisper"
+    device = "cpu"
+
+    def __init__(self, model: str, download: Callable[[str], None] | None = None, *,
+                 compute_type: str = "int8", cpu_threads: int | None = None,
+                 beam_size: int = 5, compute_device: str = "auto"):
+        super().__init__(model)
+        self._notify = download
+        requested = (compute_device or "auto").strip().lower() or "auto"
+        self._requested_device = requested
+        self._effective_device = requested
+        self._knobs = dict(compute_type=compute_type, cpu_threads=cpu_threads,
+                           beam_size=beam_size, compute_device=requested)
+        self._session: _WorkerSession | None = None
+        self._loaded = False
+        self._device: str | None = None
+        self._notes: list[str] = []
+        self._fatal: tuple[type[BaseException], str] | None = None
+        self.device_message = "device: unknown"
+        self._lock = threading.Lock()
+        # The first load happens here — where the in-process backend would
+        # have built its model — so callers see identical timing. Status
+        # announcements made during it are deferred to get_transcriber,
+        # which speaks exactly once for the finished build (F1: one line).
+        self._initializing = True
+        try:
+            self._run("loading the model", self._worker)
+        finally:
+            self._initializing = False
+
+    # -- lifecycle --------------------------------------------------------
+
+    def close(self) -> None:
+        """Stop the worker process (its model and all) and release it."""
+        with self._lock:
+            self._kill_worker()
+
+    def __del__(self):
+        try:
+            self._kill_worker()
+        except Exception:
+            pass
+
+    def _kill_worker(self) -> None:
+        session, self._session = self._session, None
+        self._loaded = False
+        if session is not None:
+            session.close()
+
+    def _refresh_message(self) -> None:
+        self.device_message = f"device: {self._device or 'unknown'}"
+        if self._notes:
+            self.device_message += " — " + "; ".join(self._notes)
+
+    def _worker(self) -> _WorkerSession:
+        """The worker process, spawned and with its model loaded."""
+        if self._session is None:
+            self._session = _WorkerSession.spawn()
+            self._loaded = False
+        if not self._loaded:
+            header = {"op": "load", "backend": self.backend,
+                      "model": self.model_name,
+                      "knobs": dict(self._knobs,
+                                    compute_device=self._effective_device),
+                      "factory": _FACTORY_PATH}
+            try:
+                response = self._session.request(header, on_status=self._notify)
+            except _ChildDied as death:
+                raise _ChildDied(death.detail,
+                                 phase="loading the model") from None
+            if not response.get("ok"):
+                detail = str(response.get("error") or "the model could not be loaded")
+                if response.get("kind") in ("cuda", "device"):
+                    raise _CudaFailure(
+                        detail, device=response.get("kind") == "device")
+                raise _BackendError(detail)
+            self._loaded = True
+            reported = response.get("device")
+            if reported:
+                self.device = str(reported)
+                self._device = str(reported)
+            note = response.get("status_note")
+            if note:
+                # The child's own pre-build narrowing (the probe pinning CPU
+                # with the canonical message). Set once; a later reload that
+                # reports no note of its own never overwrites it.
+                self.status_note = str(note)
+            if self._notes:
+                # Keep the fallback note visible beside what the fresh
+                # worker reports; the note is why it is running on CPU.
+                self._refresh_message()
+            elif response.get("device_message"):
+                self.device_message = str(response["device_message"])
+            else:
+                self._refresh_message()
+        return self._session
+
+    # -- fallback policy --------------------------------------------------
+
+    def _run(self, phase: str, fn):
+        """Run ``fn``; turn a worker death into an error or a CPU fallback."""
+        if self._fatal:
+            cls, message = self._fatal
+            raise cls(message)
+        retried = False
+        while True:
+            try:
+                return fn()
+            except _ChildDied as death:
+                answer = self._on_death(death.detail, death.phase or phase, retried)
+                if isinstance(answer, _Retry):
+                    retried = True
+                    continue
+                raise answer
+            except _CudaFailure as failure:
+                answer = self._on_cuda_failure(failure.detail, phase, retried,
+                                               device=failure.device)
+                if isinstance(answer, _Retry):
+                    retried = True
+                    continue
+                raise answer
+            except _BackendError:
+                raise  # a normal Python error: the worker itself is fine
+            except BaseException:
+                # Cancelled / KeyboardInterrupt: stop native work at once.
+                self._kill_worker()
+                raise
+
+    def _set_fatal(self, cls: type, message: str) -> None:
+        # Store type+text, not the exception: it gets re-raised on every
+        # later call and must not accumulate tracebacks.
+        self._fatal = (cls, message)
+
+    def _pin_cpu(self, detail: str, phase: str,
+                 status_note: str | None = None) -> None:
+        """Truthful ``auto`` fallback: restart on CPU and say exactly why.
+
+        ``status_note`` overrides what is announced: the canonical
+        ``CPU_FALLBACK_MESSAGE`` for a load/availability fault (F1),
+        otherwise the descriptive note itself (a signal death).
+        """
+        self._effective_device = "cpu"
+        self._knobs["compute_device"] = "cpu"
+        self._device = "cpu"
+        self.device = "cpu"
+        note = (
+            f"the transcription process {detail} while {phase}; running on CPU")
+        self._notes.append(note)
+        self.status_note = status_note or note
+        self._refresh_message()
+        self._kill_worker()
+        if self._notify and not self._initializing:
+            self._notify(str(self.status_note))
+
+    def _on_death(self, detail: str, phase: str, retried: bool) -> BaseException | _Retry:
+        want = self._requested_device
+        gpu_suspect = self._device != "cpu"  # None = died before reporting
+        if want in ("cuda", "rocm"):
+            advice = (
+                "Check the ROCm setup (docs/GPU_LINUX.md), or run on CPU with "
+                "--compute-device cpu." if want == "rocm" else
+                "Install the CUDA 12 libraries (docs/GPU_LINUX.md), or run on "
+                "CPU with --compute-device cpu.")
+            message = (f"compute_device={want} was requested, but the transcription "
+                       f"process {detail} while {phase}. {advice}")
+            self._set_fatal(CudaUnavailable, message)
+            self._kill_worker()
+            return CudaUnavailable(message)
+        if want == "auto" and gpu_suspect and not retried:
+            self._pin_cpu(detail, phase)
+            return _RETRY
+        if retried:
+            message = (f"The transcription process {detail} while {phase} even "
+                       "after falling back to CPU; the model cannot run on this "
+                       "machine. See docs/GPU_LINUX.md.")
+        else:
+            message = (f"The transcription process {detail} while {phase} "
+                       f"(listn was running on "
+                       f"{self._device or self._effective_device}, so there is "
+                       "no other device to fall back to). See docs/GPU_LINUX.md.")
+        self._set_fatal(RuntimeError, message)
+        self._kill_worker()
+        return RuntimeError(message)
+
+    def _on_cuda_failure(self, detail: str, phase: str, retried: bool,
+                         *, device: bool = False) -> BaseException | _Retry:
+        want = self._requested_device
+        # F1: only a load/availability failure ("CUDA libraries unavailable")
+        # may be recovered as CPU. A runtime fault — OOM, illegal memory
+        # access, NCCL — propagates as itself: no CPU rebuild, no relabel.
+        # ``device`` skips the re-read: the child raised CudaUnavailable
+        # itself (the probe's pre-build refusal), which is availability by
+        # construction — and whose phrasing ("sees no CUDA device") the
+        # marker list would otherwise demote to a bare RuntimeError.
+        if not device and not _is_cuda_unavailable(RuntimeError(detail)):
+            return RuntimeError(detail)
+        if want == "auto" and not retried:
+            self._pin_cpu(f"failed ({detail})", phase,
+                          status_note=CPU_FALLBACK_MESSAGE)
+            return _RETRY
+        if want in ("cuda", "rocm"):
+            if "--compute-device cpu" in detail:
+                message = detail
+            elif want == "rocm":
+                message = (f"{detail} (compute_device=rocm was requested). Check "
+                           "the ROCm setup (docs/GPU_LINUX.md), or run on CPU "
+                           "with --compute-device cpu.")
+            else:
+                message = (f"{detail} (compute_device=cuda was requested). Install "
+                           "the CUDA 12 libraries (docs/GPU_LINUX.md), or run on "
+                           "CPU with --compute-device cpu.")
+        else:
+            message = f"{detail} (compute device: {self._device or self._effective_device})"
+        self._set_fatal(CudaUnavailable, message)
+        self._kill_worker()
+        return CudaUnavailable(message)
+
+    # -- inference --------------------------------------------------------
+
+    def transcribe(self, audio: np.ndarray, language: str | None = None,
+                   prompt: str | None = None, vad: bool = True,
+                   offset: float = 0.0, hotwords: str | None = None,
+                   progress: Callable[[float], None] | None = None) -> list[RawSegment]:
+        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if audio.size == 0:
+            return []
+        audio = np.ascontiguousarray(audio)
+        with self._lock:
+            self._run("loading the model", self._worker)
+            return self._run(
+                "transcribing",
+                lambda: self._send_transcribe(audio, language, prompt, vad,
+                                              offset, hotwords, progress))
+
+    def _send_transcribe(self, audio, language, prompt, vad, offset, hotwords,
+                         progress) -> list[RawSegment]:
+        session = self._worker()
+        header = {"op": "transcribe", "language": language, "prompt": prompt,
+                  "vad": bool(vad), "offset": float(offset or 0.0),
+                  "hotwords": hotwords, "progress": progress is not None,
+                  "nbytes": int(audio.nbytes)}
+        response = session.request(header, audio, on_status=self._notify,
+                                   on_progress=progress)
+        if not response.get("ok"):
+            detail = str(response.get("error") or "transcription failed")
+            if response.get("kind") in ("cuda", "device"):
+                raise _CudaFailure(detail,
+                                   device=response.get("kind") == "device")
+            raise _BackendError(detail)
+        return [RawSegment(float(row[0]), float(row[1]), str(row[2]),
+                           float(row[3]))
+                for row in response.get("segments") or []]
+
+    def segments(self, audio, language=None, prompt=None, vad=True, hotwords=None):
+        # The worker runs the full transcribe (which applies the offset and
+        # the hallucination filter); expose that result as an iterator.
+        return iter(self.transcribe(audio, language=language, prompt=prompt,
+                                    vad=vad, hotwords=hotwords))
+
+
+def _close_cached(keep: tuple | None = None) -> None:
+    """Stop the workers of cached models that are about to be evicted."""
+    for key, instance in list(_cache.items()):
+        if key == keep:
+            continue
+        close = getattr(instance, "close", None)
+        if close is None:
+            continue
+        try:
+            close()
+        except Exception:
+            log.debug("closing a cached transcriber worker failed", exc_info=True)
+
+
+# Children must not outlive the parent process; pipes would end their lives
+# anyway at exit, but terminate them promptly instead of at process teardown.
+atexit.register(_close_cached)
 
 
 def get_transcriber(model: str, backend: str = "auto",
                     status: Callable[[str], None] | None = None,
                     *, compute_type: str | None = None, cpu_threads: int | None = None,
-                    beam_size: int | None = None) -> Transcriber:
+                    beam_size: int | None = None,
+                    compute_device: str | None = None,
+                    isolate: bool | None = None) -> Transcriber:
     """Build (and cache) a backend.
 
-    The performance knobs default to the effective ``Settings`` (settings.json
-    plus ``LISTN_*`` env overrides), so every caller — live capture, file
-    jobs, the ingest socket — picks them up without being changed. Pass them
-    explicitly to override. Only the faster-whisper backend uses them.
+    The performance knobs and the compute device default to the effective
+    ``Settings`` (settings.json plus ``LISTN_*`` env overrides), so every
+    caller — live capture, file jobs, the ingest socket — picks them up
+    without being changed. Pass them explicitly to override. Only the
+    faster-whisper backend uses them.
 
+    ``isolate`` says where the work runs. ``None`` (the default) isolates
+    the faster-whisper backend — the one whose CUDA/HIP path can die on a
+    native signal — in a child process (:class:`IsolatedTranscriber`), and
+    runs every other backend in-process. ``False`` forces in-process (the
+    unit tests inspect the constructed model); ``True`` forces a child.
+
+    ``compute_device`` accepts ``cpu``/``auto``/``cuda``/``rocm`` — the
+    ``rocm`` name is accepted here, in settings.json, in
+    ``LISTN_COMPUTE_DEVICE`` and by ``--compute-device`` alike.
+
+    ``status`` receives one truthful line per call: the canonical fallback
+    reason (``status_note``) when the build had to abandon its device,
+    otherwise the ``device: …`` report of where the model really runs.
     A faster-whisper build whose CUDA libraries turn out to be unusable is
     rebuilt on CPU, announced through ``status``, and cached under its own
     device key.
@@ -409,50 +1138,69 @@ def get_transcriber(model: str, backend: str = "auto",
         raise ValueError(f"Unknown backend '{backend}'.")
     knobs: dict = {}
     if name == "faster-whisper":
-        if compute_type is None or cpu_threads is None or beam_size is None:
+        if (compute_type is None or cpu_threads is None or beam_size is None
+                or compute_device is None):
             from listn.config import Settings
 
             s = Settings.load()
             compute_type = s.compute_type if compute_type is None else compute_type
             cpu_threads = s.cpu_threads if cpu_threads is None else cpu_threads
             beam_size = s.beam_size if beam_size is None else beam_size
-        knobs = dict(compute_type=compute_type, cpu_threads=cpu_threads, beam_size=beam_size)
-    prefix = (name, model, knobs.get("compute_type"), knobs.get("cpu_threads"), knobs.get("beam_size"))
-    # faster-whisper builds start on device "auto"; one that had to fall back
-    # to CPU is keyed as "cpu" and found only under that key.
-    requested_device = "auto" if name == "faster-whisper" else None
+            # The device is a setting too: engine jobs call this without one,
+            # so settings.json / LISTN_COMPUTE_DEVICE (what --compute-device
+            # publishes) have to reach the backend here or the flag would be
+            # unreachable outside the tests that pass it explicitly.
+            compute_device = (s.compute_device
+                              if compute_device is None else compute_device)
+        knobs = dict(compute_type=compute_type, cpu_threads=cpu_threads,
+                     beam_size=beam_size, compute_device=compute_device)
+    if isolate is None:
+        isolate = name == "faster-whisper"
+    # The device sits LAST in the key: a build that fell back to CPU is only
+    # ever served from its cpu key — never as the configured (auto) one.
+    prefix = (name, model, knobs.get("compute_type"), knobs.get("cpu_threads"),
+              knobs.get("beam_size"), bool(isolate))
+    requested_device = (knobs.get("compute_device")
+                        if name == "faster-whisper" else None)
     candidates = [prefix + (requested_device,)]
     if requested_device == "auto":
         candidates.append(prefix + ("cpu",))
     instance: Transcriber | None = None
-    fresh = False
     with _cache_lock:
         for key in candidates:
             found = _cache.get(key)
             if found is None:
                 continue
             instance = found
-            effective = key[:-1] + (getattr(found, "device", requested_device),)
-            if effective != key:
-                # It fell back to CPU after being cached: move it over so the
-                # auto key never describes it again.
-                del _cache[key]
-                _cache[effective] = found
+            if requested_device == "auto":
+                effective = key[:-1] + (getattr(found, "device", requested_device),)
+                if effective != key:
+                    # It fell back to CPU after being cached: move it over so
+                    # the auto key never describes it again.
+                    del _cache[key]
+                    _cache[effective] = found
             break
         if instance is None:
-            fresh = True
             try:
-                instance = _BACKENDS[name](model, download=status, **knobs)
+                if isolate:
+                    instance = IsolatedTranscriber(model, download=status, **knobs)
+                else:
+                    instance = _build_backend(name, model, knobs, download=status)
             except ImportError as exc:
                 extra = {"mlx": "mlx", "openai-whisper": "openai"}.get(name, "")
                 hint = f" Install it with: pip install 'listn[{extra}]'" if extra else ""
                 raise RuntimeError(f"The {name} backend is not installed.{hint}") from exc
+            _close_cached(keep=prefix + (requested_device,))
             _cache.clear()  # keep one model resident; they're large
-            _cache[prefix + (getattr(instance, "device", requested_device),)] = instance
-    if not fresh and getattr(instance, "status_note", None) and status:
-        # A cache hit on a CPU-fallback build says so instead of silently
-        # transcribing on a different device than the one configured.
-        status(instance.status_note)
+            _cache[prefix + (requested_device,)] = instance
+    # One truthful line per call, cache hit or not: the canonical fallback
+    # reason when the build had to abandon its device, otherwise where the
+    # model really runs (nothing to say for a plain "auto" build).
+    message = getattr(instance, "status_note", None)
+    if message is None and getattr(instance, "device", None) not in (None, "auto"):
+        message = getattr(instance, "device_message", None)
+    if status and message:
+        status(message)
     return instance
 
 
@@ -460,4 +1208,5 @@ def register_backend(name: str, factory) -> None:
     """Hook for tests: register a fake backend."""
     _BACKENDS[name] = factory
     with _cache_lock:
+        _close_cached()
         _cache.clear()

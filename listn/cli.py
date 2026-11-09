@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import signal
 import sys
 import tempfile
@@ -13,16 +14,22 @@ import time
 from pathlib import Path
 
 from listn import __version__
-from listn.config import BACKENDS, MODELS, Settings, SettingsError, data_dir, disable_network_telemetry
+from listn.config import BACKENDS, COMPUTE_DEVICES, MODELS, Settings, SettingsError, data_dir, disable_network_telemetry
 from listn.library import EXPORT_FORMATS, Library, export, fmt_clock
 
 
 def _settings_from(args) -> Settings:
     s = Settings.load()
-    for key in ("device", "model", "language", "backend"):
+    for key in ("device", "model", "language", "backend", "compute_device"):
         value = getattr(args, key, None)
         if value is not None:
             setattr(s, key, value)
+    if getattr(args, "compute_device", None):
+        # The model is built inside the engine, which re-reads Settings from
+        # disk and the environment, so the CLI choice is published as this
+        # run's LISTN_COMPUTE_DEVICE: the flag beats settings.json and any
+        # pre-existing environment, exactly like a flag should.
+        os.environ["LISTN_COMPUTE_DEVICE"] = args.compute_device
     if getattr(args, "chunk", None) is not None:
         s.chunk_seconds = args.chunk
     if getattr(args, "no_audio", False):
@@ -45,15 +52,18 @@ def _perf_epilog() -> str:
         s = Settings.load()
     except SettingsError as exc:
         return (f"performance knobs: INVALID — {exc}\n"
-                "  Fix settings.json or the LISTN_COMPUTE_TYPE / "
-                "LISTN_CPU_THREADS / LISTN_BEAM_SIZE environment variable.")
+                "  Fix settings.json or the LISTN_COMPUTE_DEVICE / "
+                "LISTN_COMPUTE_TYPE / LISTN_CPU_THREADS / LISTN_BEAM_SIZE "
+                "environment variable.")
     threads = "auto (backend chooses)" if s.cpu_threads is None else str(s.cpu_threads)
     return ("performance knobs (effective for this run):\n"
+            f"  compute device: {s.compute_device}\n"
             f"  compute type: {s.compute_type}\n"
             f"  cpu threads:  {threads}\n"
             f"  beam size:    {s.beam_size}\n"
-            "  override with LISTN_COMPUTE_TYPE, LISTN_CPU_THREADS, LISTN_BEAM_SIZE "
-            "(env wins over settings.json)")
+            "  override with LISTN_COMPUTE_DEVICE, LISTN_COMPUTE_TYPE, "
+            "LISTN_CPU_THREADS, LISTN_BEAM_SIZE (env wins over settings.json; "
+            "--compute-device wins over both)")
 
 
 def _add_model_args(p: argparse.ArgumentParser) -> None:
@@ -61,6 +71,12 @@ def _add_model_args(p: argparse.ArgumentParser) -> None:
                    help="Whisper model (default: saved setting; first run is large-v3-turbo on Apple Silicon with MLX, otherwise small)")
     p.add_argument("--language", metavar="CODE", help="Language code such as en, es, de (default: auto-detect)")
     p.add_argument("--backend", choices=BACKENDS, help="Transcription backend (default: auto)")
+    p.add_argument("--compute-device", choices=COMPUTE_DEVICES,
+                   help="Where faster-whisper runs: auto (the default) uses CUDA or ROCm only when that runtime is "
+                        "usable and otherwise transcribes on CPU with a reason, cpu never touches the GPU, "
+                        "cuda/rocm require that GPU and fail with an actionable message instead of falling back "
+                        "(default: saved setting; this flag beats "
+                        "LISTN_COMPUTE_DEVICE and settings.json)")
     p.add_argument("--speakers", action="store_true", help="Label speakers with pyannote (needs the diarize extra)")
     p.add_argument("--hf-token", help="Hugging Face token for the first pyannote download (or set HF_TOKEN)")
 
