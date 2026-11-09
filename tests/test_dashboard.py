@@ -222,7 +222,15 @@ def test_snapshot_tracks_engine_jobs(client, tmp_path):
         if not jobs_seen:
             time.sleep(0.02)
     wait_status(client, sid, "done")
+    # Condition wait, not a single shot: the engine writes the library row to
+    # 'done' and pops the job a few statements later on its worker thread;
+    # under CPU saturation that window is observable, and one GET right after
+    # wait_status can land inside it. Wait for the pop, then assert.
+    deadline = time.monotonic() + 10
     snap = client.get("/api/dashboard").json()
+    while time.monotonic() < deadline and any(j["id"] == sid for j in snap["jobs"]):
+        time.sleep(0.02)
+        snap = client.get("/api/dashboard").json()
     assert snap["jobs"] == []
     assert not any(j["id"] == sid for j in snap["jobs"])
 
