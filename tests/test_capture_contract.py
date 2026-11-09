@@ -254,6 +254,12 @@ def test_partial_track_death_is_reported_not_hidden(fake_pw):
     recorder = start_recorder(fake_pw, targets=make_targets(sys_name="sys.die",
                                                             mic_name="mic.tone"))
     assert wait_for(lambda: recorder._tracks["system"].state == "failed")
+    # Condition wait, not wall time: the mic's stand-in can still be inside
+    # its startup/first-chunk window when the sibling dies (worse under CPU
+    # saturation), and stopping there honestly reports an empty mic track —
+    # a race with the generator, not the partial-death contract under test.
+    assert wait_for(lambda: recorder._tracks["mic"].frames > 0, timeout=10.0), (
+        "mic never delivered audio before the stop")
     report = recorder.stop()
     assert cc.validate_report(report) == []
     system, mic = report["tracks"]["system"], report["tracks"]["mic"]
