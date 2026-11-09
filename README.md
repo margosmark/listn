@@ -465,6 +465,37 @@ The Live page's device picker is the **legacy** path: a microphone, or BlackHole
 
 The first use of a model downloads it from Hugging Face. That request is unauthenticated unless you set `HF_TOKEN`, so the log may say `Warning: You are sending unauthenticated requests to the HF Hub` once. After the files are in `~/.cache/huggingface`, later loads set `HF_HUB_OFFLINE` and do not use the network.
 
+### Where transcription runs: `compute_device`
+
+Faster-whisper runs on **`auto` by default** — the shipped behaviour: use the GPU when this machine's CUDA *or ROCm* runtime is actually usable, otherwise transcribe on CPU and say why. On Linux a machine can expose an NVIDIA device without the CUDA 12 cuBLAS runtime CTranslate2 needs, and that failure happens inside the native library — where a missing library can end the process instead of raising a Python exception. listn installs no GPU packages and makes no network or cloud calls either way.
+
+| Value | Behaviour |
+|---|---|
+| `auto` (default) | Probes the GPU **in a child process** first (so a broken driver or library cannot take listn down); uses CUDA or ROCm only when that runtime is really usable, and otherwise transcribes on CPU with the note `CUDA libraries unavailable — transcribing on CPU`. |
+| `cpu` | Never touches the GPU. |
+| `cuda`, `rocm` | Require that GPU stack. If it cannot be used, listn stops with an actionable error naming the missing piece and the remedy — no silent fallback, exit code 1, no traceback. |
+
+Model load and inference for the default backend run in a **separate process**. A GPU stack that kills that process mid-run (SIGSEGV/SIGABRT from native code — the failure a Python `try` cannot catch) can never take listn down with it: `auto` restarts the work pinned to CPU, exactly once, and says so on the status line; `cuda` fails with the error above instead of retrying on CPU; and the transcript is written only after a run finishes cleanly, so a crash never leaves a half-written or duplicated transcript.
+
+The status line reports the device the model actually runs on (`device: cpu`, `device: cuda`), so a fallback is never mistaken for GPU acceleration.
+
+```fish
+# CPU only (fish, and any other shell — `env` works everywhere)
+uv run listn transcribe ./mic.wav --model tiny --backend faster-whisper --compute-device cpu
+
+# or set it for the session
+set -lx LISTN_COMPUTE_DEVICE cpu
+uv run listn transcribe ./mic.wav --model tiny --backend faster-whisper
+
+# require CUDA — fails with an actionable message if it is unavailable
+uv run listn transcribe ./mic.wav --model tiny --backend faster-whisper --compute-device cuda
+
+# let listn decide, falling back to CPU if the CUDA runtime is unusable
+uv run listn transcribe ./mic.wav --model tiny --backend faster-whisper --compute-device auto
+```
+
+The same choices live in `settings.json` as `compute_device` (`auto`, `cpu`, `cuda`, `rocm`) and in `LISTN_COMPUTE_DEVICE`. Precedence: `--compute-device` beats the environment, which beats the file. See [GPU_LINUX.md](docs/GPU_LINUX.md) for what CUDA validation involves; only use explicit `cuda`/`rocm` after your GPU stack is known to work.
+
 ## Notes
 
 When a recording or file transcription finishes, listn writes notes into `sessions/<id>/summary.json`: a summary, key points, decisions, action items (owner, task, and a due date when one was said), and open questions. Each item carries the time it was said, and the library shows them under *In the recording* with a link that plays the audio from there. Owners are **Me** (you), a renamed speaker, or someone named in the meeting. Turn this off with *Summarize when a recording ends*, or run it again from the library. The notes are editable; notes you edited are not replaced by the automatic run after a recording or speaker labelling (use *Regenerate*, or `listn summarize --force`).
@@ -671,5 +702,6 @@ This repo's tests do not open a process tap. On the Mac, check:
 - **FFmpeg / `libavutil` errors from torchcodec during speaker labelling.** Harmless: the labels still come out, because listn hands pyannote the audio itself rather than having torchcodec decode the file.
 - **`update` says you have uncommitted changes.** Commit or `git stash` them, then run it again.
 - **Port 8765 is taken.** Quit the other listn (`engine.log` will say so). The menu bar will not attach to a pre-0.3 server that has no capture socket.
+- **`Library libcublas.so.12 is not found or cannot be loaded` (or any CUDA error) on Linux.** The GPU is visible but its CUDA runtime is missing or unusable. Run on CPU with `--compute-device cpu` (fish: `set -lx LISTN_COMPUTE_DEVICE cpu` before the command, or `env LISTN_COMPUTE_DEVICE=cpu uv run listn …`). `--compute-device cuda` fails with the same advice instead of falling back; the default `--compute-device auto` probes the runtime in a child process and falls back on its own. See [Where transcription runs](#where-transcription-runs-compute_device).
 
 MIT License.
