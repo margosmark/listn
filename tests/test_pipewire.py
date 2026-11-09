@@ -365,7 +365,7 @@ def test_recorder_start_accepts_present_nodes_despite_serial_collision(fake_pw):
                                    runner=PerIdDumpRunner(),
                                    pw_record=fake_pw["script"], node_watch_interval=0.05)
     recorder.start()  # the bug: CaptureError "already gone" was raised here
-    time.sleep(0.3)
+    wait_for_audio(recorder)
     report = recorder.stop()
     assert report["ok"] is True, report
     assert report["tracks"]["system"]["verdict"] == "ok"
@@ -565,9 +565,33 @@ def wait_for(predicate, timeout=5.0):
     return False
 
 
+#: PCM seconds every waited-on track must have delivered before a test stops
+#: the recorder. On a loaded box the stand-in needs ~0.35-1.2 s just to boot
+#: and emit its first chunk (diag_boot_latency.py: first audio p50 0.35-0.51 s
+#: at 4-16 busy loops, worst 1.19 s), so a fixed wall-clock sleep stops the
+#: capture mid-spawn and the floors below then see one 0.1 s chunk — flake #4
+#: (`assert 0.1 > 0.3`). Waiting on the audio makes the tests independent of
+#: spawn latency; the assertions themselves are unchanged.
+MIN_TRACK_SECONDS = 1.0
+
+
+def wait_for_audio(recorder, tracks=(TRACK_SYSTEM, TRACK_MIC),
+                   seconds=MIN_TRACK_SECONDS, timeout=15.0):
+    """Block until each named track has consumed ``seconds`` of PCM."""
+    def ready():
+        return all(track.frames / recorder.rate >= seconds
+                   for track in recorder._tracks.values()
+                   if track.target.track_id in tracks)
+
+    assert wait_for(ready, timeout=timeout), (
+        f"capture starved: wanted {seconds}s on track ids {tracks}, got "
+        + str({name: round(t.frames / recorder.rate, 3)
+               for name, t in recorder._tracks.items()}))
+
+
 def test_recorder_captures_two_independent_tracks(fake_pw):
     recorder = start_recorder(fake_pw)
-    time.sleep(0.35)
+    wait_for_audio(recorder)
     report = recorder.stop()
     assert report["ok"] is True, report
     system, mic = report["tracks"]["system"], report["tracks"]["mic"]
@@ -597,9 +621,22 @@ def test_recorder_captures_two_independent_tracks(fake_pw):
 
 def test_recorder_argv_follows_pw_record_contract(fake_pw):
     recorder = start_recorder(fake_pw)
-    time.sleep(0.2)
+
+    def argv_lines():
+        # The stand-ins append their argv at boot; on a loaded box the
+        # interpreter can take longer than any fixed sleep (flake #4: the
+        # argv.log read below used to FileNotFoundError), so wait for both
+        # lines — each complete line ends with the trailing "-" operand.
+        try:
+            return [ln for ln in fake_pw["argv_log"].read_text().splitlines() if ln]
+        except OSError:
+            return []
+
+    assert wait_for(lambda: len(argv_lines()) >= 2
+                    and all(ln.split()[-1] == "-" for ln in argv_lines()),
+                    timeout=15.0), f"stand-in pw-record never logged argv: {argv_lines()}"
     recorder.stop()
-    lines = [line for line in fake_pw["argv_log"].read_text().splitlines() if line]
+    lines = argv_lines()
     assert len(lines) == 2
     by_target = {}
     for line in lines:
@@ -622,7 +659,7 @@ def test_recorder_argv_follows_pw_record_contract(fake_pw):
 def test_recorder_never_calls_silence_a_success(fake_pw):
     recorder = start_recorder(fake_pw, targets=make_targets(sys_name="sys.tone",
                                                             mic_name="mic.silent"))
-    time.sleep(0.35)
+    wait_for_audio(recorder)
     report = recorder.stop()
     assert report["tracks"]["mic"]["verdict"] == "silent"
     assert report["tracks"]["system"]["verdict"] == "ok"
@@ -638,7 +675,7 @@ def test_recorder_refuses_two_tracks_with_one_signal(fake_pw):
     """
     recorder = start_recorder(fake_pw, targets=make_targets(sys_name="sys.fallback",
                                                             mic_name="mic.fallback"))
-    time.sleep(0.35)
+    wait_for_audio(recorder)
     report = recorder.stop()
     assert report["ok"] is False, report
     for name in ("system", "mic"):
@@ -654,7 +691,7 @@ def test_recorder_silent_system_alone_stays_ok(fake_pw):
     """Nobody talking silences the system track; the engine ignores it too."""
     recorder = start_recorder(fake_pw, targets=make_targets(sys_name="sys.silent",
                                                             mic_name="mic.tone"))
-    time.sleep(0.35)
+    wait_for_audio(recorder)
     report = recorder.stop()
     assert report["tracks"]["system"]["verdict"] == "silent"
     assert report["tracks"]["mic"]["verdict"] == "ok"
@@ -687,9 +724,10 @@ def test_recorder_rollback_kills_partially_started_capture(fake_pw):
 def test_recorder_fails_only_the_track_whose_process_dies(fake_pw):
     recorder = start_recorder(fake_pw, targets=make_targets(sys_name="sys.die",
                                                             mic_name="mic.tone"))
-    assert wait_for(lambda: recorder._tracks["system"].state == "failed"), \
-        "early pw-record exit must fail the track"
-    time.sleep(0.2)
+    assert wait_for(lambda: recorder._tracks["system"].state == "failed",
+                    timeout=15.0), "early pw-record exit must fail the track"
+    # the mic still needs real audio for its `ok` verdict below
+    wait_for_audio(recorder, tracks=(TRACK_MIC,))
     report = recorder.stop()
     system, mic = report["tracks"]["system"], report["tracks"]["mic"]
     assert system["state"] == "failed"
@@ -710,13 +748,20 @@ def test_recorder_fails_track_when_target_node_disappears(fake_pw):
 
     probe = FlipProbe({"sys.tone": 2})
     recorder = start_recorder(fake_pw, probe=probe)
-    time.sleep(0.4)
+    # The probe flip — not wall time — must have failed the system track,
+    # and the mic must hold real audio for its `stopped`/`ok` assertions.
+    assert wait_for(lambda: recorder._tracks["system"].state == "failed",
+                    timeout=15.0), "probe flip must fail the system track"
+    wait_for_audio(recorder, tracks=(TRACK_MIC,))
     report = recorder.stop()
     system, mic = report["tracks"]["system"], report["tracks"]["mic"]
     assert system["state"] == "failed"
     assert "disappeared" in system["error"]
-    # the pw-record process was stopped instead of silently re-targeting
-    assert system["exit_code"] in (1, -9, 137)
+    # The pw-record process was stopped instead of silently re-targeting.
+    # -2: the stand-in was still booting when the node-loss SIGINT arrived
+    # (spawn starvation) — our termination all the same; 1 = handled SIGINT,
+    # -9/137 = force-killed for ignoring it.
+    assert system["exit_code"] in (1, -2, -9, 137)
     assert mic["state"] == "stopped" and mic["verdict"] == "ok"
     assert report["ok"] is False
 
@@ -725,7 +770,11 @@ def test_recorder_force_kills_process_that_ignores_sigint(fake_pw):
     recorder = start_recorder(fake_pw, targets=make_targets(sys_name="sys.stubborn",
                                                             mic_name="mic.tone"),
                               stop_grace=0.4)
-    time.sleep(0.3)
+    # Both tracks must be flowing before stop(): the mic's `stopped` state
+    # needs real audio, and the system stand-in must have booted into its
+    # SIGINT-ignoring loop (audio proves it) — otherwise stop() ends it with
+    # a plain SIGINT and the force-kill path below is never exercised.
+    wait_for_audio(recorder)
     report = recorder.stop(grace=0.4)
     system = report["tracks"]["system"]
     assert system["state"] == "failed"
@@ -743,7 +792,7 @@ def test_recorder_lifecycle_guards(fake_pw):
     recorder.start()
     with pytest.raises(pw.CaptureError, match="already recording"):
         recorder.start()
-    time.sleep(0.3)  # let real audio land so the capture counts as successful
+    wait_for_audio(recorder)  # the capture must count as successful below
     first = recorder.stop()
     second = recorder.stop()
     assert first == second and first["ok"] is True
@@ -769,7 +818,7 @@ def test_recorder_on_block_feeds_engine_shape(fake_pw):
         blocks.append((track, rate, block))
 
     recorder = start_recorder(fake_pw, on_block=on_block)
-    time.sleep(0.3)
+    wait_for_audio(recorder)
     recorder.stop()
     assert blocks, "no PCM blocks were delivered"
     tracks = {t for t, _, _ in blocks}
@@ -871,7 +920,12 @@ def test_cli_capture_exit_codes(monkeypatch, tmp_path, capsys):
         pw, "discover", lambda **kw: graph(sink="sys.tone", source="mic.tone",
                                            default_sink="sys.tone", default_source="mic.tone"))
 
-    rc = pw.main(["--duration", "0.35", "--out", str(tmp_path / "ok"), "--json"])
+    # The CLI's recording window is wall-clock, so it must outlast the
+    # stand-ins' spawn: first audio needs 0.35-1.2 s on a loaded box
+    # (diag_boot_latency.py). With 0.35 s a leg could record 0.00 s under
+    # CPU saturation (flake #4) and the assertions below lost their cause.
+    CLI_SECONDS = "2.0"
+    rc = pw.main(["--duration", CLI_SECONDS, "--out", str(tmp_path / "ok"), "--json"])
     ok_report = json.loads(capsys.readouterr().out)
     assert rc == 0 and ok_report["ok"] is True
     assert ok_report["tracks"]["mic"]["verdict"] == "ok"
@@ -879,7 +933,7 @@ def test_cli_capture_exit_codes(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(
         pw, "discover", lambda **kw: graph(sink="sys.tone", source="mic.silent",
                                            default_sink="sys.tone", default_source="mic.silent"))
-    rc = pw.main(["--duration", "0.35", "--out", str(tmp_path / "sil"), "--json"])
+    rc = pw.main(["--duration", CLI_SECONDS, "--out", str(tmp_path / "sil"), "--json"])
     silence_report = json.loads(capsys.readouterr().out)
     assert rc == 1 and silence_report["ok"] is False
     assert silence_report["tracks"]["mic"]["verdict"] == "silent"
@@ -890,11 +944,11 @@ def test_cli_capture_exit_codes(monkeypatch, tmp_path, capsys):
         pw, "discover", lambda **kw: graph(sink="sys.fallback", source="mic.fallback",
                                            default_sink="sys.fallback",
                                            default_source="mic.fallback"))
-    rc = pw.main(["--duration", "0.35", "--out", str(tmp_path / "same"), "--json"])
+    rc = pw.main(["--duration", CLI_SECONDS, "--out", str(tmp_path / "same"), "--json"])
     same_report = json.loads(capsys.readouterr().out)
     assert rc == 1 and same_report["ok"] is False
     assert "identical" in (same_report["tracks"]["system"]["error"] or "")
-    rc = pw.main(["--duration", "0.35", "--out", str(tmp_path / "same2")])
+    rc = pw.main(["--duration", CLI_SECONDS, "--out", str(tmp_path / "same2")])
     captured = capsys.readouterr()
     assert rc == 1
     assert "Capture NOT OK" in captured.out
