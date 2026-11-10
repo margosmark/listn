@@ -21,12 +21,13 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
 import pytest
 
-from listn import cli
+from listn import __version__, autostart, cli
 from listn.tray import TrayStatus, build_menu
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -477,12 +478,77 @@ def test_launcher_keeps_state_in_the_user_home():
     # project (setuptools would need to write into the source tree), and run
     # the module from there with PYTHONPATH.
     assert "--frozen --no-install-project --no-dev" in text
-    assert '"$env/bin/python" -m listn "$@"' in text
+    # F2: the module runs with the cwd kept off sys.path (-P on >= 3.11, the
+    # runpy shim below on the 3.10 floor).
+    assert '"$env/bin/python" -P -m listn "$@"' in text
     assert 'PYTHONPATH="$project' in text
     # The tray extra is pulled in only by the tray command.
     assert "--no-install-project --no-dev --extra tray" in text
     assert text.count("--extra tray") == 1
     assert "/usr/share/listn" in text
+
+
+def test_launcher_gates_the_safe_path_flag_on_the_python_floor():
+    """F2: neither ``-P`` nor ``PYTHONSAFEPATH`` exists on Python 3.10.
+
+    The floor in pyproject.toml is 3.10, so the launcher probes the
+    interpreter it is about to ``exec`` and falls back to a runpy shim —
+    byte-identical to the one ``listn/autostart.py`` renders into its Exec
+    line, so the two shipped launch paths cannot drift apart.
+    """
+    text = LAUNCHER.read_text(encoding="utf-8")
+    probe = ('if "$env/bin/python" -c '
+             "'import sys;sys.exit(sys.version_info < (3, 11))'")
+    assert probe in text, "the -P branch is not gated on the interpreter"
+    shim = re.search(r'-c "(.+)" "\$@"', text)
+    assert shim, "the launcher has no runpy shim fallback for Python 3.10"
+    assert shim.group(1) == autostart.SAFE_RUN_SHIM
+    # The shim passes through shell quoting and (in autostart) both
+    # desktop-entry escaping layers, so none of their metacharacters.
+    assert not set(autostart.SAFE_RUN_SHIM) & set('"\\`$%')
+
+
+def test_launcher_ignores_a_planted_listn_package_in_its_cwd(tmp_path):
+    """F2: ``cd <dir-with-planted-listn-package> && listn --version`` prints
+    the real version.
+
+    The shipped script runs as-is (only ``uv sync`` is stubbed — the sync is
+    not what this is about) from a directory holding a hostile ``listn/``
+    package, with PYTHONPATH pointing at the real tree the way the packaged
+    PYTHONPATH does. The control run, without the fix, must load the planted
+    package — otherwise the test could not detect the hijack at all.
+    """
+    planted = tmp_path / "cwd"
+    (planted / "listn").mkdir(parents=True)
+    (planted / "listn" / "__init__.py").write_text(
+        'print("PLANTED_PKG_LOADED_INSTEAD")\n', encoding="utf-8")
+    (planted / "listn" / "__main__.py").write_text(
+        'import sys\nprint("PLANTED_PKG_LOADED_INSTEAD")\nsys.exit(3)\n',
+        encoding="utf-8")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    uv = bin_dir / "uv"
+    uv.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    uv.chmod(0o755)
+    env_dir = tmp_path / "env"
+    (env_dir / "bin").mkdir(parents=True)
+    (env_dir / "bin" / "python").symlink_to(sys.executable)
+
+    env = {**os.environ,
+           "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+           "UV_PROJECT_ENVIRONMENT": str(env_dir),
+           "PYTHONPATH": str(ROOT)}
+    control = subprocess.run([sys.executable, "-m", "listn", "--version"],
+                             cwd=planted, env=env, capture_output=True, text=True,
+                             timeout=120)
+    assert "PLANTED_PKG_LOADED_INSTEAD" in control.stdout, control.stdout
+
+    run = subprocess.run(["sh", str(LAUNCHER), "--version"], cwd=planted, env=env,
+                         capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip() == f"listn {__version__}"
+    assert "PLANTED_PKG_LOADED_INSTEAD" not in run.stdout + run.stderr
 
 
 # ------------------------------------------------------ optional real tools
