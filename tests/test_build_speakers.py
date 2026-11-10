@@ -22,9 +22,11 @@ def test_the_diarize_extra_is_pyannote_4_with_a_matching_torch():
     pyannote = next(d for d in extra if d.startswith("pyannote.audio"))
     assert ">=4" in pyannote and "<5" in pyannote
     torch = next(d for d in extra if re.match(r"torch[<>=]", d))
-    assert ">=2.8" in torch and "<2.9" not in torch
-    assert any(d.startswith("torchaudio>=2.8") for d in extra)
-    assert any(d.startswith("torchcodec") for d in extra)
+    # F1: >=2.13 clears every fixable advisory on torch 2.8.0 (checkpoint RCE
+    # CVE-2026-24747 etc.); CVE-2026-4538 has no upstream fix.
+    assert ">=2.13" in torch and "<2.9" not in torch
+    assert any(d.startswith("torchaudio>=2.11") for d in extra)
+    assert any(d.startswith("torchcodec>=0.12") for d in extra)
     assert project["version"] == "0.5.0"
 
 
