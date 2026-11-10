@@ -21,11 +21,14 @@ mlx = ["mlx-whisper>=0.4.3,<0.5; sys_platform == 'darwin' and platform_machine =
 # Local notes and Q&A. The default Qwen3-30B-A3B-Instruct 4-bit is about 17 GB; Qwen2.5-7B 4-bit is 4.3 GB.
 llm = ["mlx-lm>=0.20,<0.30; sys_platform == 'darwin' and platform_machine == 'arm64'"]
 openai = ["openai-whisper>=20240930"]
-# Speaker labels and voice matching. pyannote 4 needs torch 2.8+. Audio is
-# handed over in memory, so torchcodec's FFmpeg decoding is never used, but
-# torchcodec releases are built for one torch release each: 0.7 is torch 2.8.
-# Raise torch, torchaudio and torchcodec together.
-diarize = ["pyannote.audio>=4.0.1,<5", "torch>=2.8", "torchaudio>=2.8", "torchcodec>=0.7,<0.8"]
+# Speaker labels and voice matching. pyannote 4 needs torch 2.8+.
+# F1 (security t_b0cc2fd8): torch >=2.13 clears all fixable OSV advisories on
+# 2.8.0 incl. the checkpoint RCE (CVE-2026-24747); only CVE-2026-4538
+# (PYSEC-2026-139) is unfixed upstream. torchaudio tops out at 2.11.1 on PyPI
+# (declares torch>=2.11); torchcodec 0.14+ targets torch>=2.11 — so the three
+# move together as a set: torch 2.13+, torchaudio 2.11+, torchcodec 0.12+.
+# Audio is handed over in memory, so torchcodec's FFmpeg decoding is never used.
+diarize = ["pyannote.audio>=4.0.1,<5", "torch>=2.13", "torchaudio>=2.11", "torchcodec>=0.12,<0.18"]
 # KDE Plasma / SNI tray over D-Bus (no Qt needed).
 tray = ["dbus-next>=0.2,<1"]
 

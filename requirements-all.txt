@@ -39,9 +39,7 @@ av==19.0.1 ; python_full_version >= '3.12'
 certifi==2026.10.19
     # via requests
 cffi==2.1.1
-    # via
-    #   sounddevice
-    #   soundfile
+    # via sounddevice
 charset-normalizer==3.5.2
     # via requests
 click==8.5.0
@@ -50,7 +48,7 @@ click==8.5.0
     #   uvicorn
 cloudpickle==3.1.2
     # via joblib
-colorama==0.4.6 ; sys_platform == 'win32'
+colorama==0.4.6 ; (python_full_version < '0' and platform_machine == 'arm64' and sys_platform == 'darwin') or sys_platform == 'win32'
     # via
     #   colorlog
     #   tqdm
@@ -67,12 +65,22 @@ contourpy==1.4.0 ; python_full_version >= '3.12'
     # via matplotlib
 ctranslate2==4.8.3
     # via faster-whisper
+cuda-bindings==13.4.4 ; python_full_version < '3.11' and sys_platform == 'linux'
+    # via torch
+cuda-bindings==13.5.0 ; python_full_version >= '3.11' and sys_platform == 'linux'
+    # via torch
+cuda-pathfinder==1.8.3 ; python_full_version < '3.11' and sys_platform == 'linux'
+    # via cuda-bindings
+cuda-pathfinder==1.8.6 ; python_full_version >= '3.11' and sys_platform == 'linux'
+    # via cuda-bindings
+cuda-toolkit==13.0.3.0 ; python_full_version < '3.11' and sys_platform == 'linux'
+    # via torch
+cuda-toolkit==13.2.2 ; python_full_version >= '3.11' and sys_platform == 'linux'
+    # via torch
 cycler==0.12.1
     # via matplotlib
-docopt==0.6.2
-    # via
-    #   pyannote-metrics
-    #   pyannote-pipeline
+dbus-next==0.2.3
+    # via listn
 einops==0.8.2
     # via pyannote-audio
 exceptiongroup==1.3.1 ; python_full_version < '3.11'
@@ -107,8 +115,14 @@ fsspec==2026.9.0
     #   lightning
     #   pytorch-lightning
     #   torch
+googleapis-common-protos==1.76.0
+    # via
+    #   opentelemetry-exporter-otlp-proto-grpc
+    #   opentelemetry-exporter-otlp-proto-http
 greenlet==3.5.6 ; (python_full_version < '3.11' and platform_machine == 'AMD64') or (python_full_version < '3.11' and platform_machine == 'WIN32') or (python_full_version < '3.11' and platform_machine == 'aarch64') or (python_full_version < '3.11' and platform_machine == 'amd64') or (python_full_version < '3.11' and platform_machine == 'ppc64le') or (python_full_version < '3.11' and platform_machine == 'win32') or (python_full_version < '3.11' and platform_machine == 'x86_64')
     # via sqlalchemy
+grpcio==1.85.0
+    # via opentelemetry-exporter-otlp-proto-grpc
 h11==0.16.0
     # via
     #   httpcore2
@@ -130,12 +144,10 @@ huggingface-hub==2.2.0
     #   faster-whisper
     #   mlx-whisper
     #   pyannote-audio
-    #   speechbrain
     #   tokenizers
+    #   transformers
 humanfriendly==10.0 ; python_full_version < '3.11'
     # via coloredlogs
-hyperpyyaml==1.2.3
-    # via speechbrain
 idna==3.20
     # via
     #   anyio
@@ -143,11 +155,11 @@ idna==3.20
     #   requests
     #   yarl
 jinja2==3.1.6
-    # via torch
-joblib==1.6.0
     # via
-    #   scikit-learn
-    #   speechbrain
+    #   mlx-lm
+    #   torch
+joblib==1.6.0
+    # via scikit-learn
 julius==0.2.8
     # via torch-audiomentations
 kiwisolver==1.5.1
@@ -170,13 +182,17 @@ markupsafe==3.0.4
     #   jinja2
     #   mako
 matplotlib==3.10.9 ; python_full_version < '3.11'
-    # via pyannote-metrics
+    # via pyannote-audio
 matplotlib==3.11.2 ; python_full_version >= '3.11'
-    # via pyannote-metrics
+    # via pyannote-audio
 mdurl==0.1.2
     # via markdown-it-py
 mlx==0.32.4 ; platform_machine == 'arm64' and sys_platform == 'darwin'
-    # via mlx-whisper
+    # via
+    #   mlx-lm
+    #   mlx-whisper
+mlx-lm==0.29.1 ; platform_machine == 'arm64' and sys_platform == 'darwin'
+    # via listn
 mlx-metal==0.32.4 ; platform_machine == 'arm64' and sys_platform == 'darwin'
     # via mlx
 mlx-whisper==0.4.3 ; platform_machine == 'arm64' and sys_platform == 'darwin'
@@ -214,6 +230,7 @@ numpy==2.2.6 ; python_full_version < '3.11'
     #   ctranslate2
     #   listn
     #   matplotlib
+    #   mlx-lm
     #   mlx-whisper
     #   numba
     #   onnxruntime
@@ -225,10 +242,8 @@ numpy==2.2.6 ; python_full_version < '3.11'
     #   pytorch-metric-learning
     #   scikit-learn
     #   scipy
-    #   soundfile
-    #   speechbrain
-    #   tensorboardx
     #   torchmetrics
+    #   transformers
 numpy==2.4.6 ; python_full_version == '3.11.*'
     # via
     #   asteroid-filterbanks
@@ -236,6 +251,7 @@ numpy==2.4.6 ; python_full_version == '3.11.*'
     #   ctranslate2
     #   listn
     #   matplotlib
+    #   mlx-lm
     #   mlx-whisper
     #   numba
     #   onnxruntime
@@ -247,10 +263,8 @@ numpy==2.4.6 ; python_full_version == '3.11.*'
     #   pytorch-metric-learning
     #   scikit-learn
     #   scipy
-    #   soundfile
-    #   speechbrain
-    #   tensorboardx
     #   torchmetrics
+    #   transformers
 numpy==2.5.4 ; python_full_version >= '3.12'
     # via
     #   asteroid-filterbanks
@@ -258,6 +272,7 @@ numpy==2.5.4 ; python_full_version >= '3.12'
     #   ctranslate2
     #   listn
     #   matplotlib
+    #   mlx-lm
     #   mlx-whisper
     #   numba
     #   onnxruntime
@@ -269,49 +284,80 @@ numpy==2.5.4 ; python_full_version >= '3.12'
     #   pytorch-metric-learning
     #   scikit-learn
     #   scipy
-    #   soundfile
-    #   speechbrain
-    #   tensorboardx
     #   torchmetrics
-nvidia-cublas-cu12==12.8.4.1 ; platform_machine == 'x86_64' and sys_platform == 'linux'
+    #   transformers
+nvidia-cublas==13.1.1.3 ; python_full_version < '3.11' and sys_platform == 'linux'
     # via
-    #   nvidia-cudnn-cu12
-    #   nvidia-cusolver-cu12
-    #   torch
-nvidia-cuda-cupti-cu12==12.8.90 ; platform_machine == 'x86_64' and sys_platform == 'linux'
-    # via torch
-nvidia-cuda-nvrtc-cu12==12.8.93 ; platform_machine == 'x86_64' and sys_platform == 'linux'
-    # via torch
-nvidia-cuda-runtime-cu12==12.8.90 ; platform_machine == 'x86_64' and sys_platform == 'linux'
-    # via torch
-nvidia-cudnn-cu12==9.10.2.21 ; platform_machine == 'x86_64' and sys_platform == 'linux'
-    # via torch
-nvidia-cufft-cu12==11.3.3.83 ; platform_machine == 'x86_64' and sys_platform == 'linux'
-    # via torch
-nvidia-cufile-cu12==1.13.1.3 ; platform_machine == 'x86_64' and sys_platform == 'linux'
-    # via torch
-nvidia-curand-cu12==10.3.9.90 ; platform_machine == 'x86_64' and sys_platform == 'linux'
-    # via torch
-nvidia-cusolver-cu12==11.7.3.90 ; platform_machine == 'x86_64' and sys_platform == 'linux'
-    # via torch
-nvidia-cusparse-cu12==12.5.8.93 ; platform_machine == 'x86_64' and sys_platform == 'linux'
+    #   cuda-toolkit
+    #   nvidia-cudnn-cu13
+    #   nvidia-cusolver
+nvidia-cublas==13.4.1.3 ; python_full_version >= '3.11' and sys_platform == 'linux'
     # via
-    #   nvidia-cusolver-cu12
-    #   torch
-nvidia-cusparselt-cu12==0.7.1 ; platform_machine == 'x86_64' and sys_platform == 'linux'
-    # via torch
-nvidia-nccl-cu12==2.27.3 ; platform_machine == 'x86_64' and sys_platform == 'linux'
-    # via torch
-nvidia-nvjitlink-cu12==12.8.93 ; platform_machine == 'x86_64' and sys_platform == 'linux'
+    #   cuda-toolkit
+    #   nvidia-cudnn-cu13
+    #   nvidia-cusolver
+nvidia-cuda-cccl==13.3.5.0.6 ; python_full_version >= '3.11' and sys_platform == 'linux'
+    # via nvidia-nvshmem-cu13
+nvidia-cuda-cupti==13.0.85 ; (python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux') or (python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux')
+    # via cuda-toolkit
+nvidia-cuda-cupti==13.2.86 ; (python_full_version >= '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux')
+    # via cuda-toolkit
+nvidia-cuda-nvrtc==13.0.88 ; python_full_version < '3.11' and sys_platform == 'linux'
     # via
-    #   nvidia-cufft-cu12
-    #   nvidia-cusolver-cu12
-    #   nvidia-cusparse-cu12
-    #   torch
-nvidia-nvtx-cu12==12.8.90 ; platform_machine == 'x86_64' and sys_platform == 'linux'
+    #   cuda-toolkit
+    #   nvidia-cublas
+nvidia-cuda-nvrtc==13.2.86 ; python_full_version >= '3.11' and sys_platform == 'linux'
+    # via
+    #   cuda-toolkit
+    #   nvidia-cublas
+nvidia-cuda-runtime==13.0.96 ; (python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux') or (python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux')
+    # via cuda-toolkit
+nvidia-cuda-runtime==13.2.86 ; (python_full_version >= '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux')
+    # via cuda-toolkit
+nvidia-cudnn-cu13==9.24.0.43 ; python_full_version < '3.11' and sys_platform == 'linux'
     # via torch
-omegaconf==2.4.0
-    # via pyannote-audio
+nvidia-cudnn-cu13==9.26.0.51 ; python_full_version >= '3.11' and sys_platform == 'linux'
+    # via torch
+nvidia-cufft==12.0.0.61 ; (python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux') or (python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux')
+    # via cuda-toolkit
+nvidia-cufft==12.2.0.57 ; (python_full_version >= '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux')
+    # via cuda-toolkit
+nvidia-cufile==1.15.1.6 ; (python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux') or (python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux')
+    # via cuda-toolkit
+nvidia-cufile==1.17.1.22 ; (python_full_version >= '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux')
+    # via cuda-toolkit
+nvidia-curand==10.4.0.35 ; (python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux') or (python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux')
+    # via cuda-toolkit
+nvidia-cusolver==12.0.4.66 ; (python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux') or (python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux')
+    # via cuda-toolkit
+nvidia-cusolver==12.2.0.11 ; (python_full_version >= '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux')
+    # via cuda-toolkit
+nvidia-cusparse==12.6.3.3 ; (python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux') or (python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux')
+    # via
+    #   cuda-toolkit
+    #   nvidia-cusolver
+nvidia-cusparse==12.7.10.12 ; (python_full_version >= '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux')
+    # via
+    #   cuda-toolkit
+    #   nvidia-cusolver
+nvidia-cusparselt-cu13==0.8.1 ; sys_platform == 'linux'
+    # via torch
+nvidia-nccl-cu13==2.30.7 ; sys_platform == 'linux'
+    # via torch
+nvidia-nvjitlink==13.5.37 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')
+    # via
+    #   cuda-toolkit
+    #   nvidia-cufft
+    #   nvidia-cusolver
+    #   nvidia-cusparse
+nvidia-nvshmem-cu13==3.4.5 ; python_full_version < '3.11' and sys_platform == 'linux'
+    # via torch
+nvidia-nvshmem-cu13==3.7.2 ; python_full_version >= '3.11' and sys_platform == 'linux'
+    # via torch
+nvidia-nvtx==13.0.85 ; (python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux') or (python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux')
+    # via cuda-toolkit
+nvidia-nvtx==13.2.86 ; (python_full_version >= '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux')
+    # via cuda-toolkit
 onnxruntime==1.23.2 ; python_full_version < '3.11'
     # via faster-whisper
 onnxruntime==1.31.0 ; python_full_version >= '3.11'
@@ -319,7 +365,43 @@ onnxruntime==1.31.0 ; python_full_version >= '3.11'
 openai-whisper==20250625
     # via listn
 opentelemetry-api==1.45.1
-    # via fastapi
+    # via
+    #   fastapi
+    #   opentelemetry-exporter-http-transport
+    #   opentelemetry-exporter-otlp-proto-grpc
+    #   opentelemetry-exporter-otlp-proto-http
+    #   opentelemetry-sdk
+    #   opentelemetry-semantic-conventions
+    #   pyannote-audio
+opentelemetry-exporter-http-transport==0.66b1
+    # via opentelemetry-exporter-otlp-proto-http
+opentelemetry-exporter-otlp==1.45.1
+    # via pyannote-audio
+opentelemetry-exporter-otlp-common==0.66b1
+    # via
+    #   opentelemetry-exporter-otlp-proto-grpc
+    #   opentelemetry-exporter-otlp-proto-http
+opentelemetry-exporter-otlp-proto-common==1.45.1
+    # via
+    #   opentelemetry-exporter-otlp-proto-grpc
+    #   opentelemetry-exporter-otlp-proto-http
+opentelemetry-exporter-otlp-proto-grpc==1.45.1
+    # via opentelemetry-exporter-otlp
+opentelemetry-exporter-otlp-proto-http==1.45.1
+    # via opentelemetry-exporter-otlp
+opentelemetry-proto==1.45.1
+    # via
+    #   opentelemetry-exporter-otlp-proto-common
+    #   opentelemetry-exporter-otlp-proto-grpc
+    #   opentelemetry-exporter-otlp-proto-http
+opentelemetry-sdk==1.45.1
+    # via
+    #   opentelemetry-exporter-otlp-common
+    #   opentelemetry-exporter-otlp-proto-grpc
+    #   opentelemetry-exporter-otlp-proto-http
+    #   pyannote-audio
+opentelemetry-semantic-conventions==0.66b1
+    # via opentelemetry-sdk
 optuna==5.0.0
     # via pyannote-pipeline
 packaging==26.3
@@ -331,16 +413,17 @@ packaging==26.3
     #   onnxruntime
     #   optuna
     #   pytorch-lightning
-    #   speechbrain
-    #   tensorboardx
     #   torch-pitch-shift
     #   torchmetrics
+    #   transformers
 pandas==2.3.3 ; python_full_version < '3.11'
     # via
+    #   pyannote-core
     #   pyannote-database
     #   pyannote-metrics
 pandas==3.0.6 ; python_full_version >= '3.11'
     # via
+    #   pyannote-core
     #   pyannote-database
     #   pyannote-metrics
 pillow==12.3.0 ; python_full_version < '3.11'
@@ -355,24 +438,38 @@ propcache==0.5.4
     #   yarl
 protobuf==7.36.2
     # via
+    #   googleapis-common-protos
+    #   mlx-lm
     #   onnxruntime
-    #   tensorboardx
-pyannote-audio==3.4.0
+    #   opentelemetry-proto
+pyannote-audio==4.0.7
     # via listn
-pyannote-core==5.0.0
+pyannote-core==6.0.1 ; python_full_version < '3.11'
     # via
     #   pyannote-audio
     #   pyannote-database
     #   pyannote-metrics
     #   pyannote-pipeline
-pyannote-database==5.1.3
+pyannote-core==6.1.0 ; python_full_version >= '3.11'
+    # via
+    #   pyannote-audio
+    #   pyannote-database
+    #   pyannote-metrics
+    #   pyannote-pipeline
+pyannote-database==6.1.1
     # via
     #   pyannote-audio
     #   pyannote-metrics
     #   pyannote-pipeline
-pyannote-metrics==3.2.1
+pyannote-metrics==4.1 ; python_full_version < '3.11'
     # via pyannote-audio
-pyannote-pipeline==3.0.1
+pyannote-metrics==4.2.0 ; python_full_version >= '3.11'
+    # via pyannote-audio
+pyannote-pipeline==4.0.0 ; python_full_version < '3.11'
+    # via pyannote-audio
+pyannote-pipeline==4.1.0 ; python_full_version >= '3.11'
+    # via pyannote-audio
+pyannoteai-sdk==0.4.0
     # via pyannote-audio
 pycparser==3.11 ; implementation_name != 'PyPy'
     # via cffi
@@ -402,67 +499,61 @@ pyyaml==6.0.3
     # via
     #   ctranslate2
     #   huggingface-hub
-    #   hyperpyyaml
     #   lightning
-    #   omegaconf
+    #   mlx-lm
     #   optuna
     #   pyannote-database
     #   pyannote-pipeline
     #   pytorch-lightning
+    #   transformers
 regex==2026.9.29
-    # via tiktoken
+    # via
+    #   tiktoken
+    #   transformers
 requests==2.34.2
     # via
-    #   speechbrain
+    #   opentelemetry-exporter-http-transport
+    #   opentelemetry-exporter-otlp-proto-http
+    #   pyannoteai-sdk
     #   tiktoken
 rich==15.0.0
     # via
     #   pyannote-audio
     #   typer
-ruamel-yaml==0.18.17
-    # via hyperpyyaml
-ruamel-yaml-clib==0.2.15 ; platform_python_implementation == 'CPython'
-    # via ruamel-yaml
+safetensors==0.8.0
+    # via
+    #   pyannote-audio
+    #   transformers
 scikit-learn==1.7.2 ; python_full_version < '3.11'
     # via
     #   pyannote-metrics
-    #   pyannote-pipeline
     #   pytorch-metric-learning
 scikit-learn==1.9.1 ; python_full_version >= '3.11'
     # via
     #   pyannote-metrics
-    #   pyannote-pipeline
     #   pytorch-metric-learning
 scipy==1.15.3 ; python_full_version < '3.11'
     # via
     #   mlx-whisper
-    #   pyannote-core
     #   pyannote-metrics
     #   scikit-learn
-    #   speechbrain
 scipy==1.17.1 ; python_full_version == '3.11.*'
     # via
     #   mlx-whisper
-    #   pyannote-core
     #   pyannote-metrics
+    #   pyannote-pipeline
     #   scikit-learn
-    #   speechbrain
 scipy==1.18.1 ; python_full_version >= '3.12'
     # via
     #   mlx-whisper
-    #   pyannote-core
     #   pyannote-metrics
+    #   pyannote-pipeline
     #   scikit-learn
-    #   speechbrain
-semver==3.1.0
-    # via pyannote-audio
-sentencepiece==0.2.2
-    # via speechbrain
-setuptools==84.2.0 ; python_full_version >= '3.12' or (platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'linux2'
-    # via
-    #   torch
-    #   triton
-shellingham==1.5.4
+sentencepiece==0.2.2 ; platform_machine == 'arm64' and sys_platform == 'darwin'
+    # via mlx-lm
+setuptools==84.2.0
+    # via torch
+shellingham==1.5.4 ; platform_machine == 'arm64' and sys_platform == 'darwin'
     # via typer
 six==1.17.0
     # via python-dateutil
@@ -470,12 +561,6 @@ sortedcontainers==2.4.0
     # via pyannote-core
 sounddevice==0.5.6
     # via listn
-soundfile==0.14.0
-    # via
-    #   pyannote-audio
-    #   speechbrain
-speechbrain==1.1.2
-    # via pyannote-audio
 sqlalchemy==2.0.55 ; python_full_version < '3.11'
     # via
     #   alembic
@@ -491,12 +576,7 @@ starlette==1.9.0 ; python_full_version >= '3.11'
 sympy==1.14.0
     # via
     #   onnxruntime
-    #   pyannote-metrics
     #   torch
-tabulate==0.10.0
-    # via pyannote-metrics
-tensorboardx==2.6.5
-    # via pyannote-audio
 threadpoolctl==3.7.0
     # via scikit-learn
 tiktoken==0.14.0
@@ -504,12 +584,14 @@ tiktoken==0.14.0
     #   mlx-whisper
     #   openai-whisper
 tokenizers==0.23.3
-    # via faster-whisper
+    # via
+    #   faster-whisper
+    #   transformers
 tomli==2.5.0 ; python_full_version < '3.11'
     # via
     #   alembic
     #   huggingface-hub
-torch==2.8.0
+torch==2.14.1 ; python_full_version < '3.11'
     # via
     #   asteroid-filterbanks
     #   julius
@@ -520,7 +602,21 @@ torch==2.8.0
     #   pyannote-audio
     #   pytorch-lightning
     #   pytorch-metric-learning
-    #   speechbrain
+    #   torch-audiomentations
+    #   torch-pitch-shift
+    #   torchaudio
+    #   torchmetrics
+torch==2.15.0 ; python_full_version >= '3.11'
+    # via
+    #   asteroid-filterbanks
+    #   julius
+    #   lightning
+    #   listn
+    #   mlx-whisper
+    #   openai-whisper
+    #   pyannote-audio
+    #   pytorch-lightning
+    #   pytorch-metric-learning
     #   torch-audiomentations
     #   torch-pitch-shift
     #   torchaudio
@@ -529,13 +625,16 @@ torch-audiomentations==0.12.0
     # via pyannote-audio
 torch-pitch-shift==1.2.5
     # via torch-audiomentations
-torchaudio==2.8.0
+torchaudio==2.11.1
     # via
     #   listn
     #   pyannote-audio
-    #   speechbrain
     #   torch-audiomentations
     #   torch-pitch-shift
+torchcodec==0.17.0
+    # via
+    #   listn
+    #   pyannote-audio
 torchmetrics==1.9.0
     # via
     #   lightning
@@ -552,8 +651,14 @@ tqdm==4.70.1
     #   pyannote-pipeline
     #   pytorch-lightning
     #   pytorch-metric-learning
-    #   speechbrain
-triton==3.4.0 ; (platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'linux2'
+    #   transformers
+transformers==5.20.2 ; platform_machine == 'arm64' and sys_platform == 'darwin'
+    # via mlx-lm
+triton==3.8.0 ; (python_full_version < '3.11' and sys_platform == 'linux') or (python_full_version < '3.11' and sys_platform == 'linux2')
+    # via
+    #   openai-whisper
+    #   torch
+triton==3.9.0 ; (python_full_version >= '3.11' and sys_platform == 'linux') or (python_full_version >= '3.11' and sys_platform == 'linux2')
     # via
     #   openai-whisper
     #   torch
@@ -561,8 +666,8 @@ truststore==0.10.5 ; sys_platform != 'emscripten'
     # via
     #   httpcore2
     #   httpx2
-typer==0.27.3
-    # via pyannote-database
+typer==0.27.3 ; platform_machine == 'arm64' and sys_platform == 'darwin'
+    # via transformers
 typing-extensions==4.16.0
     # via
     #   aiohttp
@@ -572,17 +677,20 @@ typing-extensions==4.16.0
     #   asteroid-filterbanks
     #   exceptiongroup
     #   fastapi
+    #   grpcio
     #   httpx2
     #   huggingface-hub
     #   lightning
     #   lightning-utilities
     #   multidict
     #   opentelemetry-api
-    #   pyannote-core
+    #   opentelemetry-exporter-otlp-proto-grpc
+    #   opentelemetry-exporter-otlp-proto-http
+    #   opentelemetry-sdk
+    #   opentelemetry-semantic-conventions
     #   pydantic
     #   pydantic-core
     #   pytorch-lightning
-    #   soundfile
     #   sqlalchemy
     #   starlette
     #   torch
