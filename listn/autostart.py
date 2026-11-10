@@ -11,7 +11,9 @@ wrote by hand that merely occupies the path is left alone, and reads back as
 Everything here is local and inert: no network, no subprocess, nothing but
 files under ``$HOME``. The Exec line is the running console script plus
 ``tray``, quoted with the desktop-entry rules (no shell ever parses it) and
-carrying no token, transcript or other private data.
+carrying no token, transcript or other private data; the ``python -m listn``
+form re-launches with the cwd kept off ``sys.path`` (``-P`` / the 3.10 shim),
+so a stray ``~/listn/`` cannot shadow the packaged code at login.
 
 macOS is out of scope on purpose: the native menu bar app owns this toggle
 there (AGENTS.md — preserve macOS behaviour), so every entry point here is a
@@ -29,6 +31,25 @@ from pathlib import Path
 MARKER = "# written by listn"
 
 ENTRY_NAME = "listn.desktop"
+
+#: ``python -P`` (Python >= 3.11): never prepend the launching directory to
+#: ``sys.path``. ``python -m`` otherwise puts cwd *first*, ahead of
+#: ``PYTHONPATH``, so a planted ``listn/`` in it would run instead of the
+#: installed package (F2 — the CWD import hijack).
+SAFE_PATH_FLAG = "-P"
+
+#: The floor is Python 3.10 (``pyproject.toml`` ``requires-python``), and 3.10
+#: has neither ``-P`` nor ``PYTHONSAFEPATH`` — both arrived in 3.11, so 3.10
+#: runs this ``python -c`` shim instead: drop every ``sys.path`` entry that
+#: resolves to the cwd, then run ``listn`` exactly as ``-m`` would. It holds
+#: no ``"``, ``\``, ``$``, backtick or ``%``, so both desktop-entry escaping
+#: layers pass it through as one argument. Keep it byte-identical to the
+#: fallback line in ``packaging/arch/listn-launcher.sh`` (a test compares).
+SAFE_RUN_SHIM = (
+    "import os,runpy,sys;"
+    "sys.path[:]=[p for p in sys.path if os.path.realpath(p or os.curdir)!=os.getcwd()];"
+    "runpy.run_module('listn',run_name='__main__',alter_sys=True)"
+)
 
 
 class AutostartError(RuntimeError):
@@ -96,12 +117,26 @@ def _python() -> str | None:
     return exe if exe and Path(exe).is_file() else None
 
 
+def safe_module_argv(python: str) -> list[str]:
+    """``python`` plus how to run ``listn`` with the cwd kept off ``sys.path``.
+
+    The interpreter that renders this is the same one that will run the entry
+    at login, so testing ``sys.version_info`` here is the right gate: ``-P``
+    where it exists, the ``runpy`` shim on the 3.10 floor.
+    """
+    if sys.version_info >= (3, 11):
+        return [python, SAFE_PATH_FLAG, "-m", "listn"]
+    return [python, "-c", SAFE_RUN_SHIM]
+
+
 def launcher_argv() -> list[str]:
     """How to start the tray again: the console script running right now.
 
     Covers the packaged launcher (``/usr/bin/listn``), a source checkout
-    (``uv run listn`` → ``.venv/bin/listn``) and ``python -m listn``; falls
-    back to the bare ``listn`` command when nothing better is known.
+    (``uv run listn`` → ``.venv/bin/listn``) and ``python -m listn`` — the
+    ``-m`` form is re-rendered through :func:`safe_module_argv`, never with
+    the login cwd ahead of the real package on ``sys.path``; falls back to
+    the bare ``listn`` command when nothing better is known.
     """
     argv0 = (sys.argv[0] if sys.argv else "") or ""
     file: Path | None = None
@@ -117,13 +152,13 @@ def launcher_argv() -> list[str]:
         # `python -m listn …` puts the package's __main__.py in argv[0].
         py = _python()
         if py:
-            return [py, "-m", "listn"]
+            return safe_module_argv(py)
     if file is not None and file.name.startswith("listn"):
         return [str(file)]
     if len(sys.argv) > 2 and sys.argv[1] == "-m" and sys.argv[2].split(".")[0] == "listn":
         py = _python()
         if py:
-            return [py, "-m", "listn"]
+            return safe_module_argv(py)
     found = shutil.which("listn")
     if found:
         return [found]
