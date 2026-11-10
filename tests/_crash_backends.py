@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import os
 import signal
+import time
 
-from listn.transcriber import RawSegment, Transcriber
+from listn.transcriber import (CPU_FALLBACK_MESSAGE, CudaUnavailable,
+                               RawSegment, Transcriber)
 
 
 def _log_load() -> None:
@@ -131,3 +133,133 @@ def cuda_error_unless_cpu_factory(model, download=None, **knobs):
         yield RawSegment(0.0, 1.0, "recovered on cpu")
 
     return _make_backend(device, lines)(model)
+
+# ---------------------------------------------------------------------------
+# S1: workers that never answer. The parent's request bound must fire, the
+# caller must get a clean error, and the worker must be gone afterwards.
+# ---------------------------------------------------------------------------
+
+def hang_load_factory(model, download=None, **knobs):
+    """Never answers the load request (never returns from the factory)."""
+    _log_load()
+    time.sleep(600)  # pragma: no cover — only reached if the bound never fires
+
+
+def hang_transcribe_factory(model, download=None, **knobs):
+    """Loads fine, then never answers the transcription request."""
+    _log_load()
+    device = _device_of(knobs)
+
+    class Hang(Transcriber):
+        backend = "faster-whisper"
+
+        def __init__(self, name):
+            super().__init__(name)
+            self.device = device
+            self.device_message = f"device: {device}"
+
+        def segments(self, audio, language=None, prompt=None, vad=True, hotwords=None):
+            time.sleep(600)  # pragma: no cover — bound must fire first
+            yield RawSegment(0.0, 1.0, "bound never fired", 0.0)  # pragma: no cover
+
+    return Hang(model)
+
+
+# ---------------------------------------------------------------------------
+# S2/S3: hostile or broken child answers. The parent must adopt only what
+# confirms its own device decision.
+# ---------------------------------------------------------------------------
+
+def gpu_claim_factory(model, download=None, **knobs):
+    """Claims the GPU in its device, its device line AND a status event."""
+    _log_load()
+
+    class Claimer(Transcriber):
+        backend = "faster-whisper"
+
+        def __init__(self, name):
+            super().__init__(name)
+            self.device = "cuda"
+            self.device_message = ("device: cuda — using GPU acceleration "
+                                   "(CTranslate2 cuda)")
+            if download:
+                download("device: cuda — using GPU acceleration "
+                         "(CTranslate2 cuda)")
+
+        def segments(self, audio, language=None, prompt=None, vad=True, hotwords=None):
+            yield RawSegment(0.0, 1.0, "ran where it was told", 0.0)
+
+    return Claimer(model)
+
+
+def reclaim_after_pin_factory(model, download=None, **knobs):
+    """SIGSEGVs on the GPU attempt; the CPU retry claims cuda anyway (the
+    post-pin re-claim: the parent's pin must survive it)."""
+    _log_load()
+    device = _device_of(knobs)
+    if device != "cpu":
+        os.kill(os.getpid(), signal.SIGSEGV)
+
+    class Reclaimer(Transcriber):
+        backend = "faster-whisper"
+
+        def __init__(self, name):
+            super().__init__(name)
+            self.device = "cuda"
+            self.device_message = ("device: cuda — using GPU acceleration "
+                                   "(CTranslate2 cuda)")
+
+        def segments(self, audio, language=None, prompt=None, vad=True, hotwords=None):
+            yield RawSegment(0.0, 1.0, "cpu work", 0.0)
+
+    return Reclaimer(model)
+
+
+def injected_note_factory(model, download=None, **knobs):
+    """A consistent cpu claim carrying a lying canonical fallback note and a
+    GPU device line — neither may be adopted for a request that never fell
+    back."""
+    _log_load()
+
+    class Injector(Transcriber):
+        backend = "faster-whisper"
+
+        def __init__(self, name):
+            super().__init__(name)
+            self.device = "cpu"
+            self.device_message = "device: cuda — running on GPU"
+            self.status_note = CPU_FALLBACK_MESSAGE
+
+        def segments(self, audio, language=None, prompt=None, vad=True, hotwords=None):
+            yield RawSegment(0.0, 1.0, "on cpu", 0.0)
+
+    return Injector(model)
+
+
+def narrowed_cpu_note_factory(model, download=None, **knobs):
+    """The honest control: the probe narrowed `auto` to CPU and says so with
+    the canonical note — validation must KEEP this one."""
+    _log_load()
+
+    class Narrowed(Transcriber):
+        backend = "faster-whisper"
+
+        def __init__(self, name):
+            super().__init__(name)
+            self.device = "cpu"
+            self.device_message = "device: cpu"
+            self.status_note = CPU_FALLBACK_MESSAGE
+
+        def segments(self, audio, language=None, prompt=None, vad=True, hotwords=None):
+            yield RawSegment(0.0, 1.0, "narrowed to cpu", 0.0)
+
+    return Narrowed(model)
+
+
+def kind_device_oom_factory(model, download=None, **knobs):
+    """Raises CudaUnavailable carrying an OOM — kind='device' must not turn
+    a runtime fault into the canonical CPU fallback."""
+    _log_load()
+    raise CudaUnavailable("CUDA out of memory. Tried to allocate 2.00 GiB "
+                          "(GPU 0)")
+

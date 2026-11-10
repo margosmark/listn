@@ -38,11 +38,13 @@ import json
 import logging
 import os
 import platform
+import queue
 import re
 import signal
 import subprocess
 import sys
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -125,6 +127,18 @@ def _is_cuda_unavailable(exc: BaseException) -> bool:
     if any(marker in message for marker in _RUNTIME_FAILURE_MARKERS):
         return False
     return any(marker in message for marker in _AVAILABILITY_MARKERS)
+
+
+def _is_runtime_failure_text(text: str) -> bool:
+    """True when ``text`` carries a runtime-fault marker (OOM, NCCL, …).
+
+    The same belt-and-braces rule the availability classifier applies: a
+    message that names a runtime fault is a fault whatever ``kind`` the
+    isolation child wrapped it in (S3 — a hostile child must not be able
+    to relabel an OOM as "CUDA libraries unavailable").
+    """
+    message = str(text).lower()
+    return any(marker in message for marker in _RUNTIME_FAILURE_MARKERS)
 
 
 def _cuda_device_count() -> int:
@@ -670,6 +684,38 @@ class _BackendError(RuntimeError):
     """
 
 
+# --- request bounds (S1) ----------------------------------------------------
+# Every worker request is bounded: the parent never waits on the child
+# forever. The bound is silence-based — any frame from the child (a status
+# line, a progress tick, the final answer) resets the deadline — so a slow
+# but answering child is never killed, while a child that stops answering
+# entirely (a hung CUDA kernel, a wedged factory) is terminated and reaped
+# within the bound and the request fails with a clean error instead of
+# blocking the caller, the engine's single job-worker thread, or close().
+#
+# load gets a much longer bound than inference because a first-run model
+# download is silent for as long as it takes; engine file jobs stream
+# progress frames, and live chunks are short, so inference never needs it.
+_LOAD_IDLE_TIMEOUT = 1800.0     # seconds a load/download may stay silent
+_REQUEST_IDLE_TIMEOUT = 120.0   # seconds an inference may stay silent
+# close() waits at most this long for an in-flight request's lock before it
+# stops the worker anyway (atexit and eviction must not wedge on a hang).
+_CLOSE_LOCK_TIMEOUT = 10.0
+
+# A child status/device line that claims GPU use. Checked against the
+# parent's own device decision (S2): a worker that was told `cpu` — or
+# pinned to it after a crash — can never announce GPU acceleration. The
+# canonical CPU-fallback note ("CUDA libraries unavailable — transcribing
+# on CPU") deliberately does NOT match: it claims CPU, not a GPU.
+_GPU_CLAIM = re.compile(
+    r"device:\s*(?:cuda|rocm)|using gpu|gpu acceleration|running on gpu|"
+    r"(?:on|using|with) (?:the )?(?:cuda|rocm) gpu",
+    re.IGNORECASE)
+
+# The ``device: <name>`` token a device message opens with, if any.
+_DEVICE_TOKEN = re.compile(r"device:\s*([A-Za-z0-9_-]+)")
+
+
 def _drain_stderr(stream, lines: deque) -> None:
     """Keep the worker's stderr flowing (so it can never block) and tail it."""
     try:
@@ -684,8 +730,19 @@ def _drain_stderr(stream, lines: deque) -> None:
             pass
 
 
+# Queue sentinel: the worker's response pipe closed (child gone). Pumped
+# once when the reader thread sees EOF, and the eof flag covers waiters
+# that arrive after it was consumed.
+_EOF = object()
+
+
 class _WorkerSession:
-    """One worker child process and the two pipes that talk to it."""
+    """One worker child process and the two pipes that talk to it.
+
+    The response pipe is drained by a dedicated reader thread into a queue,
+    so no caller ever blocks on pipe I/O itself (S1): ``request`` only ever
+    waits on the queue, with a deadline.
+    """
 
     def __init__(self, proc, to_child: Connection, from_child: Connection,
                  stderr_lines: deque):
@@ -693,6 +750,29 @@ class _WorkerSession:
         self._to = to_child
         self._from = from_child
         self._stderr = stderr_lines
+        # Bounded: a child that spams frames while nobody is asking gets
+        # pipe backpressure instead of growing this queue without limit
+        # (the queue is only drained by an active request).
+        self._inbox: queue.Queue = queue.Queue(maxsize=1024)
+        self._eof = threading.Event()
+        threading.Thread(target=self._pump, args=(self._from,),
+                         name="worker-response-reader", daemon=True).start()
+
+    def _pump(self, stream: Connection) -> None:
+        """Move every frame off the response pipe so nobody blocks on I/O.
+
+        Ends only when the pipe does — the child died, was killed, or the
+        parent closed the session — and then marks the session eof so later
+        waiters fail fast instead of serving a stale queue.
+        """
+        try:
+            while True:
+                self._inbox.put(stream.recv_bytes())
+        except Exception:  # noqa: BLE001 - EOF, closed pipe, torn-down fd
+            pass
+        finally:
+            self._eof.set()
+            self._inbox.put(_EOF)
 
     @classmethod
     def spawn(cls) -> "_WorkerSession":
@@ -750,13 +830,25 @@ class _WorkerSession:
         return "exited without answering"
 
     def request(self, header: dict, payload=None, *, on_status=None,
-                on_progress=None) -> dict:
+                on_progress=None, timeout: float | None = None) -> dict:
         """Send one request and read events until its final answer.
 
         A worker that died mid-request surfaces as :class:`_ChildDied` —
         never as a partial result, because the final answer is the only
         thing this method returns.
+
+        Every request is bounded (S1). ``timeout`` caps how long the child
+        may stay silent: each frame from it resets the clock, so a slow but
+        answering worker is never killed, while one that stops answering
+        entirely is terminated and reaped within the bound of its last
+        frame and the request fails with a clean :class:`_ChildDied` —
+        never an indefinite block of the caller, the engine's job-worker
+        thread, or ``close()``. When not given, the bound follows the op
+        (``load`` includes first-run downloads, so it is the longer one).
         """
+        if timeout is None:
+            timeout = (_LOAD_IDLE_TIMEOUT if header.get("op") == "load"
+                       else _REQUEST_IDLE_TIMEOUT)
         try:
             self._to.send_bytes(json.dumps(header).encode("utf-8"))
             if payload is not None:
@@ -765,11 +857,20 @@ class _WorkerSession:
                 self._to.send_bytes(view)
         except (OSError, ValueError) as exc:
             raise _ChildDied(self.death_detail()) from exc
+        deadline = time.monotonic() + timeout
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise self._timeout_death(timeout)
             try:
-                raw = self._from.recv_bytes()
-            except (EOFError, OSError) as exc:
-                raise _ChildDied(self.death_detail()) from exc
+                raw = self._inbox.get(timeout=remaining)
+            except queue.Empty:
+                if self._eof.is_set():
+                    raise _ChildDied(self.death_detail())
+                raise self._timeout_death(timeout)
+            if raw is _EOF:
+                raise _ChildDied(self.death_detail())
+            deadline = time.monotonic() + timeout  # any frame resets the clock
             try:
                 message = json.loads(raw)
             except ValueError:
@@ -781,6 +882,16 @@ class _WorkerSession:
                 on_status(message.get("message"))
             elif event == "progress" and on_progress:
                 on_progress(float(message.get("value") or 0.0))
+
+    def _timeout_death(self, timeout: float) -> _ChildDied:
+        """S1: the child went silent for the whole bound — stop it now.
+
+        Closes the pipes and terminate+kill+reaps the process (no orphan
+        worker survives a timeout), then reports the bound as the reason
+        the request failed.
+        """
+        self.close()
+        return _ChildDied(f"stopped responding (no answer for {timeout:g}s)")
 
     def close(self) -> None:
         for conn in (self._to, self._from):
@@ -856,9 +967,20 @@ class IsolatedTranscriber(Transcriber):
     # -- lifecycle --------------------------------------------------------
 
     def close(self) -> None:
-        """Stop the worker process (its model and all) and release it."""
-        with self._lock:
+        """Stop the worker process (its model and all) and release it.
+
+        The lock wait is bounded (S1): a request wedged in another thread
+        — or an atexit/eviction close during one — must not block forever.
+        After the bound the worker is stopped anyway; the wedged request
+        then fails cleanly through its own dead-pipe path instead of
+        holding the process (or the whole cache) open.
+        """
+        acquired = self._lock.acquire(timeout=_CLOSE_LOCK_TIMEOUT)
+        try:
             self._kill_worker()
+        finally:
+            if acquired:
+                self._lock.release()
 
     def __del__(self):
         try:
@@ -877,6 +999,81 @@ class IsolatedTranscriber(Transcriber):
         if self._notes:
             self.device_message += " — " + "; ".join(self._notes)
 
+    # -- what the child may claim (S2) ------------------------------------
+    def _adopt_device_claim(self, claimed: str) -> str:
+        """A worker answer may only confirm the parent's device decision.
+
+        ``cpu`` (asked for, or pinned after a crash) must come back as
+        ``cpu``; an explicit ``cuda``/``rocm`` ask must come back as that
+        same GPU; ``auto`` accepts whatever the build resolved. Anything
+        else is a contradiction: the claim is dropped, the parent's
+        decision stands, and the mismatch is logged — a hostile or broken
+        child can never talk the parent onto a device it did not choose.
+        """
+        want = self._effective_device
+        if want == "cpu":
+            accepted = claimed == "cpu"
+        elif want == "auto":
+            accepted = claimed in ("auto", "cpu", "cuda", "rocm")
+        else:
+            # CTranslate2's device API names every GPU "cuda", so a ROCm
+            # build may legitimately answer "cuda" for a "rocm" ask.
+            accepted = claimed == want or (want == "rocm" and claimed == "cuda")
+        if accepted:
+            return claimed
+        log.warning("the transcription process reported device %r for "
+                    "compute_device=%r; keeping %r", claimed, want, want)
+        return want
+
+    def _note_is_adoptable(self, note: str) -> bool:
+        """A status note may only describe a fallback that really happened.
+
+        The child may announce the canonical CPU-fallback note only for an
+        ``auto`` build that resolved to CPU. A ``cpu`` ask never fell back,
+        an explicit GPU ask never falls back, and a note this parent wrote
+        itself (the crash pin) is never overwritten by a later answer.
+        """
+        if self._notes or self._effective_device != "auto":
+            return False
+        if self._device not in (None, "cpu"):
+            return False
+        return not _GPU_CLAIM.search(note)  # a note may not claim a GPU
+
+    def _message_is_adoptable(self, message: str) -> bool:
+        """The worker's ``device: …`` line may not contradict our decision."""
+        target = self._device or self._effective_device
+        token = _DEVICE_TOKEN.match(message.strip())
+        if token and token.group(1) != target:
+            log.warning("dropped a worker device message claiming %r "
+                        "(compute device is %r): %r",
+                        token.group(1), target, message)
+            return False
+        if target == "cpu" and _GPU_CLAIM.search(message):
+            log.warning("dropped a worker device message claiming GPU use "
+                        "while compute device is 'cpu': %r", message)
+            return False
+        return True
+
+    def _child_status(self, message) -> None:
+        """Forward a worker status line unless it contradicts our decision.
+
+        A worker asked to run on CPU — or pinned to it after a crash — can
+        never announce GPU acceleration to the user (S2): such a line is
+        dropped. Everything else passes through unchanged: download
+        notices, truthful ``device: …`` lines, the canonical CPU-fallback
+        note.
+        """
+        if message is None:
+            return
+        text = str(message)
+        target = self._device or self._effective_device
+        if target == "cpu" and _GPU_CLAIM.search(text):
+            log.warning("dropped a worker status line claiming GPU use while "
+                        "compute device is 'cpu': %r", text)
+            return
+        if self._notify:
+            self._notify(text)
+
     def _worker(self) -> _WorkerSession:
         """The worker process, spawned and with its model loaded."""
         if self._session is None:
@@ -889,7 +1086,8 @@ class IsolatedTranscriber(Transcriber):
                                     compute_device=self._effective_device),
                       "factory": _FACTORY_PATH}
             try:
-                response = self._session.request(header, on_status=self._notify)
+                response = self._session.request(header,
+                                                 on_status=self._child_status)
             except _ChildDied as death:
                 raise _ChildDied(death.detail,
                                  phase="loading the model") from None
@@ -900,21 +1098,27 @@ class IsolatedTranscriber(Transcriber):
                         detail, device=response.get("kind") == "device")
                 raise _BackendError(detail)
             self._loaded = True
+            # S2: the child's answer may only CONFIRM the parent's device
+            # decision — it can never widen it.
             reported = response.get("device")
             if reported:
-                self.device = str(reported)
-                self._device = str(reported)
+                adopted = self._adopt_device_claim(str(reported))
+                self.device = adopted
+                self._device = adopted
             note = response.get("status_note")
-            if note:
+            if note and self._note_is_adoptable(str(note)):
                 # The child's own pre-build narrowing (the probe pinning CPU
-                # with the canonical message). Set once; a later reload that
-                # reports no note of its own never overwrites it.
+                # with the canonical message), adopted only when it describes
+                # the fallback this parent's decision allows. Set once; a
+                # later reload that reports no note of its own never
+                # overwrites it.
                 self.status_note = str(note)
             if self._notes:
                 # Keep the fallback note visible beside what the fresh
                 # worker reports; the note is why it is running on CPU.
                 self._refresh_message()
-            elif response.get("device_message"):
+            elif (response.get("device_message")
+                  and self._message_is_adoptable(str(response["device_message"]))):
                 self.device_message = str(response["device_message"])
             else:
                 self._refresh_message()
@@ -1010,6 +1214,13 @@ class IsolatedTranscriber(Transcriber):
     def _on_cuda_failure(self, detail: str, phase: str, retried: bool,
                          *, device: bool = False) -> BaseException | _Retry:
         want = self._requested_device
+        # S3: the text is classified whatever ``kind`` the child wrapped it
+        # in. A runtime fault (OOM, illegal memory access, NCCL …) stays
+        # itself even under kind="device" — no CPU rebuild, no relabelling
+        # as "CUDA libraries unavailable" — the same belt-and-braces rule
+        # the availability classifier applies to kind="cuda".
+        if _is_runtime_failure_text(detail):
+            return RuntimeError(detail)
         # F1: only a load/availability failure ("CUDA libraries unavailable")
         # may be recovered as CPU. A runtime fault — OOM, illegal memory
         # access, NCCL — propagates as itself: no CPU rebuild, no relabel.
@@ -1064,7 +1275,7 @@ class IsolatedTranscriber(Transcriber):
                   "vad": bool(vad), "offset": float(offset or 0.0),
                   "hotwords": hotwords, "progress": progress is not None,
                   "nbytes": int(audio.nbytes)}
-        response = session.request(header, audio, on_status=self._notify,
+        response = session.request(header, audio, on_status=self._child_status,
                                    on_progress=progress)
         if not response.get("ok"):
             detail = str(response.get("error") or "transcription failed")

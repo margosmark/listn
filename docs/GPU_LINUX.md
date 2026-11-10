@@ -35,12 +35,15 @@ CTranslate2’s generic `compute_type` set is not a promise that every type work
 
 `listn transcribe|live --compute-device`, `LISTN_COMPUTE_DEVICE` and
 `compute_device` in `settings.json` choose where faster-whisper runs.
-Precedence: CLI > environment > settings file; an invalid value raises a
-readable `ValueError` (CLI exit 2), never a silent fallback.
+Precedence: CLI > environment > settings file; an invalid value never
+falls back silently. The `--compute-device` flag is rejected by argparse
+with a readable "invalid choice" message (exit 2, no traceback); an
+invalid `LISTN_COMPUTE_DEVICE` environment value raises `SettingsError`
+(a `ValueError`) from settings loading.
 
 | Value | Behaviour |
 |---|---|
-| `auto` (default) | Main's shipped behaviour: GPU when this machine's CUDA (or ROCm) runtime is actually usable, otherwise CPU carrying the status note `CUDA libraries unavailable — transcribing on CPU`. The availability checks run in a child process (`listn/transcriber.py:resolve_device()`), because the native loader and the driver API can end a process without raising a Python exception; a child killed by a signal, a timeout or unparseable output all read as "not usable", with the reason shown. |
+| `auto` (default) | Main's shipped behaviour: GPU when this machine's CUDA (or ROCm) runtime is actually usable, otherwise CPU. The availability checks run in a child process (`listn/transcriber.py:resolve_device()`), because the native loader and the driver API can end a process without raising a Python exception; a child killed by a signal, a timeout or unparseable output all read as "not usable". What the user actually sees on `auto`: a machine with no GPU at all announces only `device: cpu`, with no note; the note `CUDA libraries unavailable — transcribing on CPU` appears only when a GPU is visible but unusable (or an availability failure happens mid-run). The probe's specific reason stays in `device_message`, which no user-facing surface displays — explicit `cuda`/`rocm` failures, by contrast, do show their reason. |
 | `cpu` | Never touches the GPU; the probe is never run. |
 | `cuda`, `rocm` | Require that GPU stack by name: "no device", "library unusable" or a CTranslate2 refusal raises `CudaUnavailable` with the missing piece and the exact remedy **before any model build** — the file job exits 1 with no traceback and no transcript, never a false success. |
 
@@ -51,7 +54,15 @@ child: under `auto` the parent restarts it pinned to CPU exactly once and
 appends `…; running on CPU` to the status line, under explicit
 `cuda`/`rocm` it raises the actionable error with no CPU retry, and under `cpu`
 a crash is an error because there is nothing to fall back to.
-`tests/test_isolation.py` simulates each case.
+Requests to that child carry a silence-based deadline — a long one for the
+model load (a first-run model download can take minutes) and a shorter one
+for transcription: a child that stops answering is stopped and reported as
+one clean error rather than wedging the caller, and closing never queues
+behind a stuck request. The worker may confirm the device decision but
+never widen it: a child that claims a GPU the parent did not choose has
+that claim dropped (device, status line and device message alike).
+`tests/test_isolation.py` simulates each case, including those bounds and
+claims.
 
 `compute_type`: a value of `int8` — the settings default, indistinguishable
 from an explicit set — resolves to `float16` on a GPU build and stays `int8`
