@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 
 import numpy as np
 import pytest
@@ -286,3 +288,200 @@ def test_cli_sigsegv_fails_with_one_line_and_writes_no_transcript(data_dir, tmp_
     sessions = Library().list()
     assert [s.status for s in sessions] == ["error"]
     assert sessions[0].error and "SIGSEGV" in sessions[0].error
+
+# --- S1: bounded worker requests --------------------------------------------
+# The security review executed a child that never answers: transcribe(), the
+# load path and close() all blocked forever, recovery only via an external
+# kill, and the engine's single job-worker thread then wedged every later
+# file job. Every request now carries a silence-based deadline, close()'s
+# lock wait is bounded, and the expiry stops the child itself.
+
+def _worker_alive(pid: int) -> bool:
+    """True while the worker process still exists (zombies count as alive)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _spy_worker_pids(monkeypatch) -> list:
+    """Record every worker child pid this test spawns (orphan evidence)."""
+    pids = []
+    original = tr._WorkerSession.spawn.__func__
+
+    def spawn(cls):
+        session = original(cls)
+        pids.append(session.proc.pid)
+        return session
+
+    monkeypatch.setattr(tr._WorkerSession, "spawn", classmethod(spawn))
+    return pids
+
+
+def test_hung_worker_at_load_fails_within_the_bound_and_leaves_no_orphan(
+        monkeypatch, data_dir):
+    """A child that never answers the load: the parent returns within the
+    bound with a clean error, and the worker is gone — not orphaned."""
+    monkeypatch.setattr(tr, "_LOAD_IDLE_TIMEOUT", 10.0)
+    pids = _spy_worker_pids(monkeypatch)
+    monkeypatch.setattr(tr, "_FACTORY_PATH", f"{FACTORIES}:hang_load_factory")
+    start = time.monotonic()
+    with pytest.raises(RuntimeError) as excinfo:
+        tr.get_transcriber("tiny", "faster-whisper", compute_device="cpu")
+    elapsed = time.monotonic() - start
+    message = str(excinfo.value)
+    assert elapsed < 30.0  # bounded: the old code blocked forever
+    assert "stopped responding" in message
+    assert "loading the model" in message
+    assert "Traceback" not in message
+    assert tr._cache == {}  # nothing half-built was cached
+    assert pids, "the test must have spawned a worker"
+    assert all(not _worker_alive(pid) for pid in pids)  # no orphan worker
+
+
+def test_hung_worker_at_transcribe_fails_within_the_bound_and_leaves_no_orphan(
+        monkeypatch, data_dir):
+    """A child that loads fine but never answers the transcription: same
+    bound, same clean teardown, and the wedged session is dropped."""
+    monkeypatch.setattr(tr, "_REQUEST_IDLE_TIMEOUT", 3.0)
+    pids = _spy_worker_pids(monkeypatch)
+    wrapper = _iso("hang_transcribe_factory", "cpu", monkeypatch, data_dir)
+    start = time.monotonic()
+    with pytest.raises(RuntimeError) as excinfo:
+        wrapper.transcribe(_audio())
+    elapsed = time.monotonic() - start
+    message = str(excinfo.value)
+    assert elapsed < 30.0
+    assert "stopped responding" in message
+    assert "while transcribing" in message
+    assert "Traceback" not in message
+    assert wrapper._session is None  # the wedged session was torn down
+    assert pids and all(not _worker_alive(pid) for pid in pids)
+
+
+def test_close_is_bounded_while_a_request_is_wedged(monkeypatch, data_dir):
+    """close() must not queue behind a wedged request: it waits at most
+    _CLOSE_LOCK_TIMEOUT, then stops the worker anyway — which unblocks the
+    wedged request with a clean error instead of an external pkill."""
+    monkeypatch.setattr(tr, "_REQUEST_IDLE_TIMEOUT", 60.0)  # keep it wedged
+    monkeypatch.setattr(tr, "_CLOSE_LOCK_TIMEOUT", 1.0)
+    pids = _spy_worker_pids(monkeypatch)
+    wrapper = _iso("hang_transcribe_factory", "cpu", monkeypatch, data_dir)
+    errors = []
+    done = threading.Event()
+
+    def wedge():
+        try:
+            wrapper.transcribe(_audio())
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            done.set()
+
+    threading.Thread(target=wedge, daemon=True).start()
+    deadline = time.monotonic() + 10.0
+    while not wrapper._lock.locked() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert wrapper._lock.locked(), "the transcribe request never took the lock"
+
+    start = time.monotonic()
+    wrapper.close()
+    assert time.monotonic() - start < 10.0  # bounded lock wait, then a stop
+    assert done.wait(15.0)  # the wedged request fails, it does not hang
+    assert errors, "the wedged transcribe should have been unblocked"
+    assert "The transcription process" in str(errors[0])
+    assert all(not _worker_alive(pid) for pid in pids)
+
+
+# --- S2/S3: the child confirms the decision, never widens it -----------------
+
+def test_child_gpu_claim_on_a_cpu_request_is_clamped_to_cpu(monkeypatch, data_dir):
+    """Requested cpu; the child claims cuda in its device, its device line
+    AND a status event (the review's executed probe). None of it may reach
+    the user: the job still runs, on the CPU the parent asked for."""
+    monkeypatch.setattr(tr, "_FACTORY_PATH", f"{FACTORIES}:gpu_claim_factory")
+    statuses = []
+    wrapper = tr.get_transcriber("tiny", "faster-whisper",
+                                 compute_device="cpu", status=statuses.append)
+    segments = [s.text for s in wrapper.transcribe(_audio(), language="en")]
+    assert segments == ["ran where it was told"]  # the job still ran
+    assert wrapper.device == "cpu"  # the claim was not adopted
+    assert wrapper.device_message == "device: cpu"
+    assert wrapper.status_note is None  # nothing fell back
+    assert not any("cuda" in s.lower() or "gpu" in s.lower()
+                   for s in statuses)  # the callback saw no GPU claim either
+    wrapper.close()
+
+
+def test_child_reclaim_after_a_cpu_pin_never_overwrites_the_parent(
+        monkeypatch, data_dir, tmp_path):
+    """auto pins CPU after the child dies on the GPU attempt; the retry
+    child claims cuda (device + message). The pin must survive it: the job
+    still runs on CPU and the announcement keeps the SIGSEGV explanation."""
+    log = _load_log(tmp_path, monkeypatch)
+    monkeypatch.setattr(tr, "_FACTORY_PATH",
+                        f"{FACTORIES}:reclaim_after_pin_factory")
+    statuses = []
+    wrapper = tr.get_transcriber("tiny", "faster-whisper",
+                                 compute_device="auto", status=statuses.append)
+    segments = [s.text for s in wrapper.transcribe(_audio(), language="en")]
+    assert segments == ["cpu work"]  # still ran — on the pinned CPU
+    assert _loads(log) == 2  # one GPU attempt (died), one CPU retry
+    assert wrapper.device == "cpu"  # the post-pin re-claim was not adopted
+    assert wrapper.device_message.startswith("device: cpu")
+    assert "device: cuda" not in wrapper.device_message
+    assert "SIGSEGV" in (wrapper.status_note or "")  # parent's note stands
+    assert not any("cuda" in s.lower() or "gpu acceleration" in s.lower()
+                   for s in statuses)
+    wrapper.close()
+
+
+def test_child_fallback_note_is_not_adopted_on_a_cpu_request(
+        monkeypatch, data_dir):
+    """A consistent cpu claim carrying the canonical fallback note and a GPU
+    device line: a request that never fell back must announce neither."""
+    monkeypatch.setattr(tr, "_FACTORY_PATH",
+                        f"{FACTORIES}:injected_note_factory")
+    statuses = []
+    wrapper = tr.get_transcriber("tiny", "faster-whisper",
+                                 compute_device="cpu", status=statuses.append)
+    segments = [s.text for s in wrapper.transcribe(_audio(), language="en")]
+    assert segments == ["on cpu"]
+    assert wrapper.status_note is None  # nothing fell back
+    assert wrapper.device_message == "device: cpu"
+    assert tr.CPU_FALLBACK_MESSAGE not in statuses
+    wrapper.close()
+
+
+def test_child_canonical_note_for_a_narrowed_auto_build_is_adopted(
+        monkeypatch, data_dir):
+    """The control for S2/S3: an honest auto->CPU narrowing keeps its note
+    and its message exactly as the probe reported them."""
+    monkeypatch.setattr(tr, "_FACTORY_PATH",
+                        f"{FACTORIES}:narrowed_cpu_note_factory")
+    statuses = []
+    wrapper = tr.get_transcriber("tiny", "faster-whisper",
+                                 compute_device="auto", status=statuses.append)
+    assert wrapper.device == "cpu"
+    assert wrapper.status_note == tr.CPU_FALLBACK_MESSAGE
+    assert wrapper.device_message == "device: cpu"
+    assert statuses == [tr.CPU_FALLBACK_MESSAGE]
+    wrapper.close()
+
+
+def test_kind_device_runtime_fault_is_not_relabelled_as_cpu_fallback(
+        monkeypatch, data_dir):
+    """S3: kind='device' carrying an OOM must propagate as itself — no CPU
+    rebuild, no canonical 'CUDA libraries unavailable' announcement."""
+    monkeypatch.setattr(tr, "_FACTORY_PATH",
+                        f"{FACTORIES}:kind_device_oom_factory")
+    statuses = []
+    with pytest.raises(RuntimeError) as excinfo:
+        tr.get_transcriber("tiny", "faster-whisper",
+                           compute_device="auto", status=statuses.append)
+    assert type(excinfo.value) is RuntimeError  # not a CudaUnavailable
+    assert "out of memory" in str(excinfo.value)
+    assert statuses == []  # nothing was announced as a CPU fallback
+    assert tr._cache == {}  # no fallback build, nothing cached
+

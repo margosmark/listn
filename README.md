@@ -471,7 +471,7 @@ Faster-whisper runs on **`auto` by default** — the shipped behaviour: use the 
 
 | Value | Behaviour |
 |---|---|
-| `auto` (default) | Probes the GPU **in a child process** first (so a broken driver or library cannot take listn down); uses CUDA or ROCm only when that runtime is really usable, and otherwise transcribes on CPU with the note `CUDA libraries unavailable — transcribing on CPU`. |
+| `auto` (default) | Probes the GPU **in a child process** first (so a broken driver or library cannot take listn down); uses CUDA or ROCm only when that runtime is really usable, and otherwise transcribes on CPU — announcing `device: cpu` (a machine with no GPU at all gets no note), carrying the note `CUDA libraries unavailable — transcribing on CPU` only when a GPU is visible but unusable. |
 | `cpu` | Never touches the GPU. |
 | `cuda`, `rocm` | Require that GPU stack. If it cannot be used, listn stops with an actionable error naming the missing piece and the remedy — no silent fallback, exit code 1, no traceback. |
 
