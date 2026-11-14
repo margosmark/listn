@@ -56,11 +56,14 @@ appends `…; running on CPU` to the status line, under explicit
 a crash is an error because there is nothing to fall back to.
 Requests to that child carry a silence-based deadline — a long one for the
 model load (a first-run model download can take minutes) and a shorter one
-for transcription: a child that stops answering is stopped and reported as
-one clean error rather than wedging the caller, and closing never queues
-behind a stuck request. The worker may confirm the device decision but
-never widen it: a child that claims a GPU the parent did not choose has
-that claim dropped (device, status line and device message alike).
+for transcription: the clock starts before the request is written, so a
+child that goes silent — whether it stops reading the request or stops
+replying to it — is stopped and reported as one clean error rather than
+wedging the caller, and closing never queues behind a stuck request. The
+worker may confirm the device decision but never widen it: a child that
+claims a GPU the parent did not choose has that claim dropped (device,
+status line and device message alike) — under the default `auto` the
+claim must also match this machine's own capability probe.
 `tests/test_isolation.py` simulates each case, including those bounds and
 claims.
 

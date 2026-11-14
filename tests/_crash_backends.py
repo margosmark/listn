@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import signal
+import threading
 import time
 
 from listn.transcriber import (CPU_FALLBACK_MESSAGE, CudaUnavailable,
@@ -262,4 +263,63 @@ def kind_device_oom_factory(model, download=None, **knobs):
     _log_load()
     raise CudaUnavailable("CUDA out of memory. Tried to allocate 2.00 GiB "
                           "(GPU 0)")
+
+
+# ---------------------------------------------------------------------------
+# S1r: a child that stops reading the request pipe OUTSIDE an active request.
+# ---------------------------------------------------------------------------
+
+def freeze_between_factory(model, download=None, **knobs):
+    """Answers the load, then freezes itself — a child that stops reading
+    the request pipe while it is *not* inside any request (SIGSTOP /
+    wedged native thread / cgroup freeze equivalent)."""
+    _log_load()
+    device = _device_of(knobs)
+
+    def freeze():
+        time.sleep(1.5)          # let the load response reach the parent first
+        os.kill(os.getpid(), signal.SIGSTOP)
+
+    threading.Thread(target=freeze, daemon=True).start()
+    return _make_backend(device, lambda _audio: iter(
+        [RawSegment(0.0, 1.0, "never runs", 0.0)]))(model)
+
+
+# ---------------------------------------------------------------------------
+# S2r: hostile answers on the default device (`auto`), one channel each.
+# ---------------------------------------------------------------------------
+
+def auto_note_factory(model, download=None, **knobs):
+    """`auto`: fabricates the canonical CPU-fallback note with no failure
+    of any kind — both channels: as the response's status_note and as a
+    status event — plus a consistent cpu claim (gate C6)."""
+    _log_load()
+    if download:
+        download(CPU_FALLBACK_MESSAGE)   # hostile: as a status event too
+
+    class NoteInjector(Transcriber):
+        backend = "faster-whisper"
+
+        def __init__(self, name):
+            super().__init__(name)
+            self.device = "cpu"
+            self.device_message = "device: cpu"
+            self.status_note = CPU_FALLBACK_MESSAGE
+
+        def segments(self, audio, language=None, prompt=None, vad=True, hotwords=None):
+            yield RawSegment(0.0, 1.0, "on cpu", 0.0)
+
+    return NoteInjector(model)
+
+
+def auto_status_factory(model, download=None, **knobs):
+    """`auto`: hostile status event only — the response itself claims
+    nothing (device stays `auto`), so only the status channel is dirty
+    (gate C7)."""
+    _log_load()
+    if download:
+        download("device: cuda — using GPU acceleration (CTranslate2 cuda)")
+    device = str(knobs.get("compute_device") or "auto") or "auto"
+    return _make_backend(device, lambda _audio: iter(
+        [RawSegment(0.0, 1.0, "ok", 0.0)]))(model)
 
