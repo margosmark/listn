@@ -692,6 +692,9 @@ class _BackendError(RuntimeError):
 # entirely (a hung CUDA kernel, a wedged factory) is terminated and reaped
 # within the bound and the request fails with a clean error instead of
 # blocking the caller, the engine's single job-worker thread, or close().
+# Silence alone is not enough (S1c): a child that keeps TALKING without
+# ever finishing (a backend looping in progress()) resets that deadline
+# forever, so every request also carries a hard total wall cap below.
 #
 # The bound also covers writing the request (S1r): a child that stopped
 # reading the request pipe *outside* an active request (wedged native
@@ -706,19 +709,59 @@ class _BackendError(RuntimeError):
 # progress frames, and live chunks are short, so inference never needs it.
 _LOAD_IDLE_TIMEOUT = 1800.0     # seconds a load/download may stay silent
 _REQUEST_IDLE_TIMEOUT = 120.0   # seconds an inference may stay silent
+# S1c: a hard wall cap for ONE request, on top of the silence bound. Any
+# frame from the child resets the silence clock above, so a backend that
+# loops in progress() forever is never "silent" and that bound alone can
+# never stop it — but it can never push past `started + cap` either, and
+# is then stopped with one clean _ChildDied. Deliberately generous
+# (hours): a legitimately long transcription must never hit it. Read from
+# the module global at call time so tests can monkeypatch it small.
+_REQUEST_MAX_TOTAL = 6 * 3600.0  # seconds one request may run in total
 # close() waits at most this long for an in-flight request's lock before it
 # stops the worker anyway (atexit and eviction must not wedge on a hang).
 _CLOSE_LOCK_TIMEOUT = 10.0
 
 # A child status/device line that claims GPU use. Checked against the
 # parent's own device decision (S2): a worker that was told `cpu` — or
-# pinned to it after a crash — can never announce GPU acceleration. The
-# canonical CPU-fallback note ("CUDA libraries unavailable — transcribing
-# on CPU") deliberately does NOT match: it claims CPU, not a GPU.
+# pinned to it after a crash — can never announce GPU acceleration.
+# S8: positive form — any line naming a GPU device counts as a claim, so
+# a phrasing the old denylist missed ("using the GPU", "transcribing on
+# GPU", "on the GPU") cannot slip past it; false positives are accepted,
+# this channel also carries download text. The canonical CPU-fallback
+# note deliberately does NOT match: it names CUDA as the reason the
+# build is on CPU — it claims CPU, not a GPU, and the F1 marker
+# semantics must not flip.
 _GPU_CLAIM = re.compile(
-    r"device:\s*(?:cuda|rocm)|using gpu|gpu acceleration|running on gpu|"
-    r"(?:on|using|with) (?:the )?(?:cuda|rocm) gpu",
+    r"device:\s*(?:cuda|rocm|gpu)|"
+    r"\b(?:rocm|gpu|hip)\b|"
+    r"\bcuda\b(?! libraries unavailable)",
     re.IGNORECASE)
+
+# The one other honest message that legitimately names a GPU device: the
+# probe's unavailability reason (`compute_backend.resolve` narrows
+# auto -> cpu with it, and it rides into the child's device_message). It
+# reports WHY the build is on CPU, it does not claim GPU use, so it is
+# stripped before the scan — but only that exact sentence: anything a
+# child appends around it is still scanned, so wrapping a claim in the
+# reason does not hide it. _claims_gpu() applies both exemptions.
+_PROBE_REASON = re.compile(
+    r"CUDA is visible but the CUDA runtime cannot be used \([^)]*\)"
+    r"(?:; see docs/GPU_LINUX\.md)?",
+    re.IGNORECASE)
+
+
+def _claims_gpu(text: str) -> bool:
+    """True when ``text`` claims GPU use (S2/S8).
+
+    The two honest CPU-truth messages that name a GPU device — the
+    canonical fallback note and the probe's unavailability reason — are
+    removed first; everything else in the line is scanned, so a claim
+    wrapped around them still matches.
+    """
+    remainder = _PROBE_REASON.sub(" ", str(text))
+    if CPU_FALLBACK_MESSAGE in remainder:
+        remainder = remainder.replace(CPU_FALLBACK_MESSAGE, " ")
+    return bool(_GPU_CLAIM.search(remainder))
 
 # The ``device: <name>`` token a device message opens with, if any.
 _DEVICE_TOKEN = re.compile(r"device:\s*([A-Za-z0-9_-]+)")
@@ -860,10 +903,18 @@ class _WorkerSession:
         ``os.write`` with no deadline armed. When not given, the bound
         follows the op (``load`` includes first-run downloads, so it is
         the longer one).
+
+        Frames reset that silence clock but can never push the request
+        past ``_REQUEST_MAX_TOTAL`` (S1c): a child that keeps talking
+        without ever finishing — a backend looping in ``progress()``
+        forever — is stopped with one clean :class:`_ChildDied` at the
+        cap instead of resetting the silence deadline indefinitely.
         """
         if timeout is None:
             timeout = (_LOAD_IDLE_TIMEOUT if header.get("op") == "load"
                        else _REQUEST_IDLE_TIMEOUT)
+        # S1c: the total wall cap covers the whole request, send included.
+        started = time.monotonic()
         try:
             frames: list = [json.dumps(header).encode("utf-8")]
             if payload is not None:
@@ -873,19 +924,28 @@ class _WorkerSession:
         except (OSError, ValueError) as exc:
             raise _ChildDied(self.death_detail()) from exc
         # S1r: the deadline that bounds this request starts BEFORE the
-        # request is written, not after — see _send_bounded.
-        self._send_bounded(frames, timeout)
+        # request is written, not after — see _send_bounded. The total
+        # cap bounds the send too, so it can never be outrun there.
+        self._send_bounded(frames, min(timeout, _REQUEST_MAX_TOTAL))
         deadline = time.monotonic() + timeout
         while True:
-            remaining = deadline - time.monotonic()
+            now = time.monotonic()
+            # S1c: any frame resets the silence clock below, but no frame
+            # can push the request past `started + _REQUEST_MAX_TOTAL` —
+            # a child looping in progress() forever is stopped here.
+            if now - started >= _REQUEST_MAX_TOTAL:
+                raise self._max_total_death()
+            remaining = deadline - now
             if remaining <= 0:
                 raise self._timeout_death(timeout)
+            # Never sleep past the total cap either: wake up to re-check it.
+            remaining = min(remaining, started + _REQUEST_MAX_TOTAL - now)
             try:
                 raw = self._inbox.get(timeout=remaining)
             except queue.Empty:
                 if self._eof.is_set():
                     raise _ChildDied(self.death_detail())
-                raise self._timeout_death(timeout)
+                continue  # silence bound or total cap expired: re-check both
             if raw is _EOF:
                 raise _ChildDied(self.death_detail())
             deadline = time.monotonic() + timeout  # any frame resets the clock
@@ -933,10 +993,14 @@ class _WorkerSession:
         if helper.is_alive():
             raise self._send_timeout_death(timeout, helper)
         exc = outcome.get("exc")
-        if isinstance(exc, (OSError, ValueError)):
-            raise _ChildDied(self.death_detail()) from exc
         if exc is not None:
-            raise exc
+            # S9: every helper failure is a child death to the caller —
+            # OSError/ValueError (dead pipe) and anything else alike. A
+            # close() racing the send nulls Connection._handle mid-write,
+            # so the helper can raise TypeError from os.write; that must
+            # surface as _ChildDied(death_detail()), never as a raw
+            # internal exception escaping request().
+            raise _ChildDied(self.death_detail()) from exc
 
     def _send_timeout_death(self, timeout: float,
                             helper: threading.Thread) -> _ChildDied:
@@ -971,6 +1035,22 @@ class _WorkerSession:
         """
         self.close()
         return _ChildDied(f"stopped responding (no answer for {timeout:g}s)")
+
+    def _max_total_death(self) -> _ChildDied:
+        """S1c: the child kept talking but the request ran past its total
+        cap — stop it now.
+
+        Frames reset the silence clock, so a backend looping in
+        ``progress()`` forever never trips ``_timeout_death``; the total
+        cap is the bound that catches it. Same teardown as a silence
+        timeout (close stops and reaps the child — no orphan), but the
+        message says the work never finished rather than the child going
+        silent, because it did not.
+        """
+        cap = _REQUEST_MAX_TOTAL
+        self.close()
+        return _ChildDied(
+            f"never finished (the request ran for {cap:g}s without completing)")
 
     def close(self) -> None:
         for conn in (self._to, self._from):
@@ -1169,7 +1249,7 @@ class IsolatedTranscriber(Transcriber):
             return False
         if self._device not in (None, "cpu"):
             return False
-        if _GPU_CLAIM.search(note):
+        if _claims_gpu(note):
             return False   # a note may not claim a GPU
         if self._parent_auto_plan().device != "cpu":
             log.warning("dropped a worker status note the parent's own "
@@ -1186,7 +1266,7 @@ class IsolatedTranscriber(Transcriber):
                         "(compute device is %r): %r",
                         token.group(1), target, message)
             return False
-        if _GPU_CLAIM.search(message) and not self._gpu_line_allowed(target):
+        if _claims_gpu(message) and not self._gpu_line_allowed(target):
             log.warning("dropped a worker device message claiming GPU use "
                         "(compute device is %r): %r", target, message)
             return False
@@ -1207,7 +1287,7 @@ class IsolatedTranscriber(Transcriber):
             return
         text = str(message)
         target = self._device or self._effective_device
-        if _GPU_CLAIM.search(text) and not self._gpu_line_allowed(target):
+        if _claims_gpu(text) and not self._gpu_line_allowed(target):
             log.warning("dropped a worker status line claiming GPU use while "
                         "compute device is %r: %r", target, text)
             return

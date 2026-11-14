@@ -54,16 +54,22 @@ child: under `auto` the parent restarts it pinned to CPU exactly once and
 appends `…; running on CPU` to the status line, under explicit
 `cuda`/`rocm` it raises the actionable error with no CPU retry, and under `cpu`
 a crash is an error because there is nothing to fall back to.
-Requests to that child carry a silence-based deadline — a long one for the
-model load (a first-run model download can take minutes) and a shorter one
-for transcription: the clock starts before the request is written, so a
-child that goes silent — whether it stops reading the request or stops
-replying to it — is stopped and reported as one clean error rather than
-wedging the caller, and closing never queues behind a stuck request. The
-worker may confirm the device decision but never widen it: a child that
-claims a GPU the parent did not choose has that claim dropped (device,
+Requests to that child carry two bounds — a silence-based deadline (a long
+one for the model load, a first-run model download can take minutes, and a
+shorter one for transcription) and a hard total cap per request. The clock
+starts before the request is written, so a child that goes silent — whether
+it stops reading the request or stops replying to it — is stopped and
+reported as one clean error rather than wedging the caller, and closing
+never queues behind a stuck request. Frames from the child reset the
+silence clock but can never push a request past the total cap, so a child
+that keeps reporting progress without ever finishing is stopped the same
+way instead of running forever. The worker may confirm the device decision
+but never widen it: a child that claims a GPU the parent did not choose —
+in any wording that names a GPU device — has that claim dropped (device,
 status line and device message alike) — under the default `auto` the
-claim must also match this machine's own capability probe.
+claim must also match this machine's own capability probe. The canonical
+CPU-fallback note is the exception that proves the rule: it names CUDA as
+the reason the build is on CPU, so it stays CPU-truth, never a GPU claim.
 `tests/test_isolation.py` simulates each case, including those bounds and
 claims.
 
