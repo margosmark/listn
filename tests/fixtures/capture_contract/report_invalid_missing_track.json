@@ -2,7 +2,7 @@
   "description": "A report without the microphone track cannot describe a two-track capture.",
   "report": {
     "ok": true,
-    "out_dir": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok",
+    "out_dir": "out/ok",
     "rate": 48000,
     "targets": {
       "system": {
@@ -38,7 +38,7 @@
           "selection": "default"
         },
         "state": "stopped",
-        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/system.wav",
+        "file": "out/ok/system.wav",
         "duration": 2.9,
         "samplerate": 48000,
         "channels": 1,
@@ -49,7 +49,7 @@
         "verdict": "ok",
         "error": null,
         "exit_code": 1,
-        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/system.pw-record.log"
+        "log": "out/ok/system.pw-record.log"
       }
     }
   }

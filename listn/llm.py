@@ -139,7 +139,7 @@ def validate_ollama_url(raw) -> str:
     if parts.scheme not in ("http", "https"):
         raise ValueError(
             "llm_ollama_url must be an http(s) origin such as "
-            f"http://10.10.10.6:11434 - got {_redacted_origin(raw)}")
+            f"http://192.0.2.1:11434 - got {_redacted_origin(raw)}")
     if not parts.hostname:
         raise ValueError(f"llm_ollama_url has no host - got {_redacted_origin(raw)}")
     if parts.username or parts.password:

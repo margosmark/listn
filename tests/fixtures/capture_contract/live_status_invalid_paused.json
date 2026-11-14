@@ -3,7 +3,7 @@
   "status": {
     "active": true,
     "state": "paused",
-    "out_dir": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok",
+    "out_dir": "out/ok",
     "rate": 48000,
     "targets": {
       "system": {
@@ -31,14 +31,14 @@
         "frames": 139200,
         "seconds": 2.9,
         "error": null,
-        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/system.wav"
+        "file": "out/ok/system.wav"
       },
       "mic": {
         "state": "recording",
         "frames": 144000,
         "seconds": 3.0,
         "error": null,
-        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/mic.wav"
+        "file": "out/ok/mic.wav"
       }
     },
     "devices": {
