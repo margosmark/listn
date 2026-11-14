@@ -75,6 +75,25 @@ def hostile_launcher(monkeypatch, tmp_path):
 
 
 @pytest.fixture
+def apostrophe_launcher(monkeypatch, tmp_path):
+    """A prefix whose *only* odd character is an apostrophe — no space, no
+    quote, nothing else the quoting rules notice.
+
+    That is the reported failure: an unmatched ``'`` left unquoted in ``Exec``
+    makes ``g_shell_parse_argv`` give up ("Text ended before matching quote"),
+    the GIO constructor returns NULL, and the entry is dead at login while
+    Settings still shows ON because the marker file exists.
+    """
+    odd_dir = tmp_path / "o'brien"
+    odd_dir.mkdir()
+    exe = odd_dir / "listn"
+    exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    exe.chmod(0o755)
+    monkeypatch.setattr(sys, "argv", [str(exe), "ui"])
+    return exe
+
+
+@pytest.fixture
 def client(data_dir, fake_factory, home, launcher):
     sd = FakeSD(MAC_DEVICES, default=(0, 3), speed=40.0)
     engine = Engine(sd=sd, transcriber_factory=fake_factory)
@@ -141,8 +160,46 @@ try:
     out["argv"] = list(argv)
 except GLib.Error as exc:
     out["error"] = str(exc)
-info = Gio.DesktopAppInfo.new_from_filename(path)
+try:
+    info = Gio.DesktopAppInfo.new_from_filename(path)
+except TypeError:          # PyGObject raises when the constructor returns NULL
+    info = None
 out["cmdline"] = None if info is None else info.get_commandline()
+print(json.dumps(out))
+"""
+
+
+#: A real GIO *launch*: load the entry, start it, and wait for the child to
+#: record what it actually received. The record path travels in argv; the
+#: hostile ambient ``PYTHONPATH`` is set by the caller, so the child's own
+#: environment shows whether the entry's ``env PYTHONPATH=…`` prefix replaced
+#: it outright.
+GIO_LAUNCH_PROBE = """
+import json, sys, time
+
+import gi
+gi.require_version("GLib", "2.0")
+from gi.repository import Gio
+
+entry, record = sys.argv[1], sys.argv[2]
+out = {}
+info = Gio.DesktopAppInfo.new_from_filename(entry)
+out["info"] = info is not None
+if info is None:
+    print(json.dumps(out))
+    raise SystemExit(0)
+try:
+    out["launch"] = bool(info.launch([], None))
+except Exception as exc:          # GLib.Error on a refused or failed spawn
+    out["launch_error"] = str(exc)
+deadline = time.time() + 15
+while time.time() < deadline:
+    try:
+        with open(record, encoding="utf-8") as fh:
+            out["record"] = json.load(fh)
+        break
+    except (OSError, ValueError):
+        time.sleep(0.1)
 print(json.dumps(out))
 """
 
@@ -272,6 +329,133 @@ def test_hostile_launcher_path_round_trips_through_glib(client, entry, hostile_l
     # so the entry existed but could never autostart).
     assert data["cmdline"] is not None, data
     assert data["cmdline"] == data["exec"], data
+
+
+# ------------------------------------------------- apostrophe-only prefixes
+
+
+def test_apostrophe_launcher_path_validates_as_a_desktop_entry(client, entry,
+                                                               apostrophe_launcher):
+    """A lone ``'`` in the install prefix must still ship a lint-clean entry.
+
+    Pre-fix the argument went out unquoted: desktop-file-validate rejected it
+    (``reserved character ''' outside of a quote``), GLib could not parse the
+    Exec at all, and the autostart entry silently did nothing at login while
+    Settings kept showing ON.
+    """
+    if shutil.which("desktop-file-validate") is None:
+        pytest.skip("desktop-file-utils not installed")
+    assert client.put("/api/settings", json={"launch_at_login": True}).status_code == 200
+    result = subprocess.run(["desktop-file-validate", str(entry)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_apostrophe_launcher_path_round_trips_through_glib(client, entry,
+                                                           apostrophe_launcher):
+    """Real GLib must read the apostrophe path back argv-for-argv, and GIO
+    must still see a command — pre-fix the parser errored out (cmdline=None),
+    so the entry existed but could never autostart."""
+    interpreters = [c for c in (sys.executable, "/usr/bin/python3") if has_gi(c)]
+    if not interpreters:
+        pytest.skip("PyGObject not installed for any interpreter")
+    assert client.put("/api/settings", json={"launch_at_login": True}).status_code == 200
+
+    result = subprocess.run([interpreters[0], "-c", GLIB_PROBE, str(entry)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    data = json.loads(result.stdout)
+    assert "error" not in data, data["error"]
+    assert data["argv"] == [str(apostrophe_launcher), "tray"], data
+    assert data["cmdline"] is not None, data
+    assert data["cmdline"] == data["exec"], data
+
+
+#: The desktop-entry spec's reserved characters — the set that forces an
+#: argument into quotes (spec §"The Exec key"). Newline is deliberately
+#: absent: :func:`listn.autostart.render` refuses to write a line break at
+#: all, and ``%`` is handled separately as a field code (``%%``).
+SPEC_RESERVED = " \t\"'\\><~|&;$*?#()`"
+
+
+def test_quote_exec_arg_quotes_every_spec_reserved_character(tmp_path):
+    """Each reserved character *alone* must survive both layers and lint clean.
+
+    The quote-forcing check in ``quote_exec_arg`` is the only thing standing
+    between an odd install path and a dead entry, so every character the spec
+    reserves is exercised by itself — no second trigger char to fall back on.
+    """
+    if shutil.which("desktop-file-validate") is None:
+        pytest.skip("desktop-file-utils not installed")
+    entry = tmp_path / "listn.desktop"
+    for char in SPEC_RESERVED:
+        arg = f"/tmp/x{char}y"
+        value = autostart.quote_exec_arg(arg)     # exactly what follows Exec=
+        # Key-file string layer first, then the Exec layer — back to the arg.
+        assert decode_exec(keyfile_string(value)) == [arg], char
+        entry.write_text(
+            "[Desktop Entry]\nType=Application\nName=t\n"
+            f"Exec={value} tray\n", encoding="utf-8")
+        result = subprocess.run(["desktop-file-validate", str(entry)],
+                                capture_output=True, text=True)
+        assert result.returncode == 0, \
+            f"{char!r}: {result.stdout}{result.stderr}"
+    # ``%`` is not a reserved character but a field-code introducer: it must
+    # come out doubled, quoted, through the same branch.
+    assert autostart.quote_exec_arg("/tmp/x%y") == '"/tmp/x%%y"'
+
+
+def test_apostrophe_prefix_launch_delivers_exact_argv_and_pythonpath(tmp_path,
+                                                                     monkeypatch):
+    """A real GIO launch through an apostrophe prefix: exact argv, exact PYTHONPATH.
+
+    The install prefix rides the Exec line as ``PYTHONPATH=<source root>``
+    (the module form). Here the source root is a directory whose only odd
+    character is ``'`` — pre-fix GLib could not parse that Exec at all, so
+    nothing ever launched. Now both escaping layers must deliver the argument
+    verbatim, and the child must see the entry's own PYTHONPATH, not the
+    hostile ambient one the probe inherits.
+    """
+    interpreters = [c for c in (sys.executable, "/usr/bin/python3") if has_gi(c)]
+    if not interpreters:
+        pytest.skip("PyGObject not installed for any interpreter")
+    if shutil.which("desktop-file-validate") is None:
+        pytest.skip("desktop-file-utils not installed")
+
+    site = tmp_path / "o'brien" / "site"
+    pkg = site / "listn"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    record = tmp_path / "record.json"
+    (pkg / "__main__.py").write_text(
+        "import json, os, sys\n"
+        f"open({json.dumps(str(record))}, 'w', encoding='utf-8').write("
+        "json.dumps({'argv': sys.argv,"
+        " 'pythonpath': os.environ.get('PYTHONPATH')}))\n",
+        encoding="utf-8")
+    # The prefix is the variable under test; everything else is the real
+    # render → write → parse → launch chain.
+    monkeypatch.setattr(autostart, "source_root", lambda: str(site))
+    monkeypatch.setattr(sys, "argv", [str(pkg / "__main__.py"), "tray"])
+
+    entry = tmp_path / "listn.desktop"
+    entry.write_text(autostart.render(), encoding="utf-8")
+    result = subprocess.run(["desktop-file-validate", str(entry)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    # Hostile ambient PYTHONPATH: the entry must set its own, outright.
+    env = dict(os.environ, PYTHONPATH="/attacker/controlled")
+    result = subprocess.run(
+        [interpreters[0], "-c", GIO_LAUNCH_PROBE, str(entry), str(record)],
+        capture_output=True, text=True, env=env, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    data = json.loads(result.stdout)
+    assert data.get("info") is True, data            # the entry parses at all
+    assert data.get("launch") is True, data
+    assert "record" in data, f"child never wrote the record: {data}"
+    assert data["record"]["argv"] == [str(pkg / "__main__.py"), "tray"], data
+    assert data["record"]["pythonpath"] == str(site), data
 
 
 # ------------------------------------------------------------------ disable
