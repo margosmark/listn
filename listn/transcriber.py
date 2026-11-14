@@ -740,13 +740,31 @@ _GPU_CLAIM = re.compile(
 # The one other honest message that legitimately names a GPU device: the
 # probe's unavailability reason (`compute_backend.resolve` narrows
 # auto -> cpu with it, and it rides into the child's device_message). It
-# reports WHY the build is on CPU, it does not claim GPU use, so it is
-# stripped before the scan — but only that exact sentence: anything a
-# child appends around it is still scanned, so wrapping a claim in the
-# reason does not hide it. _claims_gpu() applies both exemptions.
+# reports WHY the build is on CPU, it does not claim GPU use, so its
+# FIXED prose — the sentence opener and the `; see docs/GPU_LINUX.md`
+# tail — is stripped before the scan, and anything a child appends around
+# it is still scanned, so wrapping a claim in the reason does not hide it
+# (S8-EX). The parenthetical between them is text a child can choose, so
+# it is NOT dropped with the prose: _claims_gpu() re-scans the captured
+# detail with the strong tokens below. Only bare `cuda` stays exempt
+# there — honest details are soname lists, "the capability probe timed
+# out…", "the capability probe terminated with…" and "CTranslate2 could
+# not query the CUDA driver (…)", none of which names a device — while
+# `device: cuda/rocm/gpu` and the words gpu/rocm/hip are claims wherever
+# they appear. _claims_gpu() applies all three exemptions.
 _PROBE_REASON = re.compile(
-    r"CUDA is visible but the CUDA runtime cannot be used \([^)]*\)"
+    r"CUDA is visible but the CUDA runtime cannot be used "
+    r"\((?P<detail>[^)]*)\)"
     r"(?:; see docs/GPU_LINUX\.md)?",
+    re.IGNORECASE)
+
+# The strong half of _GPU_CLAIM: everything it matches except bare
+# `cuda`. This is what the probe reason's parenthetical is re-scanned
+# with (S8-EX) — a claim parked inside the exempted sentence must not
+# hide behind an exemption meant for the honest detail only.
+_PROBE_DETAIL_CLAIM = re.compile(
+    r"device:\s*(?:cuda|rocm|gpu)|"
+    r"\b(?:rocm|gpu|hip)\b",
     re.IGNORECASE)
 
 
@@ -754,14 +772,26 @@ def _claims_gpu(text: str) -> bool:
     """True when ``text`` claims GPU use (S2/S8).
 
     The two honest CPU-truth messages that name a GPU device — the
-    canonical fallback note and the probe's unavailability reason — are
-    removed first; everything else in the line is scanned, so a claim
-    wrapped around them still matches.
+    canonical fallback note and the probe's unavailability reason — have
+    their fixed wording removed first; everything else in the line is
+    scanned, so a claim wrapped around them still matches. The probe
+    reason's parenthetical is child-chosen text, so it is captured and
+    re-scanned with the strong tokens rather than trusted: a claim parked
+    inside it is caught too, and only a bare ``cuda`` there stays exempt
+    (S8-EX).
     """
-    remainder = _PROBE_REASON.sub(" ", str(text))
+    details: list[str] = []
+
+    def _strip(match: re.Match) -> str:
+        details.append(match.group("detail"))
+        return " "
+
+    remainder = _PROBE_REASON.sub(_strip, str(text))
     if CPU_FALLBACK_MESSAGE in remainder:
         remainder = remainder.replace(CPU_FALLBACK_MESSAGE, " ")
-    return bool(_GPU_CLAIM.search(remainder))
+    if _GPU_CLAIM.search(remainder):
+        return True
+    return any(_PROBE_DETAIL_CLAIM.search(d) for d in details)
 
 # The ``device: <name>`` token a device message opens with, if any.
 _DEVICE_TOKEN = re.compile(r"device:\s*([A-Za-z0-9_-]+)")

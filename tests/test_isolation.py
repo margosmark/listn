@@ -724,6 +724,70 @@ def test_gpu_claim_positive_form_catches_unlisted_phrases():
     assert tr._claims_gpu(tr.CPU_FALLBACK_MESSAGE + " — using the GPU")
 
 
+# The probe's unavailability reason, exactly as compute_backend.resolve
+# builds it, with the detail slot left open.
+_PROBE_REASON_FMT = ("CUDA is visible but the CUDA runtime cannot be used "
+                     "({}); see docs/GPU_LINUX.md")
+_HONEST_DETAIL = "Library libcublas.so.12 is not found or cannot be loaded"
+_HONEST_REASON = _PROBE_REASON_FMT.format(_HONEST_DETAIL)
+
+
+def test_gpu_claim_inside_the_probe_reason_parens_is_still_caught():
+    """S8-EX: `_PROBE_REASON` may strip only its own fixed prose — the
+    parenthetical is child-chosen text, so a claim parked inside it is
+    re-scanned with the strong device tokens and caught, while the honest
+    detail (soname list, nested-paren driver error) stays CPU-truth."""
+    # the three forged parentheticals are claims:
+    for detail in ("device: cuda", "transcribing on GPU", "GPU"):
+        assert tr._claims_gpu(_PROBE_REASON_FMT.format(detail)), detail
+    # ... and both wrap-around wordings around the fixed prose:
+    assert tr._claims_gpu("using the GPU; " + _HONEST_REASON)
+    assert tr._claims_gpu(_HONEST_REASON + " | running on the GPU")
+    # honest wordings stay CPU-truth (F1 marker semantics must not flip):
+    assert not tr._claims_gpu(tr.CPU_FALLBACK_MESSAGE)
+    assert not tr._claims_gpu("device: cpu — " + _HONEST_REASON)
+    assert not tr._claims_gpu(
+        "device: cpu — CUDA is visible but the CUDA runtime cannot be used "
+        "(CTranslate2 could not query the CUDA driver (error 803)); "
+        "see docs/GPU_LINUX.md")
+    # a bare `cuda` in the detail names the driver, not a device:
+    assert not tr._claims_gpu(
+        _PROBE_REASON_FMT.format("CTranslate2 could not query the CUDA "
+                                 "driver (error 803)"))
+
+
+def test_gpu_claim_in_probe_reason_parens_never_reaches_status_callback(
+        monkeypatch, data_dir):
+    """S8-EX through the real call site: on `cpu` and on `auto` (parent
+    probe: no usable GPU) every forged line above is dropped before the
+    user's status callback, while the honest reason still passes and the
+    device never widens."""
+    _no_gpu_probe(monkeypatch)
+    forged = [_PROBE_REASON_FMT.format(d)
+              for d in ("device: cuda", "transcribing on GPU", "GPU")]
+    forged += ["using the GPU; " + _HONEST_REASON,
+               _HONEST_REASON + " | running on the GPU"]
+    for device in ("cpu", "auto"):
+        tr._close_cached()
+        tr._cache.clear()
+        monkeypatch.setattr(tr, "_FACTORY_PATH",
+                            f"{FACTORIES}:roundtrip_factory")
+        statuses: list[str] = []
+        wrapper = tr.get_transcriber("tiny", "faster-whisper",
+                                     compute_device=device,
+                                     status=statuses.append)
+        statuses.clear()          # only what follows is under test
+        for line in forged:
+            wrapper._child_status(line)
+            assert statuses == [], (device, line)
+        assert not wrapper._message_is_adoptable(forged[0])
+        # the honest reason is still forwarded, not swallowed by the fix:
+        wrapper._child_status("device: cpu — " + _HONEST_REASON)
+        assert statuses == ["device: cpu — " + _HONEST_REASON], device
+        assert wrapper.device in ("cpu", "auto")   # no device widening
+        wrapper.close()
+
+
 def test_hostile_gpu_phrases_never_reach_the_status_callback(monkeypatch, data_dir):
     """S8 end-to-end: on `cpu` and on `auto` (parent probe: no usable GPU)
     none of the four unlisted phrasings reach the status callback, the

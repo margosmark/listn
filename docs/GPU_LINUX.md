@@ -70,6 +70,10 @@ status line and device message alike) — under the default `auto` the
 claim must also match this machine's own capability probe. The canonical
 CPU-fallback note is the exception that proves the rule: it names CUDA as
 the reason the build is on CPU, so it stays CPU-truth, never a GPU claim.
+The probe's own unavailability reason is exempt only in its fixed wording:
+its parenthetical detail is scanned like any other text, so a claim
+parked inside it is dropped too — only a bare `cuda` there stays exempt,
+because that is how the honest detail names the driver it could not query.
 `tests/test_isolation.py` simulates each case, including those bounds and
 claims.
 
