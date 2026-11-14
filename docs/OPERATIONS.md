@@ -6,7 +6,7 @@ The supported installation and management commands are in [README](../README.md)
 
 ## Python development
 
-The project declares Python `>=3.10,<3.14` and uses `uv.lock`. From the repository root, with `uv` installed:
+The project declares Python `>=3.11,<3.14` and uses `uv.lock`. From the repository root, with `uv` installed:
 
 ```sh
 uv sync --group dev
