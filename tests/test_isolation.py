@@ -456,8 +456,14 @@ def test_child_fallback_note_is_not_adopted_on_a_cpu_request(
 
 def test_child_canonical_note_for_a_narrowed_auto_build_is_adopted(
         monkeypatch, data_dir):
-    """The control for S2/S3: an honest auto->CPU narrowing keeps its note
-    and its message exactly as the probe reported them."""
+    """The control for S2/S3/S2r: an honest auto->CPU narrowing keeps its
+    note and its message exactly as the probe reported them.
+
+    S2r: the note is adopted only when THIS parent's own probe narrowed
+    auto->cpu too, so the parent-side probe seams are pinned to the
+    visible-but-broken-GPU machine that produces a narrowing.
+    """
+    _narrowed_gpu_probe(monkeypatch)
     monkeypatch.setattr(tr, "_FACTORY_PATH",
                         f"{FACTORIES}:narrowed_cpu_note_factory")
     statuses = []
@@ -484,4 +490,180 @@ def test_kind_device_runtime_fault_is_not_relabelled_as_cpu_fallback(
     assert "out of memory" in str(excinfo.value)
     assert statuses == []  # nothing was announced as a CPU fallback
     assert tr._cache == {}  # no fallback build, nothing cached
+
+
+# --- S1r: the send path is bounded too ---------------------------------------
+
+def _wait_until_stopped(pid: int, timeout: float = 10.0) -> bool:
+    """True once the child has SIGSTOPped itself (Linux /proc state)."""
+    status_path = f"/proc/{pid}/status"
+    if not os.path.exists(status_path):
+        time.sleep(2.5)  # no /proc (macOS): trust the factory's 1.5 s timer
+        return True
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with open(status_path) as fh:
+                state = fh.read().split("State:")[1].split("\n")[0].strip()
+        except (OSError, IndexError):
+            return False
+        if state.startswith("T"):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_send_path_is_bounded_when_child_stops_reading(monkeypatch, data_dir):
+    """S1r: a child that stops reading the request pipe OUTSIDE an active
+    request (SIGSTOP after load) must not wedge the caller in os.write on
+    a payload larger than the pipe buffer: the send is bounded too — one
+    clean error, the lock released, a second job not stuck behind it, and
+    no orphan worker left behind."""
+    monkeypatch.setattr(tr, "_REQUEST_IDLE_TIMEOUT", 3.0)
+    pids = _spy_worker_pids(monkeypatch)
+    wrapper = _iso("freeze_between_factory", "cpu", monkeypatch, data_dir)
+    assert _wait_until_stopped(pids[-1]), "the child never froze between requests"
+    big = np.full(16000 * 16, 0.1, dtype=np.float32)  # 1 MB ≫ 64 KB pipe
+    start = time.monotonic()
+    errors = []
+    try:
+        wrapper.transcribe(big, language="en")
+    except BaseException as exc:  # noqa: BLE001
+        errors.append(exc)
+    elapsed = time.monotonic() - start
+    message = str(errors[0]) if errors else ""
+    assert elapsed < 12.0  # bounded: the old code blocked in os.write forever
+    assert errors, "the wedged send must fail, not return segments"
+    assert "stopped responding" in message
+    assert "while transcribing" in message
+    assert "Traceback" not in message
+    assert not wrapper._lock.locked()  # the caller released the lock
+    assert wrapper._session is None    # the wedged session was torn down
+    # a second job must not queue behind the wedged one
+    start2 = time.monotonic()
+    with pytest.raises(RuntimeError):
+        wrapper.transcribe(_audio(), language="en")
+    assert time.monotonic() - start2 < 5.0
+    wrapper.close()
+    assert pids and all(not _worker_alive(pid) for pid in pids)  # no orphan
+
+
+# --- S2r: on `auto` the child is not the device authority ---------------------
+
+def _no_gpu_probe(monkeypatch) -> None:
+    """Pin the parent-side probe seams to a machine with no usable GPU."""
+    monkeypatch.setattr(tr, "cuda_device_count", lambda: 0)
+    monkeypatch.setattr(
+        tr.compute_backend, "rocm_capability",
+        lambda: tr.compute_backend.Capability(
+            "rocm", False, "no AMD GPU and no ROCm runtime are visible "
+            "on this machine", "use --compute-device cpu or auto"))
+
+
+def _narrowed_gpu_probe(monkeypatch) -> None:
+    """Pin the parent-side seams to a visible-but-broken CUDA GPU: auto
+    narrows to CPU with the canonical reason (the CachyOS laptop)."""
+    monkeypatch.setattr(tr, "cuda_device_count", lambda: 1)
+    monkeypatch.setattr(
+        tr, "cuda_runtime_ready",
+        lambda *a, **k: (False,
+                         "libcublas.so.12: cannot open shared object file"))
+    monkeypatch.setattr(
+        tr.compute_backend, "rocm_capability",
+        lambda: tr.compute_backend.Capability(
+            "rocm", False, "no AMD GPU and no ROCm runtime are visible "
+            "on this machine", "use --compute-device cpu or auto"))
+
+
+def test_auto_hostile_gpu_claim_is_dropped_without_a_usable_parent_gpu(
+        monkeypatch, data_dir):
+    """S2r/C5: on the default device (auto) a child claiming cuda — in its
+    device, its device line AND a status event — has all of it dropped when
+    this parent's own probe sees no usable GPU. The job still runs."""
+    _no_gpu_probe(monkeypatch)
+    monkeypatch.setattr(tr, "_FACTORY_PATH", f"{FACTORIES}:gpu_claim_factory")
+    statuses = []
+    wrapper = tr.get_transcriber("tiny", "faster-whisper",
+                                 compute_device="auto", status=statuses.append)
+    segments = [s.text for s in wrapper.transcribe(_audio(), language="en")]
+    assert segments == ["ran where it was told"]  # the job still ran
+    assert wrapper.device == "auto"  # claim dropped: the parent's decision stands
+    assert "cuda" not in wrapper.device_message.lower()
+    assert wrapper.status_note is None
+    assert not any("cuda" in s.lower() or "gpu" in s.lower()
+                   for s in statuses)  # neither status event nor announcement
+    wrapper.close()
+
+
+def test_auto_fabricated_fallback_note_is_dropped_without_parent_narrowing(
+        monkeypatch, data_dir):
+    """S2r/C6: a child fabricating the canonical CPU-fallback note — as
+    the response's status_note AND as a status event — on a host whose own
+    probe did NOT narrow auto->cpu has both channels dropped. The job runs."""
+    _no_gpu_probe(monkeypatch)
+    monkeypatch.setattr(tr, "_FACTORY_PATH", f"{FACTORIES}:auto_note_factory")
+    statuses = []
+    wrapper = tr.get_transcriber("tiny", "faster-whisper",
+                                 compute_device="auto", status=statuses.append)
+    segments = [s.text for s in wrapper.transcribe(_audio(), language="en")]
+    assert segments == ["on cpu"]
+    assert wrapper.status_note is None               # fabricated note dropped
+    assert tr.CPU_FALLBACK_MESSAGE not in statuses   # and never announced
+    wrapper.close()
+
+
+def test_auto_hostile_status_event_is_dropped_without_a_usable_parent_gpu(
+        monkeypatch, data_dir):
+    """S2r/C7: a hostile status event alone (the response itself claims
+    nothing) must not reach the status callback under auto on a host whose
+    parent-side probe sees no usable GPU."""
+    _no_gpu_probe(monkeypatch)
+    monkeypatch.setattr(tr, "_FACTORY_PATH", f"{FACTORIES}:auto_status_factory")
+    statuses = []
+    wrapper = tr.get_transcriber("tiny", "faster-whisper",
+                                 compute_device="auto", status=statuses.append)
+    segments = [s.text for s in wrapper.transcribe(_audio(), language="en")]
+    assert segments == ["ok"]
+    assert wrapper.device == "auto"  # the response itself claimed nothing
+    assert not any("cuda" in s.lower() or "gpu" in s.lower()
+                   for s in statuses)
+    wrapper.close()
+
+
+def test_auto_gpu_claim_is_adopted_when_the_parent_probe_sees_a_usable_gpu(
+        monkeypatch, data_dir):
+    """The other side of S2r: under auto a cuda claim is ADOPTED when this
+    parent's own probe corroborates a usable GPU — the cross-check must not
+    blanket-ban GPU claims."""
+    monkeypatch.setattr(tr, "cuda_device_count", lambda: 2)
+    monkeypatch.setattr(tr, "cuda_runtime_ready", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(tr, "_FACTORY_PATH", f"{FACTORIES}:gpu_claim_factory")
+    statuses = []
+    wrapper = tr.get_transcriber("tiny", "faster-whisper",
+                                 compute_device="auto", status=statuses.append)
+    segments = [s.text for s in wrapper.transcribe(_audio(), language="en")]
+    assert segments == ["ran where it was told"]
+    assert wrapper.device == "cuda"  # corroborated by the parent's own probe
+    assert "cuda" in wrapper.device_message.lower()
+    wrapper.close()
+
+
+def test_cpu_request_never_runs_the_parent_auto_probe(monkeypatch, data_dir):
+    """S2r blast guard: the parent-side auto probe must never fire for an
+    explicit `cpu` ask — `cpu` never probes (it could only ever corroborate
+    a GPU claim, which cpu never accepts)."""
+    def boom(*_args, **_kwargs):
+        raise AssertionError("the parent must not probe for compute_device=cpu")
+    monkeypatch.setattr(tr, "cuda_device_count", boom)
+    monkeypatch.setattr(tr, "cuda_runtime_ready", boom)
+    monkeypatch.setattr(tr.compute_backend, "rocm_capability", boom)
+    monkeypatch.setattr(tr, "_FACTORY_PATH", f"{FACTORIES}:gpu_claim_factory")
+    statuses = []
+    wrapper = tr.get_transcriber("tiny", "faster-whisper",
+                                 compute_device="cpu", status=statuses.append)
+    segments = [s.text for s in wrapper.transcribe(_audio(), language="en")]
+    assert segments == ["ran where it was told"]
+    assert wrapper.device == "cpu"
+    assert not any("cuda" in s.lower() or "gpu" in s.lower() for s in statuses)
+    wrapper.close()
 

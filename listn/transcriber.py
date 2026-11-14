@@ -693,6 +693,14 @@ class _BackendError(RuntimeError):
 # within the bound and the request fails with a clean error instead of
 # blocking the caller, the engine's single job-worker thread, or close().
 #
+# The bound also covers writing the request (S1r): a child that stopped
+# reading the request pipe *outside* an active request (wedged native
+# thread after load, cgroup freeze, SIGSTOP) blocks `os.write` on any
+# payload larger than the 64 KB pipe buffer with no deadline armed — the
+# frames are therefore written by a helper thread joined against a
+# deadline armed before the header goes out, so such a child is stopped
+# too instead of wedging the caller in the send path.
+#
 # load gets a much longer bound than inference because a first-run model
 # download is silent for as long as it takes; engine file jobs stream
 # progress frames, and live chunks are short, so inference never needs it.
@@ -741,7 +749,10 @@ class _WorkerSession:
 
     The response pipe is drained by a dedicated reader thread into a queue,
     so no caller ever blocks on pipe I/O itself (S1): ``request`` only ever
-    waits on the queue, with a deadline.
+    waits on the queue, with a deadline. The write side is bounded too
+    (S1r): frames go out through a helper thread joined against a deadline
+    armed before the header, so a child that stopped reading the request
+    pipe cannot block the caller in ``os.write`` either.
     """
 
     def __init__(self, proc, to_child: Connection, from_child: Connection,
@@ -837,26 +848,33 @@ class _WorkerSession:
         never as a partial result, because the final answer is the only
         thing this method returns.
 
-        Every request is bounded (S1). ``timeout`` caps how long the child
-        may stay silent: each frame from it resets the clock, so a slow but
-        answering worker is never killed, while one that stops answering
-        entirely is terminated and reaped within the bound of its last
-        frame and the request fails with a clean :class:`_ChildDied` —
-        never an indefinite block of the caller, the engine's job-worker
-        thread, or ``close()``. When not given, the bound follows the op
-        (``load`` includes first-run downloads, so it is the longer one).
+        Every request is bounded (S1/S1r). ``timeout`` caps how long the
+        child may stay silent: each frame from it resets the clock, so a
+        slow but answering worker is never killed, while one that stops
+        answering entirely is terminated and reaped within the bound of
+        its last frame and the request fails with a clean
+        :class:`_ChildDied` — never an indefinite block of the caller,
+        the engine's job-worker thread, or ``close()``. The bound starts
+        before the request is written, so a child that stopped reading
+        the request pipe is stopped too instead of blocking the caller in
+        ``os.write`` with no deadline armed. When not given, the bound
+        follows the op (``load`` includes first-run downloads, so it is
+        the longer one).
         """
         if timeout is None:
             timeout = (_LOAD_IDLE_TIMEOUT if header.get("op") == "load"
                        else _REQUEST_IDLE_TIMEOUT)
         try:
-            self._to.send_bytes(json.dumps(header).encode("utf-8"))
+            frames: list = [json.dumps(header).encode("utf-8")]
             if payload is not None:
                 view = payload if isinstance(payload, (bytes, bytearray)) \
                     else memoryview(payload).cast("B")
-                self._to.send_bytes(view)
+                frames.append(view)
         except (OSError, ValueError) as exc:
             raise _ChildDied(self.death_detail()) from exc
+        # S1r: the deadline that bounds this request starts BEFORE the
+        # request is written, not after — see _send_bounded.
+        self._send_bounded(frames, timeout)
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -882,6 +900,67 @@ class _WorkerSession:
                 on_status(message.get("message"))
             elif event == "progress" and on_progress:
                 on_progress(float(message.get("value") or 0.0))
+
+    def _send_bounded(self, frames, timeout: float) -> None:
+        """Write every frame of one request within ``timeout`` seconds (S1r).
+
+        ``send_bytes`` blocks in ``os.write`` once the payload outgrows the
+        pipe buffer (64 KB), and a child that stopped reading the request
+        pipe *outside* an active request — a wedged native thread after
+        load, a cgroup freeze, SIGSTOP — would hold the caller (and the
+        lock it owns) forever with no deadline armed: the silence deadline
+        was only ever armed after the send. The frames are therefore
+        written by a helper thread joined against a deadline armed at
+        entry, and on expiry the child is stopped (which fails the blocked
+        write with EPIPE so the helper can unwind) and the request fails
+        with one clean error. The read side keeps its silence deadline,
+        unchanged.
+        """
+        deadline = time.monotonic() + timeout
+        outcome: dict[str, BaseException] = {}
+
+        def sender() -> None:
+            try:
+                for frame in frames:
+                    self._to.send_bytes(frame)
+            except BaseException as exc:  # noqa: BLE001 - reported to caller
+                outcome["exc"] = exc
+
+        helper = threading.Thread(target=sender, name="worker-request-send",
+                                  daemon=True)
+        helper.start()
+        helper.join(max(0.0, deadline - time.monotonic()))
+        if helper.is_alive():
+            raise self._send_timeout_death(timeout, helper)
+        exc = outcome.get("exc")
+        if isinstance(exc, (OSError, ValueError)):
+            raise _ChildDied(self.death_detail()) from exc
+        if exc is not None:
+            raise exc
+
+    def _send_timeout_death(self, timeout: float,
+                            helper: threading.Thread) -> _ChildDied:
+        """S1r: the child stopped reading the request pipe — stop it now.
+
+        The worker is killed FIRST (SIGKILL: a frozen or wedged child
+        ignores SIGTERM), which closes its end of the pipe and fails the
+        helper's blocked ``os.write`` with EPIPE so the helper can unwind;
+        only then is the session torn down — never closing the connection
+        out from under a live writer — and the request reports the send
+        bound as the reason it failed.
+        """
+        proc = self.proc
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        helper.join(timeout=5)   # EPIPE releases the blocked write
+        self.close()
+        return _ChildDied(
+            f"stopped responding (the request could not be delivered "
+            f"within {timeout:g}s)")
 
     def _timeout_death(self, timeout: float) -> _ChildDied:
         """S1: the child went silent for the whole bound — stop it now.
@@ -950,6 +1029,10 @@ class IsolatedTranscriber(Transcriber):
         self._session: _WorkerSession | None = None
         self._loaded = False
         self._device: str | None = None
+        # S2r: what this parent's own probe says `auto` resolves to on this
+        # machine — computed once per wrapper on first use, see
+        # _parent_auto_plan.
+        self._parent_plan: Plan | None = None
         self._notes: list[str] = []
         self._fatal: tuple[type[BaseException], str] | None = None
         self.device_message = "device: unknown"
@@ -1000,21 +1083,67 @@ class IsolatedTranscriber(Transcriber):
             self.device_message += " — " + "; ".join(self._notes)
 
     # -- what the child may claim (S2) ------------------------------------
+    def _parent_auto_plan(self) -> Plan:
+        """What this parent's own probe says ``auto`` resolves to here (S2r).
+
+        Under ``auto`` the child must not be the device authority: before a
+        GPU claim, a GPU status line or a CPU-fallback note it reports is
+        believed, the parent re-runs the same subprocess-based probe the
+        in-process build uses (:func:`_resolve_plan` — ``cuda_device_count``,
+        ``cuda_runtime_ready`` and the ROCm check all run in a child
+        process, so no native module is ever loaded here). Computed once
+        per wrapper; the seams are the module's own, so tests pin them
+        exactly like the in-process path does. A probe that sees no usable
+        GPU answers ``gpu_active == False`` and a probe that did not
+        narrow answers ``device != "cpu"`` — both drop the child's claim
+        rather than believe it.
+        """
+        if self._parent_plan is None:
+            self._parent_plan = _resolve_plan("auto")
+        return self._parent_plan
+
+    def _gpu_line_allowed(self, target: str) -> bool:
+        """May a line claiming GPU use pass for this device decision (S2r)?
+
+        ``cpu`` never — the parent chose CPU and a GPU line contradicts it.
+        An explicit ``cuda``/``rocm`` ask, or a claim the parent's own
+        probe corroborated under ``auto``, yes. Under ``auto`` without a
+        usable GPU in the parent's probe, no: the child would be inventing
+        the device it is running on.
+        """
+        if target == "cpu":
+            return False
+        if target in ("cuda", "rocm"):
+            return True
+        return self._parent_auto_plan().gpu_active
+
     def _adopt_device_claim(self, claimed: str) -> str:
         """A worker answer may only confirm the parent's device decision.
 
         ``cpu`` (asked for, or pinned after a crash) must come back as
         ``cpu``; an explicit ``cuda``/``rocm`` ask must come back as that
-        same GPU; ``auto`` accepts whatever the build resolved. Anything
-        else is a contradiction: the claim is dropped, the parent's
-        decision stands, and the mismatch is logged — a hostile or broken
-        child can never talk the parent onto a device it did not choose.
+        same GPU; ``auto`` accepts its own decision and ``cpu`` (neither
+        ever widens) and a GPU only when this parent's own probe
+        corroborates a usable GPU (S2r) — the child runs the same resolve
+        on the same machine, but it does not get to be the sole device
+        truth on the default setting. Anything else is a contradiction:
+        the claim is dropped, the parent's decision stands, and the
+        mismatch is logged — a hostile or broken child can never talk the
+        parent onto a device it did not choose.
         """
         want = self._effective_device
         if want == "cpu":
             accepted = claimed == "cpu"
         elif want == "auto":
-            accepted = claimed in ("auto", "cpu", "cuda", "rocm")
+            if claimed in ("auto", "cpu"):
+                accepted = True   # the parent's own decision, or narrower
+            else:
+                # S2r: a GPU claim under auto must be corroborated by this
+                # parent's own probe of this machine.
+                plan = self._parent_auto_plan()
+                accepted = bool(plan.gpu_active) and (
+                    claimed == plan.kind
+                    or (plan.kind == "rocm" and claimed == "cuda"))
         else:
             # CTranslate2's device API names every GPU "cuda", so a ROCm
             # build may legitimately answer "cuda" for a "rocm" ask.
@@ -1032,12 +1161,21 @@ class IsolatedTranscriber(Transcriber):
         ``auto`` build that resolved to CPU. A ``cpu`` ask never fell back,
         an explicit GPU ask never falls back, and a note this parent wrote
         itself (the crash pin) is never overwritten by a later answer.
+        S2r adds the parent's own word: under ``auto`` the note must also
+        describe a narrowing THIS parent's probe made — a child whose
+        machine the parent's probe did not narrow is fabricating it.
         """
         if self._notes or self._effective_device != "auto":
             return False
         if self._device not in (None, "cpu"):
             return False
-        return not _GPU_CLAIM.search(note)  # a note may not claim a GPU
+        if _GPU_CLAIM.search(note):
+            return False   # a note may not claim a GPU
+        if self._parent_auto_plan().device != "cpu":
+            log.warning("dropped a worker status note the parent's own "
+                        "probe did not narrow for: %r", note)
+            return False
+        return True
 
     def _message_is_adoptable(self, message: str) -> bool:
         """The worker's ``device: …`` line may not contradict our decision."""
@@ -1048,9 +1186,9 @@ class IsolatedTranscriber(Transcriber):
                         "(compute device is %r): %r",
                         token.group(1), target, message)
             return False
-        if target == "cpu" and _GPU_CLAIM.search(message):
+        if _GPU_CLAIM.search(message) and not self._gpu_line_allowed(target):
             log.warning("dropped a worker device message claiming GPU use "
-                        "while compute device is 'cpu': %r", message)
+                        "(compute device is %r): %r", target, message)
             return False
         return True
 
@@ -1059,17 +1197,25 @@ class IsolatedTranscriber(Transcriber):
 
         A worker asked to run on CPU — or pinned to it after a crash — can
         never announce GPU acceleration to the user (S2): such a line is
-        dropped. Everything else passes through unchanged: download
-        notices, truthful ``device: …`` lines, the canonical CPU-fallback
-        note.
+        dropped. Under ``auto`` the same line is dropped unless this
+        parent's own probe saw a usable GPU (S2r), and a CPU-fallback note
+        is forwarded only when the parent's own probe narrowed too.
+        Everything else passes through unchanged: download notices,
+        truthful ``device: …`` lines.
         """
         if message is None:
             return
         text = str(message)
         target = self._device or self._effective_device
-        if target == "cpu" and _GPU_CLAIM.search(text):
+        if _GPU_CLAIM.search(text) and not self._gpu_line_allowed(target):
             log.warning("dropped a worker status line claiming GPU use while "
-                        "compute device is 'cpu': %r", text)
+                        "compute device is %r: %r", target, text)
+            return
+        if (self._effective_device == "auto" and CPU_FALLBACK_MESSAGE in text
+                and not self._note_is_adoptable(text)):
+            log.warning("dropped a worker status line announcing a CPU "
+                        "fallback the parent's own probe did not narrow "
+                        "for: %r", text)
             return
         if self._notify:
             self._notify(text)
