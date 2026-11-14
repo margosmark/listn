@@ -491,7 +491,7 @@ def test_launcher_keeps_state_in_the_user_home():
 def test_launcher_gates_the_safe_path_flag_on_the_python_floor():
     """F2: neither ``-P`` nor ``PYTHONSAFEPATH`` exists on Python 3.10.
 
-    The floor in pyproject.toml is 3.10, so the launcher probes the
+    The floor in pyproject.toml is 3.11, so the launcher still probes the
     interpreter it is about to ``exec`` and falls back to a runpy shim —
     byte-identical to the one ``listn/autostart.py`` renders into its Exec
     line, so the two shipped launch paths cannot drift apart.

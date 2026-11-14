@@ -34,7 +34,7 @@ The menu bar app does not transcribe. It feeds audio to the Python engine, which
 The existing Python engine and local web library can run on Linux. This is an
 initial file-transcription workflow, not macOS feature parity. It has been
 exercised on Linux with synthetic speech, not on CachyOS or physical audio
-hardware. Install Python 3.10–3.13, `uv`, and the PortAudio system library
+hardware. Install Python 3.11–3.13, `uv`, and the PortAudio system library
 (on Arch/CachyOS, package `portaudio`), then:
 
 ```sh
@@ -227,7 +227,7 @@ pacman installs the project tree in `/usr/share/listn`, the launcher in
 `/usr/bin/listn`, and the menu entry with its icon. The launcher lets `uv`
 build **your** environment on first run from the shipped `uv.lock`, into
 `~/.local/share/listn/env`: that run downloads the locked dependencies once
-(and a Python 3.10–3.13 interpreter only if the system one is outside
+(and a Python 3.11–3.13 interpreter only if the system one is outside
 listn's supported range — the same thing `uv sync` does); afterwards it runs
 locally, and no state outside `$HOME` is ever written. Declared depends:
 `python`, `uv`, `portaudio`, `pipewire`, `wireplumber`; the optional `tray`
@@ -346,7 +346,7 @@ scripts/listn-manage.sh uninstall --purge-models     # also deletes ~/.cache/hug
 
 `scripts/listn-manage.sh first-run` does all of this. These are the manual steps.
 
-You need Python 3.10–3.13, Swift 6 (the Command Line Tools are enough; a full Xcode install is not), and [Homebrew](https://brew.sh). This was written for Apple Silicon. An M5 Pro with 48 GB is plenty for the default live model.
+You need Python 3.11–3.13, Swift 6 (the Command Line Tools are enough; a full Xcode install is not), and [Homebrew](https://brew.sh). This was written for Apple Silicon. An M5 Pro with 48 GB is plenty for the default live model.
 
 ```bash
 brew install uv
