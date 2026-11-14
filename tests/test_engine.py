@@ -1,3 +1,5 @@
+import shutil
+import threading
 import time
 import wave
 
@@ -72,6 +74,33 @@ def test_live_without_saving_audio(engine):
     wait_for(lambda: s.segments)
     engine.stop_live(wait=True)
     assert engine.library.audio_path(engine.library.get(s.meta.id)) is None
+
+
+def test_finalization_survives_a_session_dir_removed_before_the_save(engine):
+    """``listn-finish`` must not die when its session dir is already gone.
+
+    The ``data_dir`` fixture rmtree's its sandbox while that thread may
+    still be saving (and a user can delete a session the same way). An
+    unhandled FileNotFoundError there strands the session in ``finishing``,
+    drops the transcript and surfaces as a PytestUnhandledThreadExceptionWarning.
+    """
+    s = engine.start_live(Settings(device="BlackHole", save_audio=False, chunk_seconds=2.0))
+    wait_for(lambda: s.segments)
+    session_dir = engine.library.session_path(s.meta.id)
+    shutil.rmtree(session_dir)
+
+    caught = []
+    previous_hook = threading.excepthook
+    threading.excepthook = lambda args: caught.append(args)
+    try:
+        engine.stop_live(wait=True)          # joins the finisher thread
+    finally:
+        threading.excepthook = previous_hook
+
+    assert caught == [], [f"{a.thread.name}: {a.exc_value}" for a in caught]
+    assert s.state == "done"                 # finalization ran to the end
+    assert s.meta.status == "done"
+    assert not session_dir.exists()          # the save was dropped, not resurrected
 
 
 def test_bad_device_marks_session_error(engine):

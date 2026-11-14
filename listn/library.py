@@ -10,6 +10,7 @@ Layout under the data directory::
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -24,6 +25,8 @@ from listn.config import data_dir
 AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aac", ".mp4", ".mov", ".webm", ".aiff", ".aif"}
 EXPORT_FORMATS = ("txt", "md", "srt", "vtt", "json")
 _ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$")
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -157,8 +160,20 @@ class Library:
     @staticmethod
     def _write_json(path: Path, data) -> None:
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-        tmp.replace(path)
+        try:
+            tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+            tmp.replace(path)
+        except FileNotFoundError:
+            # The session directory can vanish under the writer: a user
+            # deletes the session, or a caller tears its sandbox down while
+            # ``listn-transcribe``/``listn-finish`` are still saving on their
+            # own threads. There is nowhere to put the data, so drop the save
+            # with a log — raising would kill that thread unhandled, stranding
+            # the session in "finishing" and losing the rest of the write.
+            if path.parent.exists():
+                raise
+            log.warning("Session directory %s vanished; dropped %s",
+                        path.parent, path.name)
 
     def create(self, title: str, source: str, **kwargs) -> SessionMeta:
         with self._lock:
