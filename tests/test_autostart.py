@@ -486,17 +486,23 @@ def test_launcher_argv_prefers_the_running_console_script(tmp_path, monkeypatch)
     monkeypatch.setenv("PATH", str(tmp_path))
     assert autostart.launcher_argv() == [str(exe)]
 
-    # `python -m listn` relaunches the same way, but never with the login
-    # cwd ahead of the real package on sys.path (F2): -P on >= 3.11, the
-    # runpy shim on the 3.10 floor.
+    # `python -m listn` relaunches the same way: `env PYTHONPATH=` carries the
+    # running package's own source root (the packaged venv is synced with
+    # --no-install-project and holds only the dependencies, and a login
+    # session has no PYTHONPATH — without the prefix the entry dies with
+    # ModuleNotFoundError), and the login cwd never lands ahead of the real
+    # package on sys.path (F2): -P on >= 3.11, the runpy shim on 3.10.
     main_py = tmp_path / "site" / "listn" / "__main__.py"
     main_py.parent.mkdir(parents=True)
     main_py.write_text("import sys\n", encoding="utf-8")
     monkeypatch.setattr(sys, "argv", [str(main_py), "ui"])
+    prefix = [autostart.ENV_PROGRAM, f"PYTHONPATH={autostart.source_root()}"]
     if sys.version_info >= (3, 11):
-        assert autostart.launcher_argv() == [sys.executable, "-P", "-m", "listn"]
+        assert autostart.launcher_argv() == [
+            *prefix, sys.executable, "-P", "-m", "listn"]
     else:
-        assert autostart.launcher_argv() == [sys.executable, "-c", autostart.SAFE_RUN_SHIM]
+        assert autostart.launcher_argv() == [
+            *prefix, sys.executable, "-c", autostart.SAFE_RUN_SHIM]
 
     # A non-listn argv[0] (pytest, an interpreter) never lands in Exec: the
     # listn command on PATH wins, and the bare command name is the last resort.
@@ -545,6 +551,33 @@ def test_safe_module_argv_gates_on_the_python_floor(monkeypatch):
     compile(autostart.SAFE_RUN_SHIM, "<safe-run-shim>", "exec")
 
 
+def test_module_argv_carries_the_running_source_root_on_pythonpath():
+    """The packaged venv never contains the project itself.
+
+    ``uv sync --no-install-project`` (``packaging/arch/listn-launcher.sh``:
+    a read-only ``/usr/share/listn`` cannot be built into a wheel) puts only
+    the *dependencies* into ``~/.local/share/listn/env``, and the desktop
+    session runs the login entry with no ``PYTHONPATH`` — so the entry must
+    carry the root of the package that was running when the toggle flipped,
+    the way the launcher exports it, or ``python -m listn`` cannot import
+    ``listn`` at all at login.
+    """
+    root = Path(autostart.source_root())
+    assert root.is_absolute() and root == root.resolve()   # stable: no cwd drift
+    assert (root / "listn" / "__init__.py").is_file()      # importable from here alone
+    # Derived from this module's own location — the package actually running.
+    assert root == Path(autostart.__file__).resolve().parent.parent
+    # env + PYTHONPATH lead; the safe invocation (F2) follows unchanged.
+    for version, safe in (((3, 11, 0, "final", 0),
+                           ["/venv/bin/python", "-P", "-m", "listn"]),
+                          ((3, 10, 0, "final", 0),
+                           ["/venv/bin/python", "-c", autostart.SAFE_RUN_SHIM])):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(sys, "version_info", version)
+            assert autostart.module_argv("/venv/bin/python") == [
+                autostart.ENV_PROGRAM, f"PYTHONPATH={autostart.source_root()}", *safe]
+
+
 def test_rendered_exec_from_a_planted_home_prints_the_real_version(home, monkeypatch):
     """F2: the login Exec must ignore a planted ``$HOME/listn/`` in its cwd.
 
@@ -584,6 +617,79 @@ def test_rendered_exec_from_a_planted_home_prints_the_real_version(home, monkeyp
     assert "PLANTED_PKG_LOADED_INSTEAD" not in run.stdout + run.stderr
 
 
+@pytest.mark.parametrize("floor", [(3, 11), (3, 10)],
+                         ids=["safe-path-flag", "py310-shim"])
+def test_rendered_packaged_exec_prints_the_real_version_in_a_clean_environment(
+        home, monkeypatch, tmp_path, floor):
+    """The packaged login entry must import listn with no session PYTHONPATH.
+
+    A packaged install builds the per-user venv with ``uv sync
+    --no-install-project``, so listn itself is never in that venv — only the
+    launcher exports ``PYTHONPATH=/usr/share/listn``, and the desktop session
+    runs the rendered entry with no environment of its own: the reported bug
+    is ``ModuleNotFoundError: No module named 'listn'`` at login.
+
+    The entry is rendered the way a packaged install renders it (the venv's
+    interpreter, argv[0] the package's ``__main__.py``), tokenized back with
+    the desktop-entry rules, and executed from a plain ``$HOME`` in an
+    environment with ``PYTHONPATH`` removed — the login-time setup. Control:
+    the entry as it was *before* this fix (same interpreter, no PYTHONPATH)
+    fails with exactly that error; with the fix, the real ``listn
+    <version>`` runs. Both shipped Exec shapes are exercised: ``-P`` (3.11+)
+    and the 3.10 runpy shim.
+    """
+    real_version = tuple(sys.version_info[:2])
+    if floor >= (3, 11) and real_version < (3, 11):
+        pytest.skip("this interpreter is the 3.10 floor: it cannot run -P")
+
+    # The packaged venv, bare: `--no-install-project` means the project (and
+    # every wheel of it) never enters it, only the locked dependencies do —
+    # a fresh venv with nothing in its site-packages models exactly that.
+    env_dir = tmp_path / "packaged-env"
+    made = subprocess.run([sys.executable, "-m", "venv", "--without-pip",
+                           str(env_dir)],
+                          capture_output=True, text=True, timeout=300)
+    assert made.returncode == 0, made.stderr
+    packaged_python = env_dir / "bin" / "python"
+    assert packaged_python.is_file()
+
+    # Render as the packaged install does: its venv interpreter, started via
+    # `python -m listn` (argv[0] is the package's __main__.py), gated the way
+    # the real rendering interpreter would be.
+    main_py = Path(autostart.__file__).resolve().parent / "__main__.py"
+    monkeypatch.setattr(sys, "executable", str(packaged_python))
+    monkeypatch.setattr(sys, "argv", [str(main_py), "tray"])
+    monkeypatch.setattr(sys, "version_info", (*floor, 0, "final", 0))
+
+    argv = decode_exec(autostart.render().split("Exec=", 1)[1].splitlines()[0])
+    assert argv == [*autostart.launcher_argv(), "tray"]
+    assert argv[:2] == [autostart.ENV_PROGRAM,
+                        f"PYTHONPATH={autostart.source_root()}"]
+    argv[-1] = "--version"
+
+    # The login environment: no PYTHONPATH, plain $HOME, cwd = $HOME.
+    clean = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    clean["HOME"] = str(home)
+
+    # Control: the entry as it was before the fix — the same interpreter with
+    # no PYTHONPATH — is exactly the reported failure.
+    control = subprocess.run(
+        [*autostart.safe_module_argv(str(packaged_python)), "--version"],
+        cwd=home, env=clean, capture_output=True, text=True, timeout=120)
+    assert control.returncode != 0, control.stdout
+    # `python -m` reports it through runpy as ImportError, the shim as
+    # ModuleNotFoundError; both carry the same wording as the bug report.
+    assert "No module named" in control.stderr and "listn" in control.stderr, \
+        control.stderr
+
+    # The rendered entry runs in exactly that environment and prints the
+    # real version of the package that was running when it was rendered.
+    run = subprocess.run(argv, cwd=home, env=clean, capture_output=True, text=True,
+                         timeout=120)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip() == f"listn {__version__}"
+
+
 def test_the_rendered_module_entry_validates_as_a_desktop_entry(tmp_path, monkeypatch):
     """The -P/shim Exec must stay a legal desktop-entry command line."""
     if shutil.which("desktop-file-validate") is None:
@@ -598,6 +704,35 @@ def test_the_rendered_module_entry_validates_as_a_desktop_entry(tmp_path, monkey
     result = subprocess.run(["desktop-file-validate", str(entry)],
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_the_rendered_module_entry_round_trips_through_glib(tmp_path, monkeypatch):
+    """Real GLib must read the `env PYTHONPATH=…` Exec back argv-for-argv.
+
+    The module form now leads with two extra tokens (`env`,
+    `PYTHONPATH=<source root>`), and the `PYTHONPATH=` value travels through
+    both desktop-entry escaping layers like every other argument: GLib's
+    shell_parse_argv has to hand back exactly the argv the entry encodes, or
+    GIO would exec something other than what was written.
+    """
+    interpreters = [c for c in (sys.executable, "/usr/bin/python3") if has_gi(c)]
+    if not interpreters:
+        pytest.skip("PyGObject not installed for any interpreter")
+    main_py = tmp_path / "site" / "listn" / "__main__.py"
+    main_py.parent.mkdir(parents=True)
+    main_py.write_text("import sys\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [str(main_py), "tray"])
+
+    entry = tmp_path / "listn.desktop"
+    entry.write_text(autostart.render(), encoding="utf-8")
+    result = subprocess.run([interpreters[0], "-c", GLIB_PROBE, str(entry)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    data = json.loads(result.stdout)
+    assert "error" not in data, data["error"]          # key-file string layer is valid
+    assert data["argv"] == [*autostart.launcher_argv(), "tray"], data
+    assert data["cmdline"] is not None, data           # GIO still sees a command
+    assert data["cmdline"] == data["exec"], data
 
 
 # ------------------------------------------------------------------ the UI

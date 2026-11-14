@@ -13,7 +13,12 @@ files under ``$HOME``. The Exec line is the running console script plus
 ``tray``, quoted with the desktop-entry rules (no shell ever parses it) and
 carrying no token, transcript or other private data; the ``python -m listn``
 form re-launches with the cwd kept off ``sys.path`` (``-P`` / the 3.10 shim),
-so a stray ``~/listn/`` cannot shadow the packaged code at login.
+so a stray ``~/listn/`` cannot shadow the packaged code at login, and it
+carries the running package's own source root on ``PYTHONPATH``: the
+packaged install syncs the venv with ``--no-install-project`` (the project
+itself never enters it — only the launcher exports PYTHONPATH), and a login
+session runs the entry with no PYTHONPATH of its own, so without that prefix
+``import listn`` dies with ``ModuleNotFoundError`` and no tray ever starts.
 
 macOS is out of scope on purpose: the native menu bar app owns this toggle
 there (AGENTS.md — preserve macOS behaviour), so every entry point here is a
@@ -50,6 +55,14 @@ SAFE_RUN_SHIM = (
     "sys.path[:]=[p for p in sys.path if os.path.realpath(p or os.curdir)!=os.getcwd()];"
     "runpy.run_module('listn',run_name='__main__',alter_sys=True)"
 )
+
+#: How the module form sets ``PYTHONPATH`` for the entry. Desktop-entry
+#: ``Exec`` has no shell (nothing ever parses it), so ``VAR=value cmd`` is
+#: not an assignment but a bogus program name — ``env`` is the portable
+#: program that performs it. Absolute, so it is never resolved through a
+#: session ``PATH`` listn does not choose at login; coreutils ships it in
+#: ``/usr/bin`` on every Linux desktop, and only Linux ever writes this entry.
+ENV_PROGRAM = "/usr/bin/env"
 
 
 class AutostartError(RuntimeError):
@@ -129,14 +142,45 @@ def safe_module_argv(python: str) -> list[str]:
     return [python, "-c", SAFE_RUN_SHIM]
 
 
+def source_root() -> str:
+    """The directory ``import listn`` must search to find what is running now.
+
+    Derived from this module's own file — the package that is executing as
+    the toggle flips — never from the cwd or from ``PYTHONPATH``: whatever
+    was running then is exactly what the login entry must start again
+    (``/usr/share/listn`` on a packaged install, the checkout in development,
+    the venv's ``site-packages`` when the project was installed into it).
+    """
+    return str(Path(__file__).resolve().parent.parent)
+
+
+def module_argv(python: str) -> list[str]:
+    """Full ``Exec`` argv for the ``python -m listn`` form.
+
+    Leads with ``env PYTHONPATH=<source root>`` because the packaged venv
+    only ever holds the *dependencies*: the launcher builds it with
+    ``uv sync --no-install-project`` (a read-only ``/usr/share/listn`` cannot
+    be built into a wheel) and exports ``PYTHONPATH`` itself, while the
+    desktop session runs the entry with no environment of its own — without
+    the prefix, ``python -m listn`` at login raises ``ModuleNotFoundError``
+    and the tray never starts. The variable is set outright, not appended
+    to: the entry carries exactly the tree that was running, and nothing
+    inherited from a session listn does not control. Then
+    :func:`safe_module_argv` (F2: the login cwd stays off ``sys.path``).
+    """
+    return [ENV_PROGRAM, f"PYTHONPATH={source_root()}", *safe_module_argv(python)]
+
+
 def launcher_argv() -> list[str]:
     """How to start the tray again: the console script running right now.
 
     Covers the packaged launcher (``/usr/bin/listn``), a source checkout
     (``uv run listn`` → ``.venv/bin/listn``) and ``python -m listn`` — the
-    ``-m`` form is re-rendered through :func:`safe_module_argv`, never with
-    the login cwd ahead of the real package on ``sys.path``; falls back to
-    the bare ``listn`` command when nothing better is known.
+    ``-m`` form is re-rendered through :func:`module_argv` (the running
+    package's source root on PYTHONPATH, so a venv that was synced with
+    ``--no-install-project`` can still import it at login, plus the cwd kept
+    off ``sys.path`` — F2); falls back to the bare ``listn`` command when
+    nothing better is known.
     """
     argv0 = (sys.argv[0] if sys.argv else "") or ""
     file: Path | None = None
@@ -152,13 +196,13 @@ def launcher_argv() -> list[str]:
         # `python -m listn …` puts the package's __main__.py in argv[0].
         py = _python()
         if py:
-            return safe_module_argv(py)
+            return module_argv(py)
     if file is not None and file.name.startswith("listn"):
         return [str(file)]
     if len(sys.argv) > 2 and sys.argv[1] == "-m" and sys.argv[2].split(".")[0] == "listn":
         py = _python()
         if py:
-            return safe_module_argv(py)
+            return module_argv(py)
     found = shutil.which("listn")
     if found:
         return [found]
