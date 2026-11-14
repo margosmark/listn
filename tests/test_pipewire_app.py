@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from pathlib import Path
 
 import pytest
@@ -125,12 +124,29 @@ def read_argv(fake_pw_app_env) -> list[str]:
     return path.read_text().splitlines() if path.exists() else []
 
 
+def _wait_delivered(recorder, timeout: float = 15.0) -> None:
+    """Wait until both stand-in tracks have delivered audio before stop().
+
+    The report assertions below classify *delivered* audio; a fixed
+    sleep can end the capture before the CPU-starved stand-ins have
+    written their first 0.1 s chunk, and an empty WAV is honestly
+    reported as a failed track (``verdict: None``, ``ok: false``) — a
+    race with the generator, not the report contract under test.
+    """
+    assert wait_for(lambda: all(track.frames > 0
+                                for track in recorder._tracks.values()),
+                    timeout=timeout), (
+        "no audio delivered before stop: "
+        + ", ".join(f"{name}={track.frames}"
+                    for name, track in recorder._tracks.items()))
+
+
 def run_capture(tmp_path, system, mic=MIC, *, out="rec", **kwargs):
     """Record both tracks with an explicit pair of targets; return (report, recorder)."""
     targets = pw.select_targets(pw.parse_graph(app_dump()), system, mic)
     recorder = pw.TwoTrackRecorder(tmp_path / out, targets, **kwargs)
     recorder.start()
-    time.sleep(0.3)
+    _wait_delivered(recorder)
     return recorder.stop(), recorder
 
 
@@ -398,7 +414,7 @@ def test_duplicate_node_name_capture_binds_the_selected_stream_by_serial(
         assert targets.system.node.serial == 156
         recorder = pw.TwoTrackRecorder(tmp_path / f"dup-{selector}", targets)
         recorder.start()
-        time.sleep(0.3)
+        _wait_delivered(recorder)
         report = recorder.stop()
         assert cc.validate_report(report) == []
     lines = read_argv(fake_pw_app_env)
@@ -496,7 +512,7 @@ def test_silent_app_stream_is_reported_silent(fake_pw_app_env, data_dir, tmp_pat
     targets = pw.select_targets(graph, APP_SILENT, MIC)
     recorder = pw.TwoTrackRecorder(tmp_path / "silent", targets)
     recorder.start()
-    time.sleep(0.3)
+    _wait_delivered(recorder)
     report = recorder.stop()
     system = report["tracks"]["system"]
     assert system["verdict"] == "silent"
@@ -525,9 +541,15 @@ def test_record_list_shows_application_streams(fake_pw_app_env, data_dir, capsys
 def test_record_captures_an_application_stream_end_to_end(
         fake_pw_app_env, data_dir, tmp_path, capsys):
     out_dir = tmp_path / "rec"
+    # Audio budget, not a fixed window: the stand-in writes its first
+    # 0.1 s chunk only after interpreter boot, and under CPU saturation
+    # a 0.4 s wall window can close before either track has delivered
+    # anything (empty WAV -> ok=false -> exit 1, observed in the loaded
+    # full-suite sweep). 2.0 s is the same budget test_pipewire.py uses;
+    # the frames>0 assertions below are unchanged.
     rc = cli.main(["record", "--backend", "pipewire",
                    "--system-target", APP_A, "--mic-target", MIC,
-                   "--duration", "0.4", "--out", str(out_dir), "--json"])
+                   "--duration", "2.0", "--out", str(out_dir), "--json"])
     assert rc == 0, capsys.readouterr()
     report = json.loads(capsys.readouterr().out)
     assert cc.validate_report(report) == []

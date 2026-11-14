@@ -200,9 +200,26 @@ def test_pause_is_not_a_capture_source_state():
 # Real reports (stand-in pw-record, synthetic tones) against the contract
 # ---------------------------------------------------------------------------
 
+def _wait_delivered(recorder, timeout: float = 15.0) -> None:
+    """Wait until both stand-in tracks have delivered audio before stop().
+
+    The verdict/ok assertions below classify *delivered* audio; a fixed
+    sleep can end the capture before the CPU-starved stand-ins have
+    written their first 0.1 s chunk, and an empty WAV is honestly
+    reported as a failed track with ``verdict: None`` — a race with the
+    generator, not the contract under test.
+    """
+    assert wait_for(lambda: all(track.frames > 0
+                                for track in recorder._tracks.values()),
+                    timeout=timeout), (
+        "no audio delivered before stop: "
+        + ", ".join(f"{name}={track.frames}"
+                    for name, track in recorder._tracks.items()))
+
+
 def test_real_ok_report_satisfies_contract_and_ok_policy(fake_pw):
     recorder = start_recorder(fake_pw)
-    time.sleep(0.35)
+    _wait_delivered(recorder)
     report = recorder.stop()
     assert cc.validate_report(report) == []
     assert report["ok"] is True
@@ -227,7 +244,7 @@ def test_real_ok_report_satisfies_contract_and_ok_policy(fake_pw):
 def test_real_silent_mic_report_fails_the_ok_policy(fake_pw):
     recorder = start_recorder(fake_pw, targets=make_targets(sys_name="sys.tone",
                                                             mic_name="mic.silent"))
-    time.sleep(0.35)
+    _wait_delivered(recorder)
     report = recorder.stop()
     assert cc.validate_report(report) == []
     assert report["tracks"]["mic"]["verdict"] == "silent"
@@ -240,7 +257,7 @@ def test_real_system_silent_alone_stays_ok(fake_pw):
     silent *microphone* fails the run (system silence alone does not)."""
     recorder = start_recorder(fake_pw, targets=make_targets(sys_name="sys.silent",
                                                             mic_name="mic.tone"))
-    time.sleep(0.35)
+    _wait_delivered(recorder)
     report = recorder.stop()
     assert cc.validate_report(report) == []
     assert report["tracks"]["system"]["verdict"] == "silent"
@@ -351,9 +368,17 @@ def test_pause_never_stops_or_retargets_capture_streams(pw_client):
     # The capture source is untouched by pause: still active, still recording.
     assert paused_pw["active"] is True and paused_pw["state"] == "recording"
     before = {n: paused_pw["tracks"][n]["frames"] for n in ("system", "mic")}
-    time.sleep(0.5)
-    after_pw = pw_client.get("/api/live").json()["pipewire"]
-    after = {n: after_pw["tracks"][n]["frames"] for n in ("system", "mic")}
+    # Condition wait, not wall time: the claim is "the streams keep
+    # delivering audio through pause", so wait for delivery. The stand-in
+    # generator can be CPU-starved for longer than any fixed window.
+    end = time.monotonic() + 10
+    after_pw, after = paused_pw, before
+    while time.monotonic() < end:
+        after_pw = pw_client.get("/api/live").json()["pipewire"]
+        after = {n: after_pw["tracks"][n]["frames"] for n in ("system", "mic")}
+        if all(after[n] > before[n] for n in ("system", "mic")):
+            break
+        time.sleep(0.05)
     for name in ("system", "mic"):
         assert after_pw["tracks"][name]["state"] == "recording", name
         assert after[name] > before[name], (
@@ -419,8 +444,17 @@ def test_single_track_node_loss_keeps_capture_alive_and_reports_honestly(pw_clie
     assert "system" in event.get("message", "")
 
     before = pw_status["tracks"]["mic"]["frames"]
-    time.sleep(0.4)
-    after = pw_client.get("/api/live").json()["pipewire"]
+    # Condition wait, not wall time: the claim is "the mic keeps
+    # delivering audio while the sibling track is dead", so wait for
+    # delivery; a fixed window can close before the starved stand-in's
+    # next chunk arrives.
+    end = time.monotonic() + 10
+    after = pw_status
+    while time.monotonic() < end:
+        after = pw_client.get("/api/live").json()["pipewire"]
+        if after["tracks"]["mic"]["frames"] > before:
+            break
+        time.sleep(0.05)
     assert after["tracks"]["mic"]["frames"] > before, "mic stopped during partial failure"
 
     stopped = pw_client.post("/api/live/stop")
@@ -466,7 +500,7 @@ def _assert_local_metadata_only(obj, path: str = "report"):
 
 def test_real_report_carries_only_local_metadata(fake_pw):
     recorder = start_recorder(fake_pw)
-    time.sleep(0.3)
+    _wait_delivered(recorder)
     report = recorder.stop()
     _assert_local_metadata_only(report)
     # out_dir/file/log are local filesystem paths; the walker already
