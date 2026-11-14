@@ -6,7 +6,7 @@
   },
   "report": {
     "ok": true,
-    "out_dir": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/system_silent",
+    "out_dir": "out/system_silent",
     "rate": 48000,
     "targets": {
       "system": {
@@ -42,7 +42,7 @@
           "selection": "default"
         },
         "state": "stopped",
-        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/system_silent/system.wav",
+        "file": "out/system_silent/system.wav",
         "duration": 3.4,
         "samplerate": 48000,
         "channels": 1,
@@ -53,7 +53,7 @@
         "verdict": "silent",
         "error": null,
         "exit_code": 1,
-        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/system_silent/system.pw-record.log"
+        "log": "out/system_silent/system.pw-record.log"
       },
       "mic": {
         "track": "mic",
@@ -68,7 +68,7 @@
           "selection": "default"
         },
         "state": "stopped",
-        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/system_silent/mic.wav",
+        "file": "out/system_silent/mic.wav",
         "duration": 3.2,
         "samplerate": 48000,
         "channels": 1,
@@ -79,7 +79,7 @@
         "verdict": "ok",
         "error": null,
         "exit_code": 1,
-        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/system_silent/mic.pw-record.log"
+        "log": "out/system_silent/mic.pw-record.log"
       }
     }
   }

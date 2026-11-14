@@ -2,7 +2,7 @@
   "description": "A lying report: ok=true while the microphone verdict is silent. The validator must refuse it (the false 'Capture OK' regression class).",
   "report": {
     "ok": true,
-    "out_dir": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/mic_silent",
+    "out_dir": "out/mic_silent",
     "rate": 48000,
     "targets": {
       "system": {
@@ -38,7 +38,7 @@
           "selection": "default"
         },
         "state": "stopped",
-        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/mic_silent/system.wav",
+        "file": "out/mic_silent/system.wav",
         "duration": 2.3,
         "samplerate": 48000,
         "channels": 1,
@@ -49,7 +49,7 @@
         "verdict": "ok",
         "error": null,
         "exit_code": 1,
-        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/mic_silent/system.pw-record.log"
+        "log": "out/mic_silent/system.pw-record.log"
       },
       "mic": {
         "track": "mic",
@@ -64,7 +64,7 @@
           "selection": "default"
         },
         "state": "stopped",
-        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/mic_silent/mic.wav",
+        "file": "out/mic_silent/mic.wav",
         "duration": 3.3,
         "samplerate": 48000,
         "channels": 1,
@@ -75,7 +75,7 @@
         "verdict": "silent",
         "error": null,
         "exit_code": 1,
-        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/mic_silent/mic.pw-record.log"
+        "log": "out/mic_silent/mic.pw-record.log"
       }
     }
   }

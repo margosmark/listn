@@ -704,4 +704,4 @@ This repo's tests do not open a process tap. On the Mac, check:
 - **Port 8765 is taken.** Quit the other listn (`engine.log` will say so). The menu bar will not attach to a pre-0.3 server that has no capture socket.
 - **`Library libcublas.so.12 is not found or cannot be loaded` (or any CUDA error) on Linux.** The GPU is visible but its CUDA runtime is missing or unusable. Run on CPU with `--compute-device cpu` (fish: `set -lx LISTN_COMPUTE_DEVICE cpu` before the command, or `env LISTN_COMPUTE_DEVICE=cpu uv run listn …`). `--compute-device cuda` fails with the same advice instead of falling back; the default `--compute-device auto` probes the runtime in a child process and falls back on its own. See [Where transcription runs](#where-transcription-runs-compute_device).
 
-MIT License.
+[MIT License](LICENSE).
