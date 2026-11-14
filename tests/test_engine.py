@@ -138,20 +138,26 @@ def test_file_job_completes_when_cuda_libraries_are_missing(tmp_path, data_dir, 
 
     The job must finish on CPU with the fallback in its status stages — not
     die with ``libcublas.so.12 is not found`` — and rebuild exactly once.
+
+    Seam port (contract item 2): the model now loads inside the isolation
+    child, so this file's ``sys.modules`` patch can no longer reach it. The
+    same fault travels through ``transcriber._FACTORY_PATH`` — the child
+    builds ``cuda_fault_factory`` instead of a model, and the ``auto`` build
+    still dies with the libcublas error while the ``cpu`` build works.
+    Assertions unchanged; only the build evidence moved from the fake
+    model's class list to the log the child writes.
     """
-    import sys
-    import types
+    import json
 
     from listn import transcriber as tr
-    from .test_transcriber import CudaBrokenWhisper
+    from .test_transcriber import _CUBLAS_ERROR, _FAULT_ENV, _FAULT_FACTORY, _FAULT_LOG_ENV
 
-    CudaBrokenWhisper.instances = []
-    CudaBrokenWhisper.fail_devices = ("auto",)
-    CudaBrokenWhisper.fail_at_init = False
+    log = tmp_path / "cuda_fault_builds.log"
+    monkeypatch.setenv(_FAULT_LOG_ENV, str(log))
+    monkeypatch.setenv(_FAULT_ENV, json.dumps({
+        "error": _CUBLAS_ERROR, "fail_at_init": False, "devices": ["auto"]}))
+    monkeypatch.setattr(tr, "_FACTORY_PATH", _FAULT_FACTORY)
     tr._cache.clear()
-    monkeypatch.setattr(tr, "_cuda_device_count", lambda: 1)
-    monkeypatch.setitem(sys.modules, "faster_whisper",
-                        types.SimpleNamespace(WhisperModel=CudaBrokenWhisper))
     try:
         eng = Engine(sd=FakeSD(MAC_DEVICES, speed=40.0))   # real get_transcriber
         q = eng.bus.subscribe()
@@ -169,6 +175,8 @@ def test_file_job_completes_when_cuda_libraries_are_missing(tmp_path, data_dir, 
         assert [s.text for s in eng.library.segments(meta.id)] == ["hello"]
         stages = [e["job"]["stage"] for e in events if e["type"] == "job.update"]
         assert tr.CPU_FALLBACK_MESSAGE in stages
-        assert [m.init_kwargs["device"] for m in CudaBrokenWhisper.instances] == ["auto", "cpu"]
+        builds = [json.loads(line)["device"]
+                  for line in log.read_text().splitlines() if line.strip()]
+        assert builds == ["auto", "cpu"]
     finally:
         tr._cache.clear()
