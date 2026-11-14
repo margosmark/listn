@@ -43,9 +43,9 @@ ENTRY_NAME = "listn.desktop"
 #: installed package (F2 — the CWD import hijack).
 SAFE_PATH_FLAG = "-P"
 
-#: The floor is Python 3.10 (``pyproject.toml`` ``requires-python``), and 3.10
-#: has neither ``-P`` nor ``PYTHONSAFEPATH`` — both arrived in 3.11, so 3.10
-#: runs this ``python -c`` shim instead: drop every ``sys.path`` entry that
+#: The floor is Python 3.11 (``pyproject.toml`` ``requires-python``); anything
+#: below it (a system 3.10, say) has neither ``-P`` nor ``PYTHONSAFEPATH`` —
+#: both arrived in 3.11 — and runs this ``python -c`` shim instead: drop every ``sys.path`` entry that
 #: resolves to the cwd, then run ``listn`` exactly as ``-m`` would. It holds
 #: no ``"``, ``\``, ``$``, backtick or ``%``, so both desktop-entry escaping
 #: layers pass it through as one argument. Keep it byte-identical to the
@@ -135,7 +135,7 @@ def safe_module_argv(python: str) -> list[str]:
 
     The interpreter that renders this is the same one that will run the entry
     at login, so testing ``sys.version_info`` here is the right gate: ``-P``
-    where it exists, the ``runpy`` shim on the 3.10 floor.
+    where it exists, the ``runpy`` shim below 3.11.
     """
     if sys.version_info >= (3, 11):
         return [python, SAFE_PATH_FLAG, "-m", "listn"]
