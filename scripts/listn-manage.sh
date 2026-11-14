@@ -183,10 +183,10 @@ cmd_doctor() {
 
   if command -v uv >/dev/null 2>&1; then
     local py
-    if py="$(uv python find '>=3.10,<3.14' 2>/dev/null)"; then
+    if py="$(uv python find '>=3.11,<3.14' 2>/dev/null)"; then
       ok "Python for uv: $py"
     else
-      warn "No Python 3.10-3.13 found yet; uv will download one during setup"
+      warn "No Python 3.11-3.13 found yet; uv will download one during setup"
     fi
   fi
 
