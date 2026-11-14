@@ -31,7 +31,7 @@ import pytest
 pytest.importorskip("dbus_next")
 
 import uvicorn  # noqa: E402
-from dbus_next import Message, Variant  # noqa: E402
+from dbus_next import Message, MessageType, Variant  # noqa: E402
 from dbus_next.aio import MessageBus  # noqa: E402
 from dbus_next.service import ServiceInterface, method  # noqa: E402
 
@@ -133,8 +133,13 @@ async def get_prop(bus, name, prop, path="/StatusNotifierItem",
     reply = await bus.call(Message(
         destination=name, path=path, interface=PROPS, member="Get",
         signature="ss", body=[interface, prop]))
-    assert reply is not None and reply.message_type != 3, \
-        f"Properties.Get({prop}) failed: {reply}"
+    # dbus_next's MessageType is a plain Enum, so `!= 3` is always True and
+    # an ERROR reply would fall through to `.value` on its 's' body.
+    assert reply is not None \
+        and reply.message_type is MessageType.METHOD_RETURN, \
+        f"Properties.Get({prop}) failed: " \
+        f"{getattr(reply, 'error_name', None)}: " \
+        f"{reply.body if reply else reply}"
     return reply.body[0].value
 
 
@@ -142,8 +147,10 @@ async def get_layout(bus, name):
     reply = await bus.call(Message(
         destination=name, path="/Menu", interface=DBUSMENU,
         member="GetLayout", signature="iias", body=[0, -1, []]))
-    assert reply is not None and reply.message_type != 3, \
-        f"GetLayout failed: {reply}"
+    assert reply is not None \
+        and reply.message_type is MessageType.METHOD_RETURN, \
+        f"GetLayout failed: {getattr(reply, 'error_name', None)}: " \
+        f"{reply.body if reply else reply}"
     return reply.body[1]      # [id, props, [Variant children...]]
 
 
@@ -181,7 +188,11 @@ async def group_props(bus, name, ids) -> dict[int, dict]:
     reply = await bus.call(Message(
         destination=name, path="/Menu", interface=DBUSMENU,
         member="GetGroupProperties", signature="aias", body=[list(ids), []]))
-    assert reply is not None and reply.message_type != 3, reply
+    assert reply is not None \
+        and reply.message_type is MessageType.METHOD_RETURN, \
+        f"GetGroupProperties failed: " \
+        f"{getattr(reply, 'error_name', None)}: " \
+        f"{reply.body if reply else reply}"
     return {row[0]: row[1] for row in reply.body[0]}
 
 
@@ -228,18 +239,47 @@ async def run_tray(port, controller_ready=None):
     sni = StatusNotifierItem(controller)
     task = asyncio.create_task(sni.run())
     name = service_name()
-    # wait for the item to own its bus name
+    # wait for the item to own its bus name. The reply must be a real
+    # METHOD_RETURN: an unowned name makes the daemon answer with a
+    # NameHasNoOwner *error* whose body is a non-empty string — truthy,
+    # so a bare `reply.body[0]` check would declare readiness before the
+    # item has even asked for its name.
     end = time.monotonic() + 10
     while time.monotonic() < end:
         reply = await watcher_bus.call(Message(
             destination="org.freedesktop.DBus", path="/org/freedesktop/DBus",
             interface="org.freedesktop.DBus", member="GetNameOwner",
             signature="s", body=[name]))
-        if reply is not None and reply.body and reply.body[0]:
+        if reply is not None \
+                and reply.message_type is MessageType.METHOD_RETURN \
+                and reply.body and reply.body[0]:
             break
         await asyncio.sleep(0.05)
     else:
         raise AssertionError("tray never acquired its bus name")
+    # Name ownership only proves `run()` finished registering the item —
+    # the first render happens before the first refresh. The IDLE
+    # IconName is no better a gate: /api/live answers without touching
+    # PipeWire, while discovery is a separate HTTP call that spawns
+    # pw-dump inside the server, so under load it is still in flight
+    # (or has hit the 5 s client timeout and reported nothing) while the
+    # menu is already built with empty sinks. Tests then read
+    # "System output — none found" or click Start before any target is
+    # selected. Wait for the first discovery pass to land: targets
+    # adopted, or a discovery error the menu will surface. Either way the
+    # tray is finished initialising rather than merely answering /api/live.
+    end = time.monotonic() + 20
+    while time.monotonic() < end:
+        if sni.controller.discovery_error or (
+                sni.controller.selected_system and sni.controller.selected_mic):
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError(
+            "tray never finished its first device discovery "
+            f"(sinks={len(sni.controller.sinks)} "
+            f"sources={len(sni.controller.sources)} "
+            f"err={sni.controller.discovery_error!r})")
     return sni, task, watcher, watcher_bus
 
 
