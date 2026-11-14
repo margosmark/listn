@@ -445,8 +445,13 @@ def test_app_stream_closing_mid_run_fails_the_system_track_and_keeps_the_mic(
     assert wait_for(lambda: recorder._tracks["system"].state == "failed", timeout=8)
     assert recorder._tracks["mic"].state == "recording", "the mic must keep recording"
     mic_before = recorder._tracks["mic"].frames
-    time.sleep(0.3)
-    assert recorder._tracks["mic"].frames > mic_before
+    # Condition wait, not wall time: the claim is "the mic keeps delivering
+    # audio after the app stream closed", so wait for delivery. The stand-in
+    # generator can be CPU-starved for longer than any fixed window.
+    assert wait_for(lambda: recorder._tracks["mic"].frames > mic_before,
+                    timeout=10.0), (
+        f"mic frames frozen at {mic_before} after the app stream closed "
+        f"(state={recorder._tracks['mic'].state})")
 
     report = recorder.stop()
     system = report["tracks"]["system"]
