@@ -31,6 +31,46 @@ CTranslate2’s generic `compute_type` set is not a promise that every type work
 - **NVIDIA CUDA:** faster-whisper’s documented examples use `float16`, `int8_float16`, or `int8`.[1] CTranslate2 documents GPU-specific behavior by NVIDIA compute capability: FP16 optimized on capability >=7.0; BF16 >=8.0; INT8 support varies (>=7.0 or 6.1 in its documented matrix); some requested types may be converted to another type.[3] Start with `float16` for a supported NVIDIA GPU, and use `get_supported_compute_types("cuda")` to establish actual support. Do not assume BF16/INT8 support based only on the type name.
 - **AMD ROCm:** the current public Python `get_supported_compute_types` reference names only `cpu` and `cuda`, and the official PyPI/CUDA install page is not an AMD install recipe.[2][4][5] Do not claim that the CUDA device string or CUDA type list proves ROCm functionality. The released ROCm wheel must be validated against its matching runtime and queried/benchmarked using the API supported by that build; use only values actually reported/accepted by that wheel. No reliable, current official per-type faster-whisper/ROCm matrix was found in the cited sources.
 
+## `--compute-device`
+
+`listn transcribe|live --compute-device`, `LISTN_COMPUTE_DEVICE` and
+`compute_device` in `settings.json` choose where faster-whisper runs.
+Precedence: CLI > environment > settings file; an invalid value never
+falls back silently. The `--compute-device` flag is rejected by argparse
+with a readable "invalid choice" message (exit 2, no traceback); an
+invalid `LISTN_COMPUTE_DEVICE` environment value raises `SettingsError`
+(a `ValueError`) from settings loading.
+
+| Value | Behaviour |
+|---|---|
+| `auto` (default) | Main's shipped behaviour: GPU when this machine's CUDA (or ROCm) runtime is actually usable, otherwise CPU. The availability checks run in a child process (`listn/transcriber.py:resolve_device()`), because the native loader and the driver API can end a process without raising a Python exception; a child killed by a signal, a timeout or unparseable output all read as "not usable". What the user actually sees on `auto`: a machine with no GPU at all announces only `device: cpu`, with no note; the note `CUDA libraries unavailable — transcribing on CPU` appears only when a GPU is visible but unusable (or an availability failure happens mid-run). The probe's specific reason stays in `device_message`, which no user-facing surface displays — explicit `cuda`/`rocm` failures, by contrast, do show their reason. |
+| `cpu` | Never touches the GPU; the probe is never run. |
+| `cuda`, `rocm` | Require that GPU stack by name: "no device", "library unusable" or a CTranslate2 refusal raises `CudaUnavailable` with the missing piece and the exact remedy **before any model build** — the file job exits 1 with no traceback and no transcript, never a false success. |
+
+Model load and inference for the default backend run in a separate process
+(`listn/inference_worker.py`); the parent writes library files only after the
+child answers with a complete result. A native SIGSEGV/SIGABRT kills only that
+child: under `auto` the parent restarts it pinned to CPU exactly once and
+appends `…; running on CPU` to the status line, under explicit
+`cuda`/`rocm` it raises the actionable error with no CPU retry, and under `cpu`
+a crash is an error because there is nothing to fall back to.
+Requests to that child carry a silence-based deadline — a long one for the
+model load (a first-run model download can take minutes) and a shorter one
+for transcription: the clock starts before the request is written, so a
+child that goes silent — whether it stops reading the request or stops
+replying to it — is stopped and reported as one clean error rather than
+wedging the caller, and closing never queues behind a stuck request. The
+worker may confirm the device decision but never widen it: a child that
+claims a GPU the parent did not choose has that claim dropped (device,
+status line and device message alike) — under the default `auto` the
+claim must also match this machine's own capability probe.
+`tests/test_isolation.py` simulates each case, including those bounds and
+claims.
+
+`compute_type`: a value of `int8` — the settings default, indistinguishable
+from an explicit set — resolves to `float16` on a GPU build and stays `int8`
+on CPU; any other user-set value is passed through untouched on every device.
+
 ## Detect the actual machine first
 
 Run these on the **CachyOS laptop itself**, in a terminal session with access to the host PCI devices (not this research container). Commands are observational; do not install drivers/packages as part of detection.

@@ -9,11 +9,11 @@ private data directory outside the repository:
 ``LISTN_DATA_DIR`` overrides both.
 
 The transcription performance knobs (``compute_type``, ``cpu_threads``,
-``beam_size``) can be set in ``settings.json`` or overridden per-run with
-``LISTN_COMPUTE_TYPE``, ``LISTN_CPU_THREADS`` and ``LISTN_BEAM_SIZE``. The
-environment wins over the file. Invalid values raise a ``SettingsError`` with
-a readable message instead of silently falling back; ``SettingsError`` is a
-``ValueError`` subclass so existing handlers keep working.
+``beam_size``) and the compute device (``compute_device``) can be set in
+``settings.json`` or overridden per-run with ``LISTN_COMPUTE_TYPE``,
+``LISTN_CPU_THREADS``, ``LISTN_BEAM_SIZE`` and ``LISTN_COMPUTE_DEVICE``. The
+environment wins over the file; ``--compute-device`` wins over both. Invalid
+values raise ``SettingsError``, a ``ValueError`` subclass, with a readable message.
 """
 
 from __future__ import annotations
@@ -35,6 +35,14 @@ BACKENDS = ["auto", "faster-whisper", "mlx", "openai-whisper"]
 COMPUTE_TYPES = ["default", "auto", "int8", "int8_float32", "int8_float16",
                  "int8_bfloat16", "int16", "float16", "bfloat16", "float32"]
 DEFAULT_COMPUTE_TYPE = "int8"
+# Where the faster-whisper model runs. "auto" uses the GPU only when the CUDA
+# runtime is actually usable on this machine and falls back to CPU otherwise;
+# "cpu" never touches the GPU; "cuda"/"rocm" require the GPU and fail with a
+# readable message instead of falling back. See listn/transcriber.py.
+COMPUTE_DEVICES = ["auto", "cpu", "cuda", "rocm"]
+# "auto" is main's shipped behaviour: try the GPU when usable, otherwise
+# transcribe on CPU with a truthful status note. GPU-only is opt-in.
+DEFAULT_COMPUTE_DEVICE = "auto"
 DEFAULT_BEAM_SIZE = 5
 SETTINGS_VERSION = 2
 SPEAKER_THRESHOLD = 0.55
@@ -112,10 +120,12 @@ class Settings:
     # Transcription performance knobs. Defaults match the values that used to
     # be hard-coded in the faster-whisper backend, so nothing changes when
     # they are left alone. cpu_threads=None means "don't pass it" and lets
-    # CTranslate2 pick (today's behaviour).
+    # CTranslate2 pick (today's behaviour). compute_device is separate from
+    # `device` above, which is the microphone input.
     compute_type: str = DEFAULT_COMPUTE_TYPE
     cpu_threads: int | None = None
     beam_size: int = DEFAULT_BEAM_SIZE
+    compute_device: str = DEFAULT_COMPUTE_DEVICE
     chunk_seconds: float = 6.0
     save_audio: bool = True
     # None follows the token: on when one is set (or the model is cached).
@@ -182,7 +192,8 @@ class Settings:
                           ("LISTN_BEAM_SIZE", "beam_size"),
                           ("LISTN_LLM_BACKEND", "llm_backend"),
                           ("LISTN_OLLAMA_URL", "llm_ollama_url"),
-                          ("LISTN_OLLAMA_MODEL", "llm_ollama_model")):
+                          ("LISTN_OLLAMA_MODEL", "llm_ollama_model"),
+                          ("LISTN_COMPUTE_DEVICE", "compute_device")):
             raw = os.environ.get(var)
             if raw is not None and raw.strip():
                 setattr(self, attr, raw.strip())
@@ -224,6 +235,12 @@ class Settings:
             raise SettingsError(
                 f"beam_size must be a whole number between 1 and 100 — got {raw_beam!r}.")
         self.beam_size = beam
+        raw_device = self.compute_device
+        self.compute_device = str(raw_device or "").strip().lower() or DEFAULT_COMPUTE_DEVICE
+        if self.compute_device not in COMPUTE_DEVICES:
+            raise SettingsError(
+                f"compute_device must be one of {', '.join(COMPUTE_DEVICES)} — "
+                f"got {raw_device!r}.")
         try:
             self.chunk_seconds = min(30.0, max(2.0, float(self.chunk_seconds)))
         except (TypeError, ValueError):
