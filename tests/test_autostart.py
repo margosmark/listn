@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import configparser
 import json
+import os
 import shutil
 import stat
 import subprocess
@@ -18,7 +19,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from listn import autostart
+from listn import __version__, autostart
 from listn.config import Settings
 from listn.engine import Engine
 from listn.server import create_app
@@ -485,12 +486,17 @@ def test_launcher_argv_prefers_the_running_console_script(tmp_path, monkeypatch)
     monkeypatch.setenv("PATH", str(tmp_path))
     assert autostart.launcher_argv() == [str(exe)]
 
-    # `python -m listn` relaunches the same way.
+    # `python -m listn` relaunches the same way, but never with the login
+    # cwd ahead of the real package on sys.path (F2): -P on >= 3.11, the
+    # runpy shim on the 3.10 floor.
     main_py = tmp_path / "site" / "listn" / "__main__.py"
     main_py.parent.mkdir(parents=True)
     main_py.write_text("import sys\n", encoding="utf-8")
     monkeypatch.setattr(sys, "argv", [str(main_py), "ui"])
-    assert autostart.launcher_argv() == [sys.executable, "-m", "listn"]
+    if sys.version_info >= (3, 11):
+        assert autostart.launcher_argv() == [sys.executable, "-P", "-m", "listn"]
+    else:
+        assert autostart.launcher_argv() == [sys.executable, "-c", autostart.SAFE_RUN_SHIM]
 
     # A non-listn argv[0] (pytest, an interpreter) never lands in Exec: the
     # listn command on PATH wins, and the bare command name is the last resort.
@@ -511,6 +517,87 @@ def test_launcher_argv_resolves_a_relative_invocation(tmp_path, monkeypatch):
     exe.chmod(0o755)
     monkeypatch.setattr(sys, "argv", ["bin/listn", "ui"])
     assert autostart.launcher_argv() == [str(exe)]
+
+
+# -------------------------------------------------------- the cwd is hostile
+
+
+def test_safe_module_argv_gates_on_the_python_floor(monkeypatch):
+    """F2: `-P` needs 3.11; the 3.10 floor gets the runpy shim instead.
+
+    ``PYTHONSAFEPATH`` is not an option for the floor — it arrived in 3.11
+    alongside ``-P``, so a 3.10 interpreter would silently ignore it.
+    """
+    monkeypatch.setattr(sys, "version_info", (3, 11, 0, "final", 0))
+    assert autostart.safe_module_argv("/usr/bin/python3") == [
+        "/usr/bin/python3", "-P", "-m", "listn"]
+
+    monkeypatch.setattr(sys, "version_info", (3, 10, 0, "final", 0))
+    assert autostart.safe_module_argv("/usr/bin/python3") == [
+        "/usr/bin/python3", "-c", autostart.SAFE_RUN_SHIM]
+
+    # The shim travels through two desktop-entry escaping layers, so it may
+    # hold none of the characters either layer rewrites, and no line break
+    # (which would split the Exec value in half).
+    assert not set(autostart.SAFE_RUN_SHIM) & set('"\\`$%')
+    assert "\n" not in autostart.SAFE_RUN_SHIM
+    # It is a script, not a statement soup: it must at least compile.
+    compile(autostart.SAFE_RUN_SHIM, "<safe-run-shim>", "exec")
+
+
+def test_rendered_exec_from_a_planted_home_prints_the_real_version(home, monkeypatch):
+    """F2: the login Exec must ignore a planted ``$HOME/listn/`` in its cwd.
+
+    The entry is rendered the way a packaged install renders it (argv[0] is
+    the package's ``__main__.py``), tokenized back with the desktop-entry
+    rules, and executed from a ``$HOME`` that contains a hostile ``listn/``
+    package — the exact login-time setup. ``tray`` is swapped for
+    ``--version`` so the test never starts a server; the launcher prefix it
+    runs is byte-identical either way.
+    """
+    repo = Path(autostart.__file__).resolve().parents[1]
+    main_py = repo / "listn" / "__main__.py"
+    monkeypatch.setattr(sys, "argv", [str(main_py), "tray"])
+
+    argv = decode_exec(autostart.render().split("Exec=", 1)[1].splitlines()[0])
+    assert argv == [*autostart.launcher_argv(), "tray"]
+    argv[-1] = "--version"
+
+    planted = home / "listn"
+    planted.mkdir()
+    (planted / "__init__.py").write_text('print("PLANTED_PKG_LOADED_INSTEAD")\n',
+                                         encoding="utf-8")
+    (planted / "__main__.py").write_text('print("PLANTED_PKG_LOADED_INSTEAD")\n',
+                                         encoding="utf-8")
+
+    env = {**os.environ, "PYTHONPATH": str(repo)}
+    # Control: without the safe path the planted package wins — the F2 repro.
+    control = subprocess.run([sys.executable, "-m", "listn", "--version"],
+                             cwd=home, env=env, capture_output=True, text=True,
+                             timeout=120)
+    assert "PLANTED_PKG_LOADED_INSTEAD" in control.stdout, control.stdout
+
+    run = subprocess.run(argv, cwd=home, env=env, capture_output=True, text=True,
+                         timeout=120)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip() == f"listn {__version__}"
+    assert "PLANTED_PKG_LOADED_INSTEAD" not in run.stdout + run.stderr
+
+
+def test_the_rendered_module_entry_validates_as_a_desktop_entry(tmp_path, monkeypatch):
+    """The -P/shim Exec must stay a legal desktop-entry command line."""
+    if shutil.which("desktop-file-validate") is None:
+        pytest.skip("desktop-file-utils not installed")
+    main_py = tmp_path / "site" / "listn" / "__main__.py"
+    main_py.parent.mkdir(parents=True)
+    main_py.write_text("import sys\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [str(main_py), "tray"])
+
+    entry = tmp_path / "listn.desktop"
+    entry.write_text(autostart.render(), encoding="utf-8")
+    result = subprocess.run(["desktop-file-validate", str(entry)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 # ------------------------------------------------------------------ the UI

@@ -24,4 +24,14 @@ else
     uv sync --project "$project" --frozen --no-install-project --no-dev
 fi
 
-PYTHONPATH="$project${PYTHONPATH:+:$PYTHONPATH}" exec "$env/bin/python" -m listn "$@"
+# `python -m` puts cwd first on sys.path, ahead of PYTHONPATH: a planted
+# listn/ in whatever directory this runs from would execute instead of the
+# packaged code (F2, the CWD import hijack). -P drops cwd — but it only exists
+# on Python >= 3.11, and the floor here is 3.10 (pyproject.toml), which has
+# neither -P nor PYTHONSAFEPATH (both arrived in 3.11). So 3.10 runs the same
+# runpy shim listn/autostart.py renders into its Exec line: strip every
+# sys.path entry that resolves to the cwd, then run the module as -m would.
+if "$env/bin/python" -c 'import sys;sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1; then
+    PYTHONPATH="$project${PYTHONPATH:+:$PYTHONPATH}" exec "$env/bin/python" -P -m listn "$@"
+fi
+PYTHONPATH="$project${PYTHONPATH:+:$PYTHONPATH}" exec "$env/bin/python" -c "import os,runpy,sys;sys.path[:]=[p for p in sys.path if os.path.realpath(p or os.curdir)!=os.getcwd()];runpy.run_module('listn',run_name='__main__',alter_sys=True)" "$@"
