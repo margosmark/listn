@@ -8,7 +8,7 @@
   },
   "report": {
     "ok": false,
-    "out_dir": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok",
+    "out_dir": "out/ok",
     "rate": 48000,
     "targets": {
       "system": {
@@ -44,7 +44,7 @@
           "selection": "explicit"
         },
         "state": "failed",
-        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/system.wav",
+        "file": "out/ok/system.wav",
         "duration": 2.9,
         "samplerate": 48000,
         "channels": 1,
@@ -55,7 +55,7 @@
         "verdict": "ok",
         "error": "target node 'alsa_output.pci-0000.analog-stereo' disappeared from the PipeWire graph while recording; stopped this track instead of recording another source",
         "exit_code": 1,
-        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/system.pw-record.log"
+        "log": "out/ok/system.pw-record.log"
       },
       "mic": {
         "track": "mic",
@@ -70,7 +70,7 @@
           "selection": "default"
         },
         "state": "stopped",
-        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/mic.wav",
+        "file": "out/ok/mic.wav",
         "duration": 3.0,
         "samplerate": 48000,
         "channels": 1,
@@ -81,7 +81,7 @@
         "verdict": "ok",
         "error": null,
         "exit_code": 1,
-        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/mic.pw-record.log"
+        "log": "out/ok/mic.pw-record.log"
       }
     }
   }

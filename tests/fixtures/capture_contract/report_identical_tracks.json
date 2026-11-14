@@ -9,7 +9,7 @@
   },
   "report": {
     "ok": false,
-    "out_dir": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/identical",
+    "out_dir": "out/identical",
     "rate": 48000,
     "targets": {
       "system": {
@@ -45,7 +45,7 @@
           "selection": "default"
         },
         "state": "failed",
-        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/identical/system.wav",
+        "file": "out/identical/system.wav",
         "duration": 3.2,
         "samplerate": 48000,
         "channels": 1,
@@ -56,7 +56,7 @@
         "verdict": "ok",
         "error": "system and mic tracks are identical: corr=1.000000, 100.0% of 148800 samples match",
         "exit_code": 1,
-        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/identical/system.pw-record.log"
+        "log": "out/identical/system.pw-record.log"
       },
       "mic": {
         "track": "mic",
@@ -71,7 +71,7 @@
           "selection": "default"
         },
         "state": "failed",
-        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/identical/mic.wav",
+        "file": "out/identical/mic.wav",
         "duration": 3.1,
         "samplerate": 48000,
         "channels": 1,
@@ -82,7 +82,7 @@
         "verdict": "ok",
         "error": "system and mic tracks are identical: corr=1.000000, 100.0% of 148800 samples match",
         "exit_code": 1,
-        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/identical/mic.pw-record.log"
+        "log": "out/identical/mic.pw-record.log"
       }
     }
   }

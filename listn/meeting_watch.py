@@ -14,7 +14,7 @@ when an accepted/tracked meeting disappears the watcher emits an end
 offer — or an auto-stop when auto-record is on.
 
 The notification/session metadata contract shared with L2
-(captions/hotkeys, task t_7c59bc5e) is ``MeetingPrompt.to_dict()``: a
+(captions/hotkeys) is ``MeetingPrompt.to_dict()``: a
 fixed five-key dict, no window titles, no attendee/calendar content, no
 PII beyond the app label. L2 should consume this shape rather than adding
 meeting routes; L3a adds no server routes.

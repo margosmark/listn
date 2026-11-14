@@ -2,7 +2,7 @@
   "description": "'paused' is an engine-session state, never a per-track capture state.",
   "report": {
     "ok": true,
-    "out_dir": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok",
+    "out_dir": "out/ok",
     "rate": 48000,
     "targets": {
       "system": {
@@ -38,7 +38,7 @@
           "selection": "default"
         },
         "state": "paused",
-        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/system.wav",
+        "file": "out/ok/system.wav",
         "duration": 2.9,
         "samplerate": 48000,
         "channels": 1,
@@ -49,7 +49,7 @@
         "verdict": "ok",
         "error": null,
         "exit_code": 1,
-        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/system.pw-record.log"
+        "log": "out/ok/system.pw-record.log"
       },
       "mic": {
         "track": "mic",
@@ -64,7 +64,7 @@
           "selection": "default"
         },
         "state": "stopped",
-        "file": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/mic.wav",
+        "file": "out/ok/mic.wav",
         "duration": 3.0,
         "samplerate": 48000,
         "channels": 1,
@@ -75,7 +75,7 @@
         "verdict": "ok",
         "error": null,
         "exit_code": 1,
-        "log": "/home/hermes/.hermes/profiles/soft-dev/cache/scratch/l0-fixgen/ok/mic.pw-record.log"
+        "log": "out/ok/mic.pw-record.log"
       }
     }
   }

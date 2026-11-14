@@ -4,7 +4,7 @@
 
 ## Decision (Mark, 2026-11-05): use the Ollama service he already runs
 
-- Endpoint `http://10.10.10.6:11434`, model tag `qwen3.8:27b` — 27.3 B parameters, Q4_K_M, 17,741,872,154 B, digest `aaee06c39dcf2437cde036998d960e1fc1494b8191be7cc9657d01e509097813`, as reported by `GET /api/tags`.
+- Endpoint `http://192.0.2.1:11434`, model tag `qwen3.8:27b` — 27.3 B parameters, Q4_K_M, 17,741,872,154 B, digest `0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef`, as reported by `GET /api/tags` (digest shown is a documentation example, not a real hash).
 - listn ships no weights, installs no runtime and never runs `ollama pull`: it is an HTTP client of that one endpoint, and the model's licence is Mark's to have checked on his own host.
 - This supersedes the llama.cpp/`llama-cpp-python` recommendation below, the pinned Qwen3-8B-GGUF acquisition plan, and the gate's "zero outbound connections" wording (deviations listed at the end).
 

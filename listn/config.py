@@ -137,7 +137,7 @@ class Settings:
     # "extractive".
     llm_backend: str = "auto"
     # Opt-in endpoint of an ALREADY RUNNING Ollama service, e.g.
-    # http://10.10.10.6:11434, together with the tag served there, e.g.
+    # http://192.0.2.1:11434, together with the tag served there, e.g.
     # qwen3.8:27b. Empty by default: without MLX and without an endpoint,
     # listn writes extractive notes and makes no outbound connection. Setting
     # the URL is the opt-in - listn still never downloads weights, never runs
@@ -273,7 +273,7 @@ class Settings:
         if self.llm_backend == "ollama" and not (self.llm_ollama_url and self.llm_ollama_model):
             raise SettingsError(
                 "llm_backend=ollama needs both llm_ollama_url "
-                "(e.g. http://10.10.10.6:11434) and llm_ollama_model "
+                "(e.g. http://192.0.2.1:11434) and llm_ollama_model "
                 "(e.g. qwen3.8:27b).")
         self.summarize_after = bool(self.summarize_after)
         self.offer_meetings = bool(self.offer_meetings)
