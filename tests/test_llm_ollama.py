@@ -24,7 +24,7 @@ from listn.index import SearchIndex
 from listn.library import Library, Segment
 from listn.summary import build_notes, extractive_notes
 
-MARK_URL = "http://10.10.10.6:11434"
+MARK_URL = "http://192.0.2.1:11434"
 MARK_MODEL = "qwen3.8:27b"
 SYSTEM_LINE = "You write accurate, specific meeting notes."
 
@@ -122,13 +122,13 @@ def test_validate_ollama_url_normalises_a_bare_origin():
 
 
 @pytest.mark.parametrize("bad", [
-    "ftp://10.10.10.6:11434",
-    "10.10.10.6:11434",
+    "ftp://192.0.2.1:11434",
+    "192.0.2.1:11434",
     "http://",
-    "http://user:secret@10.10.10.6:11434",
-    "http://10.10.10.6:11434/api",
-    "http://10.10.10.6:11434?model=x",
-    "http://10.10.10.6:notaport",
+    "http://user:secret@192.0.2.1:11434",
+    "http://192.0.2.1:11434/api",
+    "http://192.0.2.1:11434?model=x",
+    "http://192.0.2.1:notaport",
     "javascript:alert(1)",
 ])
 def test_validate_ollama_url_refuses_anything_but_a_bare_http_origin(bad):
@@ -138,9 +138,9 @@ def test_validate_ollama_url_refuses_anything_but_a_bare_http_origin(bad):
 
 def test_validation_errors_never_echo_credentials():
     """N1: a rejected URL surfaces in SettingsError without its secrets."""
-    for bad in ("ftp://user:secret@10.10.10.6:11434",
+    for bad in ("ftp://user:secret@192.0.2.1:11434",
                 "http://user:secret@",
-                "1user:secret@10.10.10.6"):
+                "1user:secret@192.0.2.1"):
         with pytest.raises(SettingsError) as caught:
             Settings(llm_ollama_url=bad).validated()
         assert "secret" not in str(caught.value), "credentials leaked into a settings error"
@@ -153,7 +153,7 @@ def test_settings_reject_an_unknown_backend():
 
 def test_settings_reject_an_endpoint_listn_wont_talk_to():
     with pytest.raises(SettingsError):
-        Settings(llm_ollama_url="http://10.10.10.6:11434/api").validated()
+        Settings(llm_ollama_url="http://192.0.2.1:11434/api").validated()
 
 
 def test_settings_require_url_and_model_when_ollama_is_selected():
