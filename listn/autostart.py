@@ -105,6 +105,15 @@ def autostart_file() -> Path:
     return base / "autostart" / ENTRY_NAME
 
 
+#: Characters that force an argument into quotes on the ``Exec`` line — the
+#: desktop-entry spec's reserved set (space, tab, ``"``, ``'``, ``\``, ``>``,
+#: ``<``, ``~``, ``|``, ``&``, ``;``, ``$``, ``*``, ``?``, ``#``, ``(``,
+#: ``)``, `` ` ``) plus ``%``, the field-code introducer (escaped ``%%``).
+#: Newline and carriage return never reach quoting: :func:`render` refuses
+#: to write a line break at all.
+EXEC_QUOTE_CHARS = ' \t"\'\\`$%><~|&;*?#()'
+
+
 def quote_exec_arg(arg: str) -> str:
     """Quote one argument for the ``Exec`` line *as written to the file*.
 
@@ -117,12 +126,23 @@ def quote_exec_arg(arg: str) -> str:
     backslash for the string layer; GLib undoes exactly those two, in
     reverse. No shell parses either layer, so nothing here is shell
     interpolation.
+
+    An argument is quoted when it holds any character :data:`EXEC_QUOTE_CHARS`
+    — quoting, not escaping, is what keeps an odd install path alive: an
+    unmatched ``'`` left bare makes ``g_shell_parse_argv`` give up ("Text
+    ended before matching quote"), the GIO constructor returns NULL, and the
+    entry is dead at login while Settings still shows ON because the marker
+    file exists. The tab is additionally spelled out as the key-file escape
+    ``\\t``: a raw control character in the file is rejected outright by
+    ``desktop-file-validate``.
     """
-    if arg and not any(c in arg for c in ' \t"\\`$%'):
-        return arg              # no backslash in the argument: the layers are a no-op
+    if arg and not any(c in arg for c in EXEC_QUOTE_CHARS):
+        return arg              # nothing the layers rewrite: leave it alone
     escaped = (arg.replace("\\", "\\\\").replace('"', '\\"')
                .replace("$", "\\$").replace("`", "\\`").replace("%", "%%"))
-    return f'"{escaped}"'.replace("\\", "\\\\")   # key-file string layer
+    # Key-file string layer: double the backslashes the Exec layer just
+    # produced, then escape the tab (still a raw control character here).
+    return (f'"{escaped}"'.replace("\\", "\\\\").replace("\t", "\\t"))
 
 
 def _python() -> str | None:
