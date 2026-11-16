@@ -1,4 +1,6 @@
 import json
+import logging
+import shutil
 
 import pytest
 
@@ -50,6 +52,26 @@ def test_delete_and_update(lib):
     lib.delete(m.id)
     with pytest.raises(KeyError):
         lib.get(m.id)
+
+
+def test_saves_into_a_vanished_session_dir_are_dropped(lib, caplog):
+    """A session dir that disappears mid-write must not raise.
+
+    ``listn-finish`` saves the transcript on a background thread while the
+    caller may already have torn the directory down (a test fixture's
+    rmtree, or a user deleting the session). Raising there kills the thread
+    with an unhandled FileNotFoundError and drops the rest of the save.
+    """
+    m = lib.create("doomed", "live")
+    shutil.rmtree(lib.session_path(m.id))
+    with caplog.at_level(logging.WARNING, logger="listn.library"):
+        lib.save_segments(m.id, [Segment(0, 1, "orphaned")])
+        lib.save_meta(m)
+        lib.save_notes(m.id, {"n": 1})
+        lib.save_bookmarks(m.id, [{"t": 0.0, "note": "x"}])
+    assert not lib.session_path(m.id).exists()          # nothing resurrected
+    assert not list(lib.root.glob("*/transcript.json.tmp"))
+    assert any("vanished" in r.getMessage() for r in caplog.records)
 
 
 def test_recover_interrupted(lib):
