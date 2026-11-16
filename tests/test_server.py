@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from listn.engine import Engine
 from listn.server import create_app
 
-from .conftest import MAC_DEVICES, FakeSD
+from .conftest import MAC_DEVICES, FakeSD, join_stray_finishers
 from .test_engine import write_wav
 
 
@@ -136,3 +136,55 @@ def test_upload_rejects_unknown_type(client):
 def test_bad_session_ids(client):
     assert client.get("/api/sessions/..%2F..%2Fetc").status_code == 404
     assert client.get("/api/sessions/20240101-000000-abcdef").status_code == 404
+
+
+def test_shutdown_joins_an_in_flight_finisher(data_dir, fake_factory):
+    """uvicorn's exit must wait for ``listn-finish`` instead of outliving it.
+
+    ``POST /api/live/stop`` stops with ``wait=False`` on purpose, so the
+    lifespan that runs when the process exits meets a session that is
+    already stopping and calls ``stop_live(wait=True)`` on it. That call
+    used to return in ~0.02s having joined nothing: uvicorn exited and the
+    daemon finisher died mid-save, leaving meta.json saying ``recording``
+    (t_d0ba73dd).
+    """
+    sd = FakeSD(MAC_DEVICES, default=(0, 3), speed=40.0)
+    engine = Engine(sd=sd, transcriber_factory=fake_factory)
+    app = create_app(engine=engine, sd=sd)
+    real_save = engine.library.save_meta
+
+    def slow_save(meta, *args, **kwargs):
+        time.sleep(1.2)
+        return real_save(meta, *args, **kwargs)
+
+    try:
+        with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+            client.put("/api/settings", json={"device": "BlackHole", "chunk_seconds": 2})
+            started = client.post("/api/live/start", json={"title": "Quit mid-finish"})
+            assert started.status_code == 200, started.text
+            sid = started.json()["id"]
+            end = time.monotonic() + 10
+            while not client.get("/api/live").json()["segments"] and time.monotonic() < end:
+                time.sleep(0.05)
+            engine.library.save_meta = slow_save
+            assert client.post("/api/live/stop").status_code == 200
+            session = engine.live
+            assert session is not None
+            # The finisher is inside the slowed final save, so it is still
+            # running for the whole of the shutdown below.
+            assert session.state == "finishing"
+            t0 = time.monotonic()             # leaving this block runs the lifespan
+        shutdown = time.monotonic() - t0
+        assert shutdown >= 1.0, (
+            f"the lifespan shutdown returned after {shutdown:.4f}s with "
+            f"listn-finish still saving (state={session.state})")
+        assert session.state == "done"
+        assert engine.library.get(sid).status == "done"
+        finisher = getattr(session, "_finisher", None)
+        assert finisher is not None and not finisher.is_alive()
+        root = engine.library.session_path(sid)
+        assert (root / "transcript.json").exists()
+        assert (root / "meta.json").exists()
+    finally:
+        engine.library.save_meta = real_save
+        join_stray_finishers()

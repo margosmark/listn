@@ -110,6 +110,12 @@ class LiveSession:
         self._blocks: queue.Queue = queue.Queue(maxsize=2000)
         self._chunks: queue.Queue = queue.Queue()
         self._stop = threading.Event()
+        # The single ``listn-finish`` thread, if one has been started. It is
+        # the idempotency token for stop(): a stop is "already in flight"
+        # exactly while this handle exists, and wait=True joins *that*
+        # thread instead of returning early (t_d0ba73dd).
+        self._finisher: threading.Thread | None = None
+        self._stop_lock = threading.Lock()
         self._capture_done = threading.Event()
         self.mode = "device"
         self._writer: WavWriter | None = None
@@ -558,19 +564,36 @@ class LiveSession:
         self._emit("live.status", message="The input device changed. Recording continued.")
 
     def stop(self, wait: bool = True) -> None:
-        if self._stop.is_set():
-            return
-        self.state = "finishing"
-        self._emit("live.status", message="Finishing the last chunks...", state=self.state)
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
-        self._stop.set()
-        finisher = threading.Thread(target=self._finish, name="listn-finish", daemon=True)
-        finisher.start()
+        """End the session; with ``wait``, return only once it has finished.
+
+        Idempotent *and* honest: the first call performs the shutdown and
+        starts the single ``listn-finish`` thread, later calls never repeat
+        it — but a later ``wait=True`` still joins that thread. Callers rely
+        on it: ``/api/live/stop`` stops with ``wait=False`` on purpose, and
+        the app's shutdown then calls ``stop(wait=True)`` on the very
+        session that is already stopping. That call used to return in
+        0.0000s having joined nothing, so uvicorn could exit while the
+        daemon finisher was still writing transcript.json/meta.json.
+        """
+        with self._stop_lock:
+            finisher = self._finisher
+            if finisher is None:
+                self.state = "finishing"
+                self._emit("live.status", message="Finishing the last chunks...", state=self.state)
+                if self._stream is not None:
+                    try:
+                        self._stream.stop()
+                        self._stream.close()
+                    except Exception:
+                        pass
+                # _stop is set only once the handle exists, so any observer
+                # that sees the stop in flight can always find the finisher
+                # to join. (The disk guard sets _stop on its own; that state
+                # arrives here with no finisher yet and is finished off.)
+                finisher = threading.Thread(target=self._finish, name="listn-finish", daemon=True)
+                self._finisher = finisher
+                self._stop.set()
+                finisher.start()
         if wait:
             finisher.join()
 

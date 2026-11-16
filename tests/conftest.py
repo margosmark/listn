@@ -145,6 +145,18 @@ def fake_factory():
     return factory
 
 
+def join_stray_finishers(timeout: float = 5.0) -> None:
+    """Wait for any ``listn-finish`` thread still running.
+
+    A test that proves ``stop(wait=True)`` *used* to skip the join leaves the
+    finisher behind; joining it here keeps that RED run from racing the
+    ``data_dir`` cleanup, so it fails on its own assertions only.
+    """
+    for thread in threading.enumerate():
+        if thread.name == "listn-finish" and thread is not threading.current_thread():
+            thread.join(timeout)
+
+
 @pytest.fixture(autouse=True)
 def no_local_llm(monkeypatch):
     """Never load a real MLX model in tests; tests pass a fake ``complete``.

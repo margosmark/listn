@@ -8,7 +8,7 @@ from listn.audio import to_int16
 from listn.config import Settings
 from listn.engine import Engine
 
-from .conftest import MAC_DEVICES, FakeSD
+from .conftest import MAC_DEVICES, FakeSD, join_stray_finishers
 
 
 def wait_for(pred, timeout=10.0):
@@ -180,3 +180,54 @@ def test_file_job_completes_when_cuda_libraries_are_missing(tmp_path, data_dir, 
         assert builds == ["auto", "cpu"]
     finally:
         tr._cache.clear()
+
+
+def test_second_stop_waits_for_the_finisher_the_first_one_started(engine):
+    """``stop(wait=True)`` after a ``stop(wait=False)`` must join listn-finish.
+
+    ``/api/live/stop`` stops with ``wait=False`` on purpose, so the app's own
+    shutdown finds a session that is already stopping and calls
+    ``stop(wait=True)`` on it. That call used to hit
+    ``if self._stop.is_set(): return``, return in 0.0000s having joined
+    nothing, and let uvicorn exit while the *daemon* ``listn-finish`` was
+    still writing transcript.json/meta.json (t_d0ba73dd).
+
+    The final save is slowed down so the finisher is provably still running
+    when the second stop arrives — the situation a big transcript on a busy
+    disk creates in production.
+    """
+    session = engine.start_live(Settings(device="BlackHole", save_audio=False, chunk_seconds=2.0))
+    wait_for(lambda: session.segments)
+    real_save = engine.library.save_meta
+
+    def slow_save(meta, *args, **kwargs):
+        time.sleep(1.2)
+        return real_save(meta, *args, **kwargs)
+
+    engine.library.save_meta = slow_save
+    try:
+        engine.stop_live(wait=False)          # what /api/live/stop does
+        assert session.state == "finishing"
+
+        t0 = time.monotonic()
+        engine.stop_live(wait=True)           # what the shutdown path does
+        waited = time.monotonic() - t0
+        assert waited >= 1.0, (
+            f"stop(wait=True) returned after {waited:.4f}s while "
+            f"listn-finish was still saving (state={session.state})")
+        assert session.state == "done"
+        finisher = getattr(session, "_finisher", None)
+        assert finisher is not None, "stop() keeps no handle on the finisher it spawned"
+        assert not finisher.is_alive()
+        meta = engine.library.get(session.meta.id)
+        assert meta.status == "done"
+        assert (engine.library.session_path(session.meta.id) / "transcript.json").exists()
+
+        # Idempotent: a third stop neither re-runs the shutdown nor hangs.
+        t0 = time.monotonic()
+        engine.stop_live(wait=True)
+        assert time.monotonic() - t0 < 0.5
+        assert session.state == "done"
+    finally:
+        engine.library.save_meta = real_save
+        join_stray_finishers()
