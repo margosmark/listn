@@ -286,8 +286,69 @@ def freeze_between_factory(model, download=None, **knobs):
 
 
 # ---------------------------------------------------------------------------
+# S1c: a child that never finishes but never goes silent either.
+# ---------------------------------------------------------------------------
+
+def chatty_factory(model, download=None, **knobs):
+    """Loads fine, then never answers the transcription: it keeps emitting
+    progress frames forever — a backend stuck in a loop that happens to
+    report progress, so the silence bound alone can never stop it (S1c)."""
+    _log_load()
+    device = _device_of(knobs)
+
+    class Chatty(Transcriber):
+        backend = "faster-whisper"
+
+        def __init__(self, name):
+            super().__init__(name)
+            self.device = device
+            self.device_message = f"device: {device}"
+
+        def transcribe(self, audio, language=None, prompt=None, vad=True,
+                       offset=0.0, hotwords=None, progress=None):
+            while True:  # pragma: no cover - only reached if the cap never fires
+                if progress:
+                    progress(0.5)
+                time.sleep(0.2)
+
+        def segments(self, audio, language=None, prompt=None, vad=True, hotwords=None):
+            yield RawSegment(0.0, 1.0, "never", 0.0)  # pragma: no cover
+
+    return Chatty(model)
+
+
+# ---------------------------------------------------------------------------
 # S2r: hostile answers on the default device (`auto`), one channel each.
 # ---------------------------------------------------------------------------
+
+# The S8 counterexamples: GPU claims in wording the old denylist missed.
+GPU_PHRASES = ("device: gpu — using the GPU right now", "using the GPU",
+               "transcribing on GPU", "on the GPU")
+
+
+def gpu_phrase_factory(model, download=None, **knobs):
+    """`cpu`/`auto` request: claims GPU use in wording the old `_GPU_CLAIM`
+    denylist did not list — as a status event for every phrase, plus one as
+    the device line — while actually running on CPU (S8)."""
+    _log_load()
+    device = _device_of(knobs)
+    if download:
+        for phrase in GPU_PHRASES:
+            download(phrase)
+
+    class Phraser(Transcriber):
+        backend = "faster-whisper"
+
+        def __init__(self, name):
+            super().__init__(name)
+            self.device = "gpu"
+            self.device_message = "using the GPU"
+
+        def segments(self, audio, language=None, prompt=None, vad=True, hotwords=None):
+            yield RawSegment(0.0, 1.0, "ok", 0.0)
+
+    return Phraser(model)
+
 
 def auto_note_factory(model, download=None, **knobs):
     """`auto`: fabricates the canonical CPU-fallback note with no failure

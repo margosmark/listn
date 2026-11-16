@@ -667,3 +667,177 @@ def test_cpu_request_never_runs_the_parent_auto_probe(monkeypatch, data_dir):
     assert not any("cuda" in s.lower() or "gpu" in s.lower() for s in statuses)
     wrapper.close()
 
+
+# --- S1c: the total per-request wall cap ------------------------------------
+
+def test_chatty_worker_is_stopped_by_the_total_request_cap(monkeypatch, data_dir):
+    """S1c: frames reset the silence clock, so a backend looping in
+    progress() forever never trips the idle bound — the total cap must
+    stop it with one clean error, inside the cap, lock released and no
+    orphan worker left behind."""
+    pids = _spy_worker_pids(monkeypatch)
+    wrapper = _iso("chatty_factory", "cpu", monkeypatch, data_dir)
+    # Patched AFTER the load so only the transcribe request is bounded here.
+    monkeypatch.setattr(tr, "_REQUEST_IDLE_TIMEOUT", 120.0)  # never fires
+    monkeypatch.setattr(tr, "_REQUEST_MAX_TOTAL", 4.0)       # the cap under test
+    seen: list[float] = []
+    start = time.monotonic()
+    errors: list[BaseException] = []
+    try:
+        wrapper.transcribe(_audio(), language="en", progress=seen.append)
+    except BaseException as exc:  # noqa: BLE001
+        errors.append(exc)
+    elapsed = time.monotonic() - start
+    assert 4.0 <= elapsed < 15.0  # returned inside the cap (S1c; silence alone never fires)
+    assert errors, "the chatty child must be stopped, not run forever"
+    message = str(errors[0])
+    assert "never finished" in message          # the cap's own reason
+    assert "while transcribing" in message
+    assert "stopped responding" not in message  # the silence bound did NOT fire
+    assert "Traceback" not in message
+    assert len(seen) >= 3  # progress frames really did keep arriving
+    assert not wrapper._lock.locked()
+    assert wrapper._session is None  # the wedged session was torn down
+    assert pids and all(not _worker_alive(pid) for pid in pids)
+
+
+# --- S8: the GPU-claim check is a positive form -----------------------------
+
+def test_gpu_claim_positive_form_catches_unlisted_phrases():
+    """S8: any line naming a GPU device is a claim, so the counterexamples
+    the denylist missed now match — while the two honest CPU-truth
+    messages that name a device (the canonical F1 note and the probe's
+    unavailability reason) still do not, so F1 marker semantics hold."""
+    for phrase in ("device: gpu — using the GPU right now", "using the GPU",
+                   "transcribing on GPU", "on the GPU",
+                   "device: cuda", "running on GPU", "CTranslate2 cuda"):
+        assert tr._claims_gpu(phrase), phrase
+    # CPU-truth, not a GPU claim (F1 marker semantics must not flip):
+    assert not tr._claims_gpu(tr.CPU_FALLBACK_MESSAGE)
+    assert not tr._claims_gpu("device: cpu")
+    assert not tr._claims_gpu("device: auto")
+    assert not tr._claims_gpu(
+        "device: cpu — CUDA is visible but the CUDA runtime cannot be used "
+        "(libcublas.so.12: cannot open shared object file); "
+        "see docs/GPU_LINUX.md")
+    # A claim appended around an honest message is still caught:
+    assert tr._claims_gpu(tr.CPU_FALLBACK_MESSAGE + " — using the GPU")
+
+
+# The probe's unavailability reason, exactly as compute_backend.resolve
+# builds it, with the detail slot left open.
+_PROBE_REASON_FMT = ("CUDA is visible but the CUDA runtime cannot be used "
+                     "({}); see docs/GPU_LINUX.md")
+_HONEST_DETAIL = "Library libcublas.so.12 is not found or cannot be loaded"
+_HONEST_REASON = _PROBE_REASON_FMT.format(_HONEST_DETAIL)
+
+
+def test_gpu_claim_inside_the_probe_reason_parens_is_still_caught():
+    """S8-EX: `_PROBE_REASON` may strip only its own fixed prose — the
+    parenthetical is child-chosen text, so a claim parked inside it is
+    re-scanned with the strong device tokens and caught, while the honest
+    detail (soname list, nested-paren driver error) stays CPU-truth."""
+    # the three forged parentheticals are claims:
+    for detail in ("device: cuda", "transcribing on GPU", "GPU"):
+        assert tr._claims_gpu(_PROBE_REASON_FMT.format(detail)), detail
+    # ... and both wrap-around wordings around the fixed prose:
+    assert tr._claims_gpu("using the GPU; " + _HONEST_REASON)
+    assert tr._claims_gpu(_HONEST_REASON + " | running on the GPU")
+    # honest wordings stay CPU-truth (F1 marker semantics must not flip):
+    assert not tr._claims_gpu(tr.CPU_FALLBACK_MESSAGE)
+    assert not tr._claims_gpu("device: cpu — " + _HONEST_REASON)
+    assert not tr._claims_gpu(
+        "device: cpu — CUDA is visible but the CUDA runtime cannot be used "
+        "(CTranslate2 could not query the CUDA driver (error 803)); "
+        "see docs/GPU_LINUX.md")
+    # a bare `cuda` in the detail names the driver, not a device:
+    assert not tr._claims_gpu(
+        _PROBE_REASON_FMT.format("CTranslate2 could not query the CUDA "
+                                 "driver (error 803)"))
+
+
+def test_gpu_claim_in_probe_reason_parens_never_reaches_status_callback(
+        monkeypatch, data_dir):
+    """S8-EX through the real call site: on `cpu` and on `auto` (parent
+    probe: no usable GPU) every forged line above is dropped before the
+    user's status callback, while the honest reason still passes and the
+    device never widens."""
+    _no_gpu_probe(monkeypatch)
+    forged = [_PROBE_REASON_FMT.format(d)
+              for d in ("device: cuda", "transcribing on GPU", "GPU")]
+    forged += ["using the GPU; " + _HONEST_REASON,
+               _HONEST_REASON + " | running on the GPU"]
+    for device in ("cpu", "auto"):
+        tr._close_cached()
+        tr._cache.clear()
+        monkeypatch.setattr(tr, "_FACTORY_PATH",
+                            f"{FACTORIES}:roundtrip_factory")
+        statuses: list[str] = []
+        wrapper = tr.get_transcriber("tiny", "faster-whisper",
+                                     compute_device=device,
+                                     status=statuses.append)
+        statuses.clear()          # only what follows is under test
+        for line in forged:
+            wrapper._child_status(line)
+            assert statuses == [], (device, line)
+        assert not wrapper._message_is_adoptable(forged[0])
+        # the honest reason is still forwarded, not swallowed by the fix:
+        wrapper._child_status("device: cpu — " + _HONEST_REASON)
+        assert statuses == ["device: cpu — " + _HONEST_REASON], device
+        assert wrapper.device in ("cpu", "auto")   # no device widening
+        wrapper.close()
+
+
+def test_hostile_gpu_phrases_never_reach_the_status_callback(monkeypatch, data_dir):
+    """S8 end-to-end: on `cpu` and on `auto` (parent probe: no usable GPU)
+    none of the four unlisted phrasings reach the status callback, the
+    device claim stays clamped, and the job still runs."""
+    _no_gpu_probe(monkeypatch)
+    for device in ("cpu", "auto"):
+        tr._close_cached()
+        tr._cache.clear()
+        monkeypatch.setattr(tr, "_FACTORY_PATH",
+                            f"{FACTORIES}:gpu_phrase_factory")
+        statuses: list[str] = []
+        wrapper = tr.get_transcriber("tiny", "faster-whisper",
+                                     compute_device=device,
+                                     status=statuses.append)
+        segments = [s.text for s in wrapper.transcribe(_audio(), language="en")]
+        assert segments == ["ok"]  # the job still ran
+        assert wrapper.device in ("cpu", "auto")  # the claim never widened
+        assert not any("gpu" in s.lower() for s in statuses), statuses
+        assert "gpu" not in wrapper.device_message.lower()
+        wrapper.close()
+
+
+# --- S9: every helper failure is a child death ------------------------------
+
+def test_close_race_typeerror_is_mapped_to_child_died(monkeypatch, data_dir):
+    """S9: Connection.close() nulls _handle between _check_closed() and
+    os.write, so the send helper raises TypeError — it must surface as
+    _ChildDied(death_detail()) with the TypeError chained, never as a raw
+    internal exception escaping request()."""
+    pids = _spy_worker_pids(monkeypatch)
+    wrapper = _iso("roundtrip_factory", "cpu", monkeypatch, data_dir)
+    session = wrapper._session
+    # Reap the child first so death_detail() reports immediately instead of
+    # waiting out its 5 s grace period on a healthy worker.
+    session.proc.kill()
+    session.proc.wait(timeout=5)
+
+    def racer(buf, *args, **kwargs):
+        # The exact production interleaving: _check_closed() passes, then
+        # close() nulls _handle, then os.write sees None -> TypeError.
+        session._to._check_closed()
+        session._to._handle = None
+        return session._to._send_bytes(buf)
+
+    monkeypatch.setattr(session._to, "send_bytes", racer)
+    with pytest.raises(tr._ChildDied) as excinfo:
+        session.request({"op": "transcribe", "language": "en"}, b"\x00\x00\x00\x00")
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, TypeError)
+    assert "'NoneType' object cannot be interpreted as an integer" in str(cause)
+    assert "Traceback" not in str(excinfo.value)
+    wrapper.close()
+    assert pids and all(not _worker_alive(pid) for pid in pids)
