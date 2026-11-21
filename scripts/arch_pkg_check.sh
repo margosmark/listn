@@ -112,7 +112,7 @@ builder=""
 run_as_builder() { "$@"; }
 if [ "$is_root" = yes ]; then
     note "installing build tooling (pacman -Sy base-devel sudo curl git dbus)"
-    pacman -Sy --noconfirm --needed base-devel sudo curl git dbus shadow
+    pacman -Syu --noconfirm --needed base-devel sudo curl git dbus shadow
     builder=builder
     id builder >/dev/null 2>&1 || useradd -m -s /bin/sh builder
     printf 'builder ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/listn-check

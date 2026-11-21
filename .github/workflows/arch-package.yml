@@ -38,7 +38,7 @@ jobs:
     steps:
       # actions/checkout needs git in the bare archlinux image.
       - name: Tooling for checkout
-        run: pacman -Sy --noconfirm --needed git curl
+        run: pacman -Syu --noconfirm --needed git curl
       - uses: actions/checkout@v4
       - name: Build, install, first run, one-engine-at-login, upgrade, uninstall
         env:
